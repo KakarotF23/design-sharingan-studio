@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, realpath } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, realpath } from "node:fs/promises";
+import { devNull } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Project } from "@design-sharingan/core";
 import { detectProject } from "./detect-project";
@@ -136,6 +137,51 @@ async function reserveCloneStaging(parentPath: string): Promise<CloneStaging> {
   return staging;
 }
 
+function declaresCheckoutFilter(contents: string): boolean {
+  return contents.split(/\r?\n/).some((line) => {
+    const trimmed = line.trimStart();
+    if (trimmed === "" || trimmed.startsWith("#")) {
+      return false;
+    }
+    return /(?:^|[\t ])(?:[!-])?filter(?:=|[\t ]|$)/.test(line);
+  });
+}
+
+async function assertNoRepositoryCheckoutFilters(rootPath: string): Promise<void> {
+  async function visit(directoryPath: string): Promise<void> {
+    const entries = await readdir(directoryPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (directoryPath === rootPath && entry.name === ".git") {
+        continue;
+      }
+
+      const entryPath = join(directoryPath, entry.name);
+      if (entry.isDirectory()) {
+        await visit(entryPath);
+        continue;
+      }
+
+      if (entry.name !== ".gitattributes") {
+        continue;
+      }
+      if (!entry.isFile()) {
+        throw new Error(
+          "Repository checkout attributes must be regular files",
+        );
+      }
+
+      const contents = await readFile(entryPath, "utf8");
+      if (contents.includes("\0") || declaresCheckoutFilter(contents)) {
+        throw new Error(
+          "Repository checkout filters are unavailable during safe import",
+        );
+      }
+    }
+  }
+
+  await visit(rootPath);
+}
+
 function retainedWorkspaceError(error: unknown): Error {
   const reason =
     error instanceof Error && /unable to clone github repository/i.test(error.message)
@@ -169,7 +215,11 @@ export class GitHubProjectAdapter {
     const command = {
       executable: "git" as const,
       args: [
+        "-c",
+        `core.hooksPath=${devNull}`,
         "clone",
+        "--no-checkout",
+        "--template=",
         "--branch",
         input.branch,
         "--single-branch",
@@ -178,6 +228,18 @@ export class GitHubProjectAdapter {
         staging.path,
       ],
       cwd: location.parentPath,
+    };
+    const checkoutCommand = {
+      executable: "git" as const,
+      args: [
+        "-c",
+        `core.hooksPath=${devNull}`,
+        "-c",
+        `core.attributesFile=${devNull}`,
+        "checkout",
+        "--force",
+      ],
+      cwd: staging.path,
     };
     const privateEnvironment =
       input.token === undefined || input.token === ""
@@ -207,6 +269,31 @@ export class GitHubProjectAdapter {
         staging.identity,
         "Git clone staging directory",
       );
+
+      try {
+        await this.gitRunner.run(checkoutCommand, {
+          environment: {
+            GIT_ATTR_NOSYSTEM: "1",
+            GIT_CONFIG_COUNT: "0",
+            GIT_CONFIG_GLOBAL: devNull,
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_PARAMETERS: "",
+            GIT_CONFIG_SYSTEM: devNull,
+            GIT_TERMINAL_PROMPT: "0",
+          },
+          isolateInheritedGitEnvironment: true,
+        });
+      } catch {
+        throw new Error("Unable to materialize GitHub repository");
+      }
+
+      await verifyOwnedDirectory(
+        location.parentPath,
+        staging.path,
+        staging.identity,
+        "Git clone staging directory",
+      );
+      await assertNoRepositoryCheckoutFilters(staging.path);
 
       // Detection and persistence complete before the unique workspace path is
       // exposed to the caller. The preferred destination is never overwritten.

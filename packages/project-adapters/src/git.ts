@@ -9,6 +9,11 @@ export interface GitCommand {
 export interface GitRunOptions {
   environment?: Readonly<Record<string, string>>;
   privateEnvironment?: Readonly<Record<string, string>>;
+  /**
+   * Drop inherited GIT_* process variables before applying the controlled
+   * command environment. Used when repository content is materialized.
+   */
+  isolateInheritedGitEnvironment?: boolean;
 }
 
 export interface GitRunner {
@@ -18,10 +23,18 @@ export interface GitRunner {
 export const defaultGitRunner: GitRunner = {
   async run(command, options): Promise<void> {
     await new Promise<void>((resolve, reject) => {
+      const inheritedEnvironment =
+        options?.isolateInheritedGitEnvironment === true
+          ? Object.fromEntries(
+              Object.entries(process.env).filter(
+                ([key]) => !key.toUpperCase().startsWith("GIT_"),
+              ),
+            )
+          : process.env;
       const child = spawn(command.executable, [...command.args], {
         cwd: command.cwd,
         env: {
-          ...process.env,
+          ...inheritedEnvironment,
           ...options?.environment,
           ...options?.privateEnvironment,
         },
