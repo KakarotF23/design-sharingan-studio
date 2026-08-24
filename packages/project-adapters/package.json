@@ -1,0 +1,22 @@
+{
+  "name": "@design-sharingan/project-adapters",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./path-policy": "./src/path-policy.ts",
+    "./workspace-store": "./src/workspace-store.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit --project tsconfig.json"
+  },
+  "dependencies": {
+    "@design-sharingan/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "vitest": "latest"
+  }
+}
