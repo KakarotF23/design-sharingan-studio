@@ -1,0 +1,10 @@
+node_modules/
+.pnpm-store/
+.turbo/
+.next/
+next-env.d.ts
+dist/
+playwright-report/
+test-results/
+*.tsbuildinfo
+.env*.local

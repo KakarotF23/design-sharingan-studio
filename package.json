@@ -1,0 +1,17 @@
+{
+  "name": "design-sharingan-studio",
+  "private": true,
+  "packageManager": "pnpm@10",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "test": "turbo test",
+    "typecheck": "turbo typecheck",
+    "e2e": "playwright test -c tests/e2e/playwright.config.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "latest",
+    "turbo": "latest",
+    "typescript": "latest"
+  }
+}
