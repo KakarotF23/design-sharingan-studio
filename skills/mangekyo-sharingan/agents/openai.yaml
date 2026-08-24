@@ -1,0 +1,6 @@
+interface:
+  display_name: "Mangekyo Sharingan"
+  short_description: "Iterate rendered UI with evidence-backed visual QA"
+  default_prompt: "Use $mangekyo-sharingan to render, compare, and refine this approved UI direction without breaking UX or the existing design system."
+policy:
+  allow_implicit_invocation: true

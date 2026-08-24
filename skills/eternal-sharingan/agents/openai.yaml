@@ -1,0 +1,6 @@
+interface:
+  display_name: "Eternal Sharingan"
+  short_description: "Design genome, drift detection, and product UI governance"
+  default_prompt: "Use $eternal-sharingan to protect and evolve the product Design Genome, detect cross-screen drift, and make evidence-backed design-governance decisions."
+policy:
+  allow_implicit_invocation: true

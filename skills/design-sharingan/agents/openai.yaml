@@ -1,0 +1,6 @@
+interface:
+  display_name: "Design Sharingan"
+  short_description: "Extract visual DNA and evolve coherent product UI"
+  default_prompt: "Use $design-sharingan to analyze this UI reference, extract reusable design DNA, and adapt it to my existing product before coding."
+policy:
+  allow_implicit_invocation: true
