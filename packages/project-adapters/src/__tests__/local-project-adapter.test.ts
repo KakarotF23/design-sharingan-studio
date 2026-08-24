@@ -77,4 +77,38 @@ describe("LocalProjectAdapter", () => {
     expect(workspace.capabilities.canRun).toBe(false);
     expect(workspace.capabilities.canRender).toBe(false);
   });
+
+  // Production break caught: package-manager ambiguity must reach Studio intake as configuration-required, never as runnable.
+  it.each([
+    {
+      name: "an unsupported declaration",
+      packageManager: "bun@1.2.0",
+      lockfiles: [] as string[],
+    },
+    {
+      name: "conflicting lockfiles",
+      packageManager: undefined,
+      lockfiles: ["pnpm-lock.yaml", "yarn.lock"],
+    },
+  ])("returns NEEDS_CONFIGURATION for $name", async ({
+    packageManager,
+    lockfiles,
+  }) => {
+    const selectedRoot = await temporaryProject({
+      name: "ambiguous-next",
+      ...(packageManager === undefined ? {} : { packageManager }),
+      scripts: { dev: "next dev" },
+      dependencies: { next: "latest", react: "latest" },
+    });
+    await Promise.all(
+      lockfiles.map((lockfile) => writeFile(join(selectedRoot, lockfile), "")),
+    );
+
+    const workspace = await new LocalProjectAdapter().open(selectedRoot);
+
+    expect(workspace.packageManager).toBeUndefined();
+    expect(workspace.devCommand).toBeUndefined();
+    expect(workspace.capabilities.canRun).toBe(false);
+    expect(workspace.status).toBe("NEEDS_CONFIGURATION");
+  });
 });

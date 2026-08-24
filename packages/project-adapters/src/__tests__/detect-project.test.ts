@@ -1,4 +1,12 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,6 +86,39 @@ describe("detectProject", () => {
     expect(result.devCommand).toBe("npm start");
   });
 
+  // Production break caught: treating an explicit unsupported package manager as absent guesses pnpm and enables an unsafe runtime.
+  it("does not default an explicitly unsupported package manager", async () => {
+    const rootPath = await temporaryProject({
+      packageManager: "bun@1.2.0",
+      scripts: { dev: "next dev" },
+      dependencies: { next: "latest", react: "latest" },
+    });
+
+    const result = await detectProject(rootPath);
+
+    expect(result.packageManager).toBeUndefined();
+    expect(result.devCommand).toBeUndefined();
+    expect(result.capabilities.canRun).toBe(false);
+  });
+
+  // Production break caught: choosing the first of conflicting lockfiles can execute the project with the wrong package manager.
+  it("rejects conflicting lockfile evidence", async () => {
+    const rootPath = await temporaryProject({
+      scripts: { dev: "next dev" },
+      dependencies: { next: "latest", react: "latest" },
+    });
+    await Promise.all([
+      writeFile(join(rootPath, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n"),
+      writeFile(join(rootPath, "yarn.lock"), ""),
+    ]);
+
+    const result = await detectProject(rootPath);
+
+    expect(result.packageManager).toBeUndefined();
+    expect(result.devCommand).toBeUndefined();
+    expect(result.capabilities.canRun).toBe(false);
+  });
+
   // Production break caught: treating an arbitrary script name as executable configuration violates fail-closed intake.
   it("does not guess a command or render target for an unknown project", async () => {
     const rootPath = await temporaryProject({
@@ -123,5 +164,24 @@ describe("detectProject", () => {
     expect(result.framework).toBeUndefined();
     expect(result.devCommand).toBeUndefined();
     expect(result.capabilities.canRun).toBe(false);
+  });
+
+  // Production break caught: reading package.json through a symlink lets project detection consume files outside the selected root.
+  it("rejects a package.json symlink that escapes the project", async () => {
+    const sandbox = await mkdtemp(join(tmpdir(), "design-sharingan-package-link-"));
+    temporaryRoots.push(sandbox);
+    const rootPath = join(sandbox, "project");
+    const outsidePackage = join(sandbox, "outside-package.json");
+    const outsideContents = `${JSON.stringify({
+      name: "outside",
+      scripts: { dev: "next dev" },
+      dependencies: { next: "latest" },
+    })}\n`;
+    await mkdir(rootPath);
+    await writeFile(outsidePackage, outsideContents);
+    await symlink(outsidePackage, join(rootPath, "package.json"));
+
+    await expect(detectProject(rootPath)).rejects.toThrow(/package\.json.*symbolic link/i);
+    expect(await readFile(outsidePackage, "utf8")).toBe(outsideContents);
   });
 });

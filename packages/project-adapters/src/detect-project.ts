@@ -2,11 +2,12 @@ import { constants } from "node:fs";
 import {
   access,
   lstat,
-  readFile,
+  open,
   readdir,
   realpath,
 } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
+import { assertPathInsideWorkspace } from "./path-policy";
 import type {
   ProjectDetection,
   SupportedFramework,
@@ -20,6 +21,11 @@ interface PackageJson {
   dependencies?: unknown;
   devDependencies?: unknown;
 }
+
+type PackageManagerDeclaration =
+  | { kind: "ABSENT" }
+  | { kind: "SUPPORTED"; value: SupportedPackageManager }
+  | { kind: "UNSUPPORTED" };
 
 const ROUTE_FILE_PATTERN = /\.(?:js|jsx|ts|tsx)$/;
 
@@ -61,46 +67,124 @@ async function hasGitMetadata(rootPath: string): Promise<boolean> {
   }
 }
 
+async function regularFileInsideWorkspace(
+  rootPath: string,
+  relativePath: string,
+  label: string,
+): Promise<string | undefined> {
+  const candidatePath = join(rootPath, relativePath);
+  let entry: Awaited<ReturnType<typeof lstat>>;
+  try {
+    entry = await lstat(candidatePath);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+
+  if (entry.isSymbolicLink()) {
+    throw new Error(`${label} must not be a symbolic link`);
+  }
+  if (!entry.isFile()) {
+    throw new Error(`${label} must be a regular file`);
+  }
+
+  const canonicalPath = await realpath(candidatePath);
+  return assertPathInsideWorkspace(rootPath, canonicalPath);
+}
+
 async function readPackageJson(rootPath: string): Promise<PackageJson | undefined> {
-  const packagePath = join(rootPath, "package.json");
-  if (!(await pathExists(packagePath))) {
+  const packagePath = await regularFileInsideWorkspace(
+    rootPath,
+    "package.json",
+    "package.json",
+  );
+  if (packagePath === undefined) {
     return undefined;
   }
 
-  return JSON.parse(await readFile(packagePath, "utf8")) as PackageJson;
+  const packageFile = await open(
+    packagePath,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  try {
+    const entry = await packageFile.stat();
+    if (!entry.isFile()) {
+      throw new Error("package.json must be a regular file");
+    }
+    const parsed = JSON.parse(await packageFile.readFile("utf8")) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("package.json must contain a JSON object");
+    }
+    return parsed as PackageJson;
+  } finally {
+    await packageFile.close();
+  }
 }
 
 function declaredPackageManager(
   packageJson: PackageJson | undefined,
-): SupportedPackageManager | undefined {
-  if (typeof packageJson?.packageManager !== "string") {
-    return undefined;
+): PackageManagerDeclaration {
+  if (
+    packageJson === undefined ||
+    !Object.prototype.hasOwnProperty.call(packageJson, "packageManager")
+  ) {
+    return { kind: "ABSENT" };
   }
 
-  const packageManager = packageJson.packageManager.split("@", 1)[0];
-  return packageManager === "pnpm" ||
-    packageManager === "yarn" ||
-    packageManager === "npm"
-    ? packageManager
-    : undefined;
+  if (typeof packageJson.packageManager !== "string") {
+    return { kind: "UNSUPPORTED" };
+  }
+  const match = /^(pnpm|yarn|npm)(?:@.+)?$/.exec(packageJson.packageManager);
+  return match === null
+    ? { kind: "UNSUPPORTED" }
+    : {
+        kind: "SUPPORTED",
+        value: match[1] as SupportedPackageManager,
+      };
 }
 
 async function detectPackageManager(
   rootPath: string,
   packageJson: PackageJson | undefined,
 ): Promise<SupportedPackageManager | undefined> {
-  if (await pathExists(join(rootPath, "pnpm-lock.yaml"))) {
-    return "pnpm";
+  const lockfiles = [
+    ["pnpm-lock.yaml", "pnpm"],
+    ["yarn.lock", "yarn"],
+    ["package-lock.json", "npm"],
+  ] as const;
+  const lockfileEvidence: SupportedPackageManager[] = [];
+  for (const [lockfile, packageManager] of lockfiles) {
+    if (
+      (await regularFileInsideWorkspace(
+        rootPath,
+        lockfile,
+        `${lockfile} lockfile`,
+      )) !== undefined
+    ) {
+      lockfileEvidence.push(packageManager);
+    }
   }
-  if (await pathExists(join(rootPath, "yarn.lock"))) {
-    return "yarn";
-  }
-  if (await pathExists(join(rootPath, "package-lock.json"))) {
-    return "npm";
+  if (lockfileEvidence.length > 1) {
+    return undefined;
   }
 
-  return declaredPackageManager(packageJson) ??
-    (packageJson === undefined ? undefined : "pnpm");
+  const declaration = declaredPackageManager(packageJson);
+  if (declaration.kind === "UNSUPPORTED") {
+    return undefined;
+  }
+  const [lockfilePackageManager] = lockfileEvidence;
+  if (lockfilePackageManager !== undefined) {
+    return declaration.kind === "SUPPORTED" &&
+      declaration.value !== lockfilePackageManager
+      ? undefined
+      : lockfilePackageManager;
+  }
+  if (declaration.kind === "SUPPORTED") {
+    return declaration.value;
+  }
+  return packageJson === undefined ? undefined : "pnpm";
 }
 
 async function detectFramework(
@@ -110,8 +194,13 @@ async function detectFramework(
   const hasNextSignature =
     "next" in dependencies ||
     (await Promise.all(
-      ["next.config.js", "next.config.mjs", "next.config.ts"].map((file) =>
-        pathExists(join(rootPath, file)),
+      ["next.config.js", "next.config.mjs", "next.config.ts"].map(
+        async (file) =>
+          (await regularFileInsideWorkspace(
+            rootPath,
+            file,
+            `${file} framework configuration`,
+          )) !== undefined,
       ),
     )).some(Boolean);
   if (hasNextSignature) {
@@ -121,8 +210,13 @@ async function detectFramework(
   const hasViteSignature =
     "vite" in dependencies ||
     (await Promise.all(
-      ["vite.config.js", "vite.config.mjs", "vite.config.ts"].map((file) =>
-        pathExists(join(rootPath, file)),
+      ["vite.config.js", "vite.config.mjs", "vite.config.ts"].map(
+        async (file) =>
+          (await regularFileInsideWorkspace(
+            rootPath,
+            file,
+            `${file} framework configuration`,
+          )) !== undefined,
       ),
     )).some(Boolean);
   if (hasViteSignature) {
