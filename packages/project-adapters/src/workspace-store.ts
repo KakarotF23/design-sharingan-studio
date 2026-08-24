@@ -301,6 +301,7 @@ async function openOwnedWorkspaceRoot(
 ): Promise<Awaited<ReturnType<typeof open>>> {
   if (
     project.rootPath !== ownership.rootPath ||
+    dirname(ownership.rootPath) !== ownership.parentPath ||
     assertPathInsideWorkspace(ownership.parentPath, ownership.rootPath) !==
       ownership.rootPath
   ) {

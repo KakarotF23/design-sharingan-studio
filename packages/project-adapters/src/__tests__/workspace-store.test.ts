@@ -21,6 +21,7 @@ import type {
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ensureDesignWorkspace,
+  saveGuardedProjectMetadata,
   saveProjectMetadata,
   saveReferenceArtifact,
   saveRenderArtifact,
@@ -55,6 +56,28 @@ function projectFixture(rootPath: string): Project {
     createdAt: "2026-08-24T09:00:00.000Z",
   };
 }
+
+// Production break caught: an ownership token bound only to an ancestor can
+// authorize a workspace outside the adapter's exact allocation parent.
+it("rejects guarded ownership whose parent is not the root's exact parent", async () => {
+  const allocationParent = await realpath(await temporaryProject());
+  const rootPath = join(allocationParent, "owned-workspace");
+  await mkdir(rootPath);
+  const rootEntry = await stat(rootPath);
+
+  await expect(
+    saveGuardedProjectMetadata(projectFixture(rootPath), {
+      rootPath,
+      parentPath: dirname(allocationParent),
+      dev: rootEntry.dev,
+      ino: rootEntry.ino,
+    }),
+  ).rejects.toThrow(/owned workspace identity changed/i);
+
+  await expect(lstat(join(rootPath, ".design-sharingan"))).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+});
 
 function referenceFixture(): Reference {
   return {
