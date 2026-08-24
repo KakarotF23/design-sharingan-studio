@@ -5,10 +5,13 @@ import {
   readFile,
   readdir,
   realpath,
+  rm,
   stat,
+  symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   DesignSession,
   Project,
@@ -105,6 +108,53 @@ it("fails closed when project metadata is not a regular file", async () => {
   await expect(ensureDesignWorkspace(rootPath)).rejects.toThrow(/regular file/i);
 });
 
+// Production break caught: canonical containment alone lets the machine root alias the project root and redirect session writes into source.
+it("rejects an in-project machine-root symlink alias without replacing source", async () => {
+  const rootPath = await temporaryProject();
+  const sourceSessionPath = join(rootPath, "sessions", "session-1.json");
+  await mkdir(dirname(sourceSessionPath), { recursive: true });
+  await writeFile(sourceSessionPath, "source-owned\n");
+  await symlink(".", join(rootPath, ".design-sharingan"));
+
+  const result = await saveSession(rootPath, sessionFixture()).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+
+  expect(await readFile(sourceSessionPath, "utf8")).toBe("source-owned\n");
+  expect(result).toBeInstanceOf(Error);
+  expect((result as Error).message).toMatch(/symbolic link/i);
+});
+
+// Production break caught: any fixed runtime-directory alias can redirect machine artifacts into an in-project source directory.
+it.each(["references", "sessions", "renders", "cache"])(
+  "rejects a symbolic-link alias for the fixed %s directory",
+  async (directoryName) => {
+    const rootPath = await temporaryProject();
+    const workspace = await ensureDesignWorkspace(rootPath);
+    const fixedPath = join(workspace.machinePath, directoryName);
+    const aliasTarget = join(rootPath, `source-${directoryName}`);
+    await rm(fixedPath, { recursive: true });
+    await mkdir(aliasTarget);
+    await symlink(aliasTarget, fixedPath);
+
+    await expect(ensureDesignWorkspace(rootPath)).rejects.toThrow(/symbolic link/i);
+  },
+);
+
+// Production break caught: accepting project.json as a symlink allows workspace identity to alias another in-project file.
+it("rejects a symbolic-link alias for project metadata", async () => {
+  const rootPath = await temporaryProject();
+  const workspace = await ensureDesignWorkspace(rootPath);
+  const sourcePath = join(rootPath, "source-project.json");
+  await rm(workspace.projectMetadataPath);
+  await writeFile(sourcePath, '{"sourceOwned":true}\n');
+  await symlink(sourcePath, workspace.projectMetadataPath);
+
+  await expect(ensureDesignWorkspace(rootPath)).rejects.toThrow(/symbolic link/i);
+  expect(await readFile(sourcePath, "utf8")).toBe('{"sourceOwned":true}\n');
+});
+
 // Production break caught: non-stable serialization or in-place writes produce noisy metadata and expose partial files to readers.
 it("writes stable two-space JSON by atomic file replacement", async () => {
   const rootPath = await temporaryProject();
@@ -142,7 +192,7 @@ it("writes stable two-space JSON by atomic file replacement", async () => {
 // Production break caught: artifact persistence that stores only bytes loses the domain record and actual image location.
 it("persists a reference record and bytes under its reference directory", async () => {
   const rootPath = await temporaryProject();
-  await ensureDesignWorkspace(rootPath);
+  await saveProjectMetadata(projectFixture(rootPath));
 
   const saved = await saveReferenceArtifact(
     rootPath,
@@ -169,6 +219,38 @@ it("persists a reference record and bytes under its reference directory", async 
   });
 });
 
+// Production break caught: an explicit root alone permits a reference from another project to be written into the active workspace.
+it("rejects a reference whose project identity does not match the workspace", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const mismatchedReference = {
+    ...referenceFixture(),
+    projectId: "project-2",
+  };
+
+  const result = await saveReferenceArtifact(
+    rootPath,
+    mismatchedReference,
+    new Uint8Array([1]),
+  ).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+
+  await expect(
+    lstat(
+      join(
+        rootPath,
+        ".design-sharingan",
+        "references",
+        mismatchedReference.id,
+      ),
+    ),
+  ).rejects.toMatchObject({ code: "ENOENT" });
+  expect(result).toBeInstanceOf(Error);
+  expect((result as Error).message).toMatch(/active project identity/i);
+});
+
 // Production break caught: trusting a session id as a path segment lets persistence escape its artifact directory.
 it("rejects a session id that traverses outside machine state", async () => {
   const rootPath = await temporaryProject();
@@ -185,6 +267,7 @@ it("rejects a session id that traverses outside machine state", async () => {
 // Production break caught: omitting the final rename leaves a session unavailable at its durable path.
 it("persists a session record at its stable machine-state path", async () => {
   const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
 
   const sessionPath = await saveSession(rootPath, sessionFixture());
 
@@ -201,10 +284,65 @@ it("persists a session record at its stable machine-state path", async () => {
   );
 });
 
+// Production break caught: an explicit root alone permits a session from another project to be written into the active workspace.
+it("rejects a session whose project identity does not match the workspace", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const mismatchedSession = {
+    ...sessionFixture(),
+    projectId: "project-2",
+  };
+
+  const result = await saveSession(rootPath, mismatchedSession).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+
+  await expect(
+    lstat(
+      join(
+        rootPath,
+        ".design-sharingan",
+        "sessions",
+        `${mismatchedSession.id}.json`,
+      ),
+    ),
+  ).rejects.toMatchObject({ code: "ENOENT" });
+  expect(result).toBeInstanceOf(Error);
+  expect((result as Error).message).toMatch(/active project identity/i);
+});
+
+// Production break caught: missing persisted identity must not default to trusting the caller's project id.
+it.each(["reference", "session"] as const)(
+  "fails closed when saving a %s without validated project metadata",
+  async (artifactKind) => {
+    const rootPath = await temporaryProject();
+    await ensureDesignWorkspace(rootPath);
+
+    const result =
+      artifactKind === "reference"
+        ? await saveReferenceArtifact(
+            rootPath,
+            referenceFixture(),
+            new Uint8Array([1]),
+          ).then(
+            () => undefined,
+            (error: unknown) => error,
+          )
+        : await saveSession(rootPath, sessionFixture()).then(
+            () => undefined,
+            (error: unknown) => error,
+          );
+
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toMatch(/active project identity/i);
+  },
+);
+
 // Production break caught: a failed replacement that leaves temp files behind pollutes runtime state and can be mistaken for evidence.
 it("cleans its temporary JSON file when atomic replacement fails", async () => {
   const rootPath = await temporaryProject();
-  await ensureDesignWorkspace(rootPath);
+  await saveProjectMetadata(projectFixture(rootPath));
   const sessionsPath = join(rootPath, ".design-sharingan", "sessions");
   await mkdir(join(sessionsPath, "blocked.json"));
 

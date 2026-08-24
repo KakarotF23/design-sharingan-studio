@@ -2,6 +2,7 @@ import {
   lstat,
   mkdir,
   open,
+  readFile,
   rename,
   unlink,
 } from "node:fs/promises";
@@ -32,36 +33,18 @@ export interface SavedArtifact {
   metadataPath: string;
 }
 
-function workspacePaths(rootPath: string): DesignWorkspace {
+function expectedWorkspacePaths(rootPath: string): DesignWorkspace {
   const canonicalRoot = assertPathInsideWorkspace(rootPath, rootPath);
-  const machinePath = assertPathInsideWorkspace(
-    canonicalRoot,
-    join(canonicalRoot, MACHINE_DIRECTORY),
-  );
+  const machinePath = join(canonicalRoot, MACHINE_DIRECTORY);
 
   return {
     rootPath: canonicalRoot,
     machinePath,
-    projectMetadataPath: assertPathInsideWorkspace(
-      canonicalRoot,
-      join(machinePath, "project.json"),
-    ),
-    referencesPath: assertPathInsideWorkspace(
-      canonicalRoot,
-      join(machinePath, "references"),
-    ),
-    sessionsPath: assertPathInsideWorkspace(
-      canonicalRoot,
-      join(machinePath, "sessions"),
-    ),
-    rendersPath: assertPathInsideWorkspace(
-      canonicalRoot,
-      join(machinePath, "renders"),
-    ),
-    cachePath: assertPathInsideWorkspace(
-      canonicalRoot,
-      join(machinePath, "cache"),
-    ),
+    projectMetadataPath: join(machinePath, "project.json"),
+    referencesPath: join(machinePath, "references"),
+    sessionsPath: join(machinePath, "sessions"),
+    rendersPath: join(machinePath, "renders"),
+    cachePath: join(machinePath, "cache"),
   };
 }
 
@@ -161,31 +144,100 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+async function validateFixedDirectory(
+  containingRoot: string,
+  directoryPath: string,
+  label: string,
+): Promise<string> {
+  if (await pathExists(directoryPath)) {
+    const entry = await lstat(directoryPath);
+    if (entry.isSymbolicLink()) {
+      throw new Error(`${label} must not be a symbolic link`);
+    }
+    if (!entry.isDirectory()) {
+      throw new Error(`${label} must be a real directory`);
+    }
+  } else {
+    await mkdir(directoryPath);
+  }
+
+  const createdEntry = await lstat(directoryPath);
+  if (createdEntry.isSymbolicLink()) {
+    throw new Error(`${label} must not be a symbolic link`);
+  }
+  if (!createdEntry.isDirectory()) {
+    throw new Error(`${label} must be a real directory`);
+  }
+
+  return assertPathInsideWorkspace(containingRoot, directoryPath);
+}
+
+async function validateProjectMetadataFile(
+  workspace: DesignWorkspace,
+): Promise<string> {
+  const metadataPath = workspace.projectMetadataPath;
+  if (await pathExists(metadataPath)) {
+    const entry = await lstat(metadataPath);
+    if (entry.isSymbolicLink()) {
+      throw new Error("Workspace project metadata must not be a symbolic link");
+    }
+    if (!entry.isFile()) {
+      throw new Error("Workspace project metadata must be a regular file");
+    }
+  } else {
+    await atomicWriteJson(workspace.machinePath, metadataPath, {});
+  }
+
+  const createdEntry = await lstat(metadataPath);
+  if (createdEntry.isSymbolicLink()) {
+    throw new Error("Workspace project metadata must not be a symbolic link");
+  }
+  if (!createdEntry.isFile()) {
+    throw new Error("Workspace project metadata must be a regular file");
+  }
+
+  return assertPathInsideWorkspace(workspace.machinePath, metadataPath);
+}
+
 export async function ensureDesignWorkspace(
   rootPath: string,
 ): Promise<DesignWorkspace> {
-  const workspace = workspacePaths(rootPath);
-
-  for (const directory of [
-    workspace.machinePath,
-    workspace.referencesPath,
-    workspace.sessionsPath,
-    workspace.rendersPath,
-    workspace.cachePath,
-  ]) {
-    const safeDirectory = assertPathInsideWorkspace(workspace.rootPath, directory);
-    await mkdir(safeDirectory, { recursive: true });
-  }
-
-  if (!(await pathExists(workspace.projectMetadataPath))) {
-    await atomicWriteJson(
-      workspace.machinePath,
-      workspace.projectMetadataPath,
-      {},
-    );
-  } else if (!(await lstat(workspace.projectMetadataPath)).isFile()) {
-    throw new Error("Workspace project metadata must be a regular file");
-  }
+  const expected = expectedWorkspacePaths(rootPath);
+  const machinePath = await validateFixedDirectory(
+    expected.rootPath,
+    expected.machinePath,
+    "Machine workspace directory",
+  );
+  const referencesPath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "references"),
+    "References directory",
+  );
+  const sessionsPath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "sessions"),
+    "Sessions directory",
+  );
+  const rendersPath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "renders"),
+    "Renders directory",
+  );
+  const cachePath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "cache"),
+    "Cache directory",
+  );
+  const workspace: DesignWorkspace = {
+    rootPath: expected.rootPath,
+    machinePath,
+    projectMetadataPath: join(machinePath, "project.json"),
+    referencesPath,
+    sessionsPath,
+    rendersPath,
+    cachePath,
+  };
+  workspace.projectMetadataPath = await validateProjectMetadataFile(workspace);
 
   return workspace;
 }
@@ -198,6 +250,58 @@ export async function saveProjectMetadata(project: Project): Promise<string> {
     project,
   );
   return workspace.projectMetadataPath;
+}
+
+function invalidProjectIdentity(cause?: unknown): Error {
+  const error = new Error(
+    "Cannot validate active project identity; refusing artifact persistence",
+  );
+  if (cause !== undefined) {
+    error.cause = cause;
+  }
+  return error;
+}
+
+async function loadValidatedProjectContext(
+  rootPath: string,
+  expectedProjectId: string,
+): Promise<DesignWorkspace> {
+  const workspace = await ensureDesignWorkspace(rootPath);
+
+  try {
+    const persisted = JSON.parse(
+      await readFile(workspace.projectMetadataPath, "utf8"),
+    ) as unknown;
+    if (
+      persisted === null ||
+      typeof persisted !== "object" ||
+      !("id" in persisted) ||
+      typeof persisted.id !== "string" ||
+      persisted.id !== expectedProjectId ||
+      !("rootPath" in persisted) ||
+      typeof persisted.rootPath !== "string"
+    ) {
+      throw invalidProjectIdentity();
+    }
+
+    const persistedRoot = assertPathInsideWorkspace(
+      workspace.rootPath,
+      persisted.rootPath,
+    );
+    if (persistedRoot !== workspace.rootPath) {
+      throw invalidProjectIdentity();
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith("Cannot validate active project identity")
+    ) {
+      throw error;
+    }
+    throw invalidProjectIdentity(error);
+  }
+
+  return workspace;
 }
 
 function extensionForReference(reference: Reference): string {
@@ -221,7 +325,10 @@ export async function saveReferenceArtifact(
   bytes: Uint8Array,
 ): Promise<SavedArtifact> {
   assertSafePathSegment(reference.id, "Reference id");
-  const workspace = await ensureDesignWorkspace(rootPath);
+  const workspace = await loadValidatedProjectContext(
+    rootPath,
+    reference.projectId,
+  );
   const referencePath = assertPathInsideWorkspace(
     workspace.referencesPath,
     join(workspace.referencesPath, reference.id),
@@ -251,7 +358,10 @@ export async function saveSession(
   session: DesignSession,
 ): Promise<string> {
   assertSafePathSegment(session.id, "Session id");
-  const workspace = await ensureDesignWorkspace(rootPath);
+  const workspace = await loadValidatedProjectContext(
+    rootPath,
+    session.projectId,
+  );
   const sessionPath = assertPathInsideWorkspace(
     workspace.sessionsPath,
     join(workspace.sessionsPath, `${session.id}.json`),
