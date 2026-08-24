@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, realpath, rename, rm } from "node:fs/promises";
+import {
+  lstat,
+  mkdtemp,
+  realpath,
+  rename,
+  rm,
+  rmdir,
+} from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Project } from "@design-sharingan/core";
 import { detectProject } from "./detect-project";
@@ -12,6 +19,10 @@ export interface GitHubProjectInput {
   repositoryUrl: string;
   branch: string;
   token?: string;
+  /**
+   * Preferred clone path. Its canonical parent bounds allocation, while the
+   * returned ProjectWorkspace.rootPath is the authoritative unique workspace.
+   */
   destinationPath: string;
 }
 
@@ -140,9 +151,59 @@ async function cleanupCloneStaging(
       staging.identity,
       "Git clone staging directory",
     );
-    await rm(staging.path, { recursive: true });
   } catch {
-    // Cleanup is best-effort and never follows or removes an unowned path.
+    // Ownership changed. Leak the path rather than touch replacement data.
+    return;
+  }
+
+  let quarantine: CloneStaging | undefined;
+  try {
+    const quarantinePath = await mkdtemp(
+      join(parentPath, ".design-sharingan-cleanup-"),
+    );
+    const entry = await lstat(quarantinePath);
+    quarantine = {
+      path: quarantinePath,
+      identity: { dev: entry.dev, ino: entry.ino },
+    };
+    await verifyOwnedDirectory(
+      parentPath,
+      quarantine.path,
+      quarantine.identity,
+      "Git cleanup quarantine",
+    );
+
+    const quarantinedWorkspace = join(
+      quarantine.path,
+      `workspace-${randomUUID()}`,
+    );
+    await rename(staging.path, quarantinedWorkspace);
+    await verifyOwnedDirectory(
+      quarantine.path,
+      quarantinedWorkspace,
+      staging.identity,
+      "Quarantined Git workspace",
+    );
+    await verifyOwnedDirectory(
+      parentPath,
+      quarantine.path,
+      quarantine.identity,
+      "Git cleanup quarantine",
+    );
+
+    // The recursive removal occurs only after an atomic move into a fresh,
+    // exclusive namespace that was never disclosed to the external runner.
+    await rm(quarantinedWorkspace, { recursive: true });
+    await verifyOwnedDirectory(
+      parentPath,
+      quarantine.path,
+      quarantine.identity,
+      "Git cleanup quarantine",
+    );
+    await rmdir(quarantine.path);
+  } catch {
+    // Cleanup is best-effort. Any ownership uncertainty intentionally leaks
+    // the staging/quarantine path instead of deleting a replacement inode.
   }
 }
 
@@ -185,7 +246,7 @@ export class GitHubProjectAdapter {
             ).toString("base64")}`,
           };
 
-    let published = false;
+    let completed = false;
     try {
       try {
         await this.gitRunner.run(command, {
@@ -202,31 +263,18 @@ export class GitHubProjectAdapter {
         staging.identity,
         "Git clone staging directory",
       );
-      await assertDestinationAbsent(location.destinationPath);
-      try {
-        await rename(staging.path, location.destinationPath);
-      } catch {
-        throw new Error(
-          "Git clone destination changed during import; refusing workspace publication",
-        );
-      }
-      published = true;
-      await verifyOwnedDirectory(
-        location.parentPath,
-        location.destinationPath,
-        staging.identity,
-        "Published GitHub workspace",
-      );
 
-      const detection = await detectProject(location.destinationPath);
-      if (detection.rootPath !== location.destinationPath) {
-        throw new Error("Published GitHub workspace escaped its destination");
+      // Detection and persistence complete before the unique workspace path is
+      // exposed to the caller. The preferred destination is never overwritten.
+      const detection = await detectProject(staging.path);
+      if (detection.rootPath !== staging.path) {
+        throw new Error("Owned GitHub workspace escaped its allocation");
       }
       await verifyOwnedDirectory(
         location.parentPath,
-        location.destinationPath,
+        staging.path,
         staging.identity,
-        "Published GitHub workspace",
+        "Owned GitHub workspace",
       );
 
       const timestamp = this.runtime.now().toISOString();
@@ -250,6 +298,13 @@ export class GitHubProjectAdapter {
       };
 
       await saveProjectMetadata(project);
+      await verifyOwnedDirectory(
+        location.parentPath,
+        staging.path,
+        staging.identity,
+        "Owned GitHub workspace",
+      );
+      completed = true;
 
       return {
         ...detection,
@@ -258,7 +313,7 @@ export class GitHubProjectAdapter {
         packageManager: detection.packageManager,
       };
     } finally {
-      if (!published) {
+      if (!completed) {
         await cleanupCloneStaging(location.parentPath, staging);
       }
     }

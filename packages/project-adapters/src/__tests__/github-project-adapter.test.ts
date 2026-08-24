@@ -82,7 +82,7 @@ describe("GitHubProjectAdapter", () => {
       destinationPath,
     });
     const persistedText = await readFile(
-      join(destinationPath, ".design-sharingan", "project.json"),
+      join(workspace.rootPath, ".design-sharingan", "project.json"),
       "utf8",
     );
     const [call] = gitRunner.calls;
@@ -103,6 +103,7 @@ describe("GitHubProjectAdapter", () => {
     expect(basename(cloneTarget as string)).toMatch(
       /^\.design-sharingan-clone-/,
     );
+    expect(workspace.rootPath).toBe(cloneTarget);
     expect(call?.command.cwd).toBe(canonicalParent);
     expect(JSON.stringify(call?.command)).not.toContain(token);
     expect(call?.options?.privateEnvironment).toEqual(
@@ -125,8 +126,8 @@ describe("GitHubProjectAdapter", () => {
     expect(workspace.capabilities.canUseGit).toBe(true);
   });
 
-  // Production break caught: cloning directly into the requested path lets a runner-time symlink swap redirect detection and metadata outside the selected parent.
-  it("fails closed when the requested destination becomes an escape symlink", async () => {
+  // Production break caught: publishing through a requested path that becomes a symlink redirects detection and metadata outside the approved parent.
+  it("keeps detection and persistence in the owned workspace when the preferred destination becomes an escape symlink", async () => {
     const parentPath = await cloneParent();
     const destinationPath = join(parentPath, "checkout");
     const outsideSandbox = await cloneParent();
@@ -166,24 +167,95 @@ describe("GitHubProjectAdapter", () => {
       },
     };
 
-    const error = await new GitHubProjectAdapter({ gitRunner })
-      .open({
-        repositoryUrl: "https://github.com/example/private.git",
-        branch: "main",
-        destinationPath,
-      })
-      .then(
-        () => undefined,
-        (caught: unknown) => caught,
-      );
+    const workspace = await new GitHubProjectAdapter({ gitRunner }).open({
+      repositoryUrl: "https://github.com/example/private.git",
+      branch: "main",
+      destinationPath,
+    });
 
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toMatch(/destination|workspace safely/i);
+    expect(dirname(workspace.rootPath)).toBe(canonicalParent);
+    expect(workspace.rootPath).not.toBe(canonicalDestination);
+    expect(workspace.rootPath).not.toBe(outsidePath);
+    expect(
+      JSON.parse(
+        await readFile(
+          join(workspace.rootPath, ".design-sharingan", "project.json"),
+          "utf8",
+        ),
+      ),
+    ).toMatchObject({ rootPath: workspace.rootPath, sourceType: "GITHUB" });
     await expect(
       readFile(join(outsidePath, ".design-sharingan", "project.json"), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
-    const parentEntries = await readdir(parentPath);
-    expect(parentEntries.some((entry) => entry.startsWith(".design-sharingan-clone-"))).toBe(false);
+  });
+
+  // Production break caught: ordinary rename publication can overwrite an empty destination that appears after initial validation.
+  it("does not overwrite a preferred destination that appears during clone", async () => {
+    const parentPath = await cloneParent();
+    const destinationPath = join(parentPath, "checkout");
+    const canonicalParent = await realpath(parentPath);
+    const replacementMarker = join(destinationPath, "user-owned.txt");
+    const gitRunner: GitRunner = {
+      run: async (command) => {
+        const cloneTarget = command.args.at(-1);
+        if (cloneTarget === undefined) {
+          throw new Error("missing fake clone destination");
+        }
+        await Promise.all([
+          mkdir(join(cloneTarget, ".git")),
+          writeFile(
+            join(cloneTarget, "package.json"),
+            '{"scripts":{"dev":"next dev"},"dependencies":{"next":"latest"}}\n',
+          ),
+          mkdir(destinationPath),
+        ]);
+        await writeFile(replacementMarker, "user-owned\n");
+      },
+    };
+
+    const workspace = await new GitHubProjectAdapter({ gitRunner }).open({
+      repositoryUrl: "https://github.com/example/private.git",
+      branch: "main",
+      destinationPath,
+    });
+
+    expect(dirname(workspace.rootPath)).toBe(canonicalParent);
+    expect(workspace.rootPath).not.toBe(join(canonicalParent, "checkout"));
+    expect(await readFile(replacementMarker, "utf8")).toBe("user-owned\n");
+    await expect(
+      readFile(join(destinationPath, ".design-sharingan", "project.json"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // Production break caught: cleanup by a previously verified pathname can delete a replacement inode installed by the external boundary.
+  it("leaves a replacement staging directory untouched on cleanup", async () => {
+    const parentPath = await cloneParent();
+    const destinationPath = join(parentPath, "checkout");
+    let cloneTarget: string | undefined;
+    const gitRunner: GitRunner = {
+      run: async (command) => {
+        cloneTarget = command.args.at(-1);
+        if (cloneTarget === undefined) {
+          throw new Error("missing fake clone destination");
+        }
+        await rm(cloneTarget, { recursive: true });
+        await mkdir(cloneTarget);
+        await writeFile(join(cloneTarget, "replacement.txt"), "keep me\n");
+        throw new Error("simulated clone failure");
+      },
+    };
+
+    await expect(
+      new GitHubProjectAdapter({ gitRunner }).open({
+        repositoryUrl: "https://github.com/example/private.git",
+        branch: "main",
+        destinationPath,
+      }),
+    ).rejects.toThrow(/unable to clone/i);
+
+    expect(cloneTarget).toBeDefined();
+    expect(await readFile(join(cloneTarget as string, "replacement.txt"), "utf8"))
+      .toBe("keep me\n");
   });
 
   // Production break caught: propagating an external process error can surface a private token in UI/logging error messages.
