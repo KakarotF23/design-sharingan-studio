@@ -1,3 +1,4 @@
+import { renameSync, symlinkSync } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -256,6 +257,82 @@ describe("GitHubProjectAdapter", () => {
     expect(cloneTarget).toBeDefined();
     expect(await readFile(join(cloneTarget as string, "replacement.txt"), "utf8"))
       .toBe("keep me\n");
+  });
+
+  // Production break caught: a swap from an injected runtime hook immediately before persistence can redirect Task 3 metadata into an external root.
+  it("binds metadata persistence to the owned workspace inode", async () => {
+    const parentPath = await cloneParent();
+    const outsideSandbox = await cloneParent();
+    const outsidePath = join(outsideSandbox, "escape-target");
+    await mkdir(outsidePath);
+    let cloneTarget: string | undefined;
+    const gitRunner: GitRunner = {
+      run: async (command) => {
+        cloneTarget = command.args.at(-1);
+        if (cloneTarget === undefined) {
+          throw new Error("missing fake clone destination");
+        }
+        await Promise.all([
+          mkdir(join(cloneTarget, ".git")),
+          writeFile(
+            join(cloneTarget, "package.json"),
+            '{"scripts":{"dev":"next dev"},"dependencies":{"next":"latest"}}\n',
+          ),
+        ]);
+      },
+    };
+    const runtime = {
+      now: () => new Date("2026-08-24T12:00:00.000Z"),
+      createId: () => {
+        if (cloneTarget === undefined) {
+          throw new Error("clone target was not captured");
+        }
+        renameSync(cloneTarget, `${cloneTarget}-owned-orphan`);
+        symlinkSync(outsidePath, cloneTarget, "dir");
+        return "project-owned-inode";
+      },
+    };
+
+    await expect(
+      new GitHubProjectAdapter({ gitRunner, runtime }).open({
+        repositoryUrl: "https://github.com/example/private.git",
+        branch: "main",
+        destinationPath: join(parentPath, "checkout"),
+      }),
+    ).rejects.toThrow(/owned.*workspace|persistence|retained/i);
+
+    await expect(
+      readFile(join(outsidePath, ".design-sharingan", "project.json"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // Production break caught: tidying a failed clone by pathname can delete data that must be retained when ownership cannot be capability-pinned.
+  it("retains a failed workspace instead of destructively cleaning it", async () => {
+    const parentPath = await cloneParent();
+    let cloneTarget: string | undefined;
+    const gitRunner: GitRunner = {
+      run: async (command) => {
+        cloneTarget = command.args.at(-1);
+        if (cloneTarget === undefined) {
+          throw new Error("missing fake clone destination");
+        }
+        await writeFile(join(cloneTarget, "retain-on-failure.txt"), "retain me\n");
+        throw new Error("simulated clone failure");
+      },
+    };
+
+    await expect(
+      new GitHubProjectAdapter({ gitRunner }).open({
+        repositoryUrl: "https://github.com/example/private.git",
+        branch: "main",
+        destinationPath: join(parentPath, "checkout"),
+      }),
+    ).rejects.toThrow(/retained|incomplete workspace/i);
+
+    expect(cloneTarget).toBeDefined();
+    expect(
+      await readFile(join(cloneTarget as string, "retain-on-failure.txt"), "utf8"),
+    ).toBe("retain me\n");
   });
 
   // Production break caught: propagating an external process error can surface a private token in UI/logging error messages.

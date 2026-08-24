@@ -1,19 +1,15 @@
 import { randomUUID } from "node:crypto";
-import {
-  lstat,
-  mkdtemp,
-  realpath,
-  rename,
-  rm,
-  rmdir,
-} from "node:fs/promises";
+import { lstat, mkdtemp, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Project } from "@design-sharingan/core";
 import { detectProject } from "./detect-project";
 import { defaultGitRunner, type GitRunner } from "./git";
 import { assertPathInsideWorkspace } from "./path-policy";
 import type { AdapterRuntime, ProjectWorkspace } from "./types";
-import { saveProjectMetadata } from "./workspace-store";
+import {
+  saveGuardedProjectMetadata,
+  type WorkspaceOwnership,
+} from "./workspace-store";
 
 export interface GitHubProjectInput {
   repositoryUrl: string;
@@ -140,71 +136,14 @@ async function reserveCloneStaging(parentPath: string): Promise<CloneStaging> {
   return staging;
 }
 
-async function cleanupCloneStaging(
-  parentPath: string,
-  staging: CloneStaging,
-): Promise<void> {
-  try {
-    await verifyOwnedDirectory(
-      parentPath,
-      staging.path,
-      staging.identity,
-      "Git clone staging directory",
-    );
-  } catch {
-    // Ownership changed. Leak the path rather than touch replacement data.
-    return;
-  }
-
-  let quarantine: CloneStaging | undefined;
-  try {
-    const quarantinePath = await mkdtemp(
-      join(parentPath, ".design-sharingan-cleanup-"),
-    );
-    const entry = await lstat(quarantinePath);
-    quarantine = {
-      path: quarantinePath,
-      identity: { dev: entry.dev, ino: entry.ino },
-    };
-    await verifyOwnedDirectory(
-      parentPath,
-      quarantine.path,
-      quarantine.identity,
-      "Git cleanup quarantine",
-    );
-
-    const quarantinedWorkspace = join(
-      quarantine.path,
-      `workspace-${randomUUID()}`,
-    );
-    await rename(staging.path, quarantinedWorkspace);
-    await verifyOwnedDirectory(
-      quarantine.path,
-      quarantinedWorkspace,
-      staging.identity,
-      "Quarantined Git workspace",
-    );
-    await verifyOwnedDirectory(
-      parentPath,
-      quarantine.path,
-      quarantine.identity,
-      "Git cleanup quarantine",
-    );
-
-    // The recursive removal occurs only after an atomic move into a fresh,
-    // exclusive namespace that was never disclosed to the external runner.
-    await rm(quarantinedWorkspace, { recursive: true });
-    await verifyOwnedDirectory(
-      parentPath,
-      quarantine.path,
-      quarantine.identity,
-      "Git cleanup quarantine",
-    );
-    await rmdir(quarantine.path);
-  } catch {
-    // Cleanup is best-effort. Any ownership uncertainty intentionally leaks
-    // the staging/quarantine path instead of deleting a replacement inode.
-  }
+function retainedWorkspaceError(error: unknown): Error {
+  const reason =
+    error instanceof Error && /unable to clone github repository/i.test(error.message)
+      ? "Unable to clone GitHub repository"
+      : "GitHub import failed";
+  return new Error(
+    `${reason}; incomplete workspace retained at its allocated local path`,
+  );
 }
 
 export class GitHubProjectAdapter {
@@ -221,6 +160,12 @@ export class GitHubProjectAdapter {
     validateBranch(input.branch);
     const location = await cloneLocation(input.destinationPath);
     const staging = await reserveCloneStaging(location.parentPath);
+    const ownership: WorkspaceOwnership = {
+      rootPath: staging.path,
+      parentPath: location.parentPath,
+      dev: staging.identity.dev,
+      ino: staging.identity.ino,
+    };
     const command = {
       executable: "git" as const,
       args: [
@@ -246,7 +191,6 @@ export class GitHubProjectAdapter {
             ).toString("base64")}`,
           };
 
-    let completed = false;
     try {
       try {
         await this.gitRunner.run(command, {
@@ -297,25 +241,23 @@ export class GitHubProjectAdapter {
         updatedAt: timestamp,
       };
 
-      await saveProjectMetadata(project);
+      await saveGuardedProjectMetadata(project, ownership);
       await verifyOwnedDirectory(
         location.parentPath,
         staging.path,
         staging.identity,
         "Owned GitHub workspace",
       );
-      completed = true;
-
       return {
         ...detection,
         ...project,
         framework: detection.framework,
         packageManager: detection.packageManager,
       };
-    } finally {
-      if (!completed) {
-        await cleanupCloneStaging(location.parentPath, staging);
-      }
+    } catch (error) {
+      // Destructive failure cleanup is intentionally forbidden without an
+      // inode-bound deletion capability. The unique workspace is orphaned.
+      throw retainedWorkspaceError(error);
     }
   }
 }

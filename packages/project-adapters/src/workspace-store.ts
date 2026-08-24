@@ -3,9 +3,11 @@ import {
   mkdir,
   open,
   readFile,
+  realpath,
   rename,
   unlink,
 } from "node:fs/promises";
+import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, extname, join } from "node:path";
 import type {
@@ -31,6 +33,13 @@ export interface DesignWorkspace {
 export interface SavedArtifact {
   artifactPath: string;
   metadataPath: string;
+}
+
+export interface WorkspaceOwnership {
+  rootPath: string;
+  parentPath: string;
+  dev: number;
+  ino: number;
 }
 
 function expectedWorkspacePaths(rootPath: string): DesignWorkspace {
@@ -250,6 +259,105 @@ export async function saveProjectMetadata(project: Project): Promise<string> {
     project,
   );
   return workspace.projectMetadataPath;
+}
+
+function invalidWorkspaceOwnership(): Error {
+  return new Error(
+    "Owned workspace identity changed; refusing guarded persistence",
+  );
+}
+
+async function assertOpenWorkspaceOwnership(
+  rootHandle: Awaited<ReturnType<typeof open>>,
+  ownership: WorkspaceOwnership,
+): Promise<void> {
+  let pathEntry: Awaited<ReturnType<typeof lstat>>;
+  let handleEntry: Awaited<ReturnType<typeof rootHandle.stat>>;
+  try {
+    [pathEntry, handleEntry] = await Promise.all([
+      lstat(ownership.rootPath),
+      rootHandle.stat(),
+    ]);
+  } catch {
+    throw invalidWorkspaceOwnership();
+  }
+
+  if (
+    pathEntry.isSymbolicLink() ||
+    !pathEntry.isDirectory() ||
+    !handleEntry.isDirectory() ||
+    pathEntry.dev !== ownership.dev ||
+    pathEntry.ino !== ownership.ino ||
+    handleEntry.dev !== ownership.dev ||
+    handleEntry.ino !== ownership.ino
+  ) {
+    throw invalidWorkspaceOwnership();
+  }
+}
+
+async function openOwnedWorkspaceRoot(
+  project: Project,
+  ownership: WorkspaceOwnership,
+): Promise<Awaited<ReturnType<typeof open>>> {
+  if (
+    project.rootPath !== ownership.rootPath ||
+    assertPathInsideWorkspace(ownership.parentPath, ownership.rootPath) !==
+      ownership.rootPath
+  ) {
+    throw invalidWorkspaceOwnership();
+  }
+
+  let rootHandle: Awaited<ReturnType<typeof open>>;
+  try {
+    rootHandle = await open(
+      ownership.rootPath,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+  } catch {
+    throw invalidWorkspaceOwnership();
+  }
+
+  try {
+    const canonicalParent = await realpath(ownership.parentPath);
+    const canonicalRoot = await realpath(ownership.rootPath);
+    if (
+      canonicalParent !== ownership.parentPath ||
+      canonicalRoot !== ownership.rootPath
+    ) {
+      throw invalidWorkspaceOwnership();
+    }
+    await assertOpenWorkspaceOwnership(rootHandle, ownership);
+    return rootHandle;
+  } catch (error) {
+    await rootHandle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Persist project metadata only while the canonical workspace path still
+ * resolves to the exact directory inode captured by its adapter.
+ */
+export async function saveGuardedProjectMetadata(
+  project: Project,
+  ownership: WorkspaceOwnership,
+): Promise<string> {
+  const rootHandle = await openOwnedWorkspaceRoot(project, ownership);
+  try {
+    // No caller-provided JavaScript executes between the guarded open and the
+    // fixed runtime hierarchy mutation below.
+    const workspace = await ensureDesignWorkspace(project.rootPath);
+    await assertOpenWorkspaceOwnership(rootHandle, ownership);
+    await atomicWriteJson(
+      workspace.machinePath,
+      workspace.projectMetadataPath,
+      project,
+    );
+    await assertOpenWorkspaceOwnership(rootHandle, ownership);
+    return workspace.projectMetadataPath;
+  } finally {
+    await rootHandle.close().catch(() => undefined);
+  }
 }
 
 function invalidProjectIdentity(cause?: unknown): Error {
