@@ -174,7 +174,7 @@ export interface DesignApproach {
   recommended: boolean;
   pros: string[];
   cons: string[];
-  uxImpact: UXImpact;
+  uxImpact: UXImpact[];
   estimatedComplexity: string;
   genomeFit: string;
   likelyFiles: string[];

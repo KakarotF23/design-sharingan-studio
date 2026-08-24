@@ -33,4 +33,36 @@ describe("autonomy policy", () => {
       }).decision
     ).toBe("HUMAN_GATE");
   });
+
+  it("protects default runtime, governance, repository-control, and secret paths", () => {
+    for (const file of [
+      ".design-sharingan/project.json",
+      "design-governance/DESIGN-GENOME.md",
+      ".git/config",
+      ".env.local"
+    ]) {
+      expect(
+        evaluateAutonomyPolicy(DEFAULT_AUTONOMY_POLICY, {
+          kind: "STYLE_CHANGE",
+          files: [file]
+        }).decision
+      ).toBe("HUMAN_GATE");
+    }
+  });
+
+  it("normalizes traversal and duplicate separators before matching protected paths", () => {
+    const policy = {
+      ...DEFAULT_AUTONOMY_POLICY,
+      protectedPaths: ["src/auth/**"]
+    };
+
+    for (const file of ["src/auth/../auth/Login.tsx", "src//auth//Login.tsx"]) {
+      expect(
+        evaluateAutonomyPolicy(policy, {
+          kind: "STYLE_CHANGE",
+          files: [file]
+        }).decision
+      ).toBe("HUMAN_GATE");
+    }
+  });
 });

@@ -38,12 +38,51 @@ export const DEFAULT_AUTONOMY_POLICY: AutonomyPolicy = {
   allowNavigationChanges: false,
   allowDataModelChanges: false,
   allowFileDeletion: false,
-  protectedPaths: []
+  protectedPaths: [
+    ".design-sharingan/**",
+    "design-governance/**",
+    ".git/**",
+    ".env",
+    ".env.*",
+    "**/.env",
+    "**/.env.*"
+  ]
 };
 
+function normalizeRelativePath(value: string): string | undefined {
+  const candidate = value.replaceAll("\\", "/");
+
+  if (candidate.startsWith("/")) {
+    return undefined;
+  }
+
+  const segments: string[] = [];
+  for (const segment of candidate.split("/")) {
+    if (segment === "" || segment === ".") {
+      continue;
+    }
+
+    if (segment === "..") {
+      if (segments.length === 0) {
+        return undefined;
+      }
+
+      segments.pop();
+      continue;
+    }
+
+    segments.push(segment);
+  }
+
+  return segments.length > 0 ? segments.join("/") : undefined;
+}
+
 function pathMatchesPattern(path: string, pattern: string): boolean {
-  const normalizedPath = path.replaceAll("\\", "/").replace(/^\.\//, "");
-  const normalizedPattern = pattern.replaceAll("\\", "/").replace(/^\.\//, "");
+  const normalizedPattern = normalizeRelativePath(pattern);
+  if (!normalizedPattern) {
+    return false;
+  }
+
   const expression = normalizedPattern
     .split("/")
     .map((segment) => {
@@ -55,7 +94,7 @@ function pathMatchesPattern(path: string, pattern: string): boolean {
     })
     .join("/");
 
-  return new RegExp(`^${expression}$`).test(normalizedPath);
+  return new RegExp(`^${expression}$`).test(path);
 }
 
 function isAllowed(policy: AutonomyPolicy, change: AutonomyChange): boolean {
@@ -84,14 +123,27 @@ export function evaluateAutonomyPolicy(
   policy: AutonomyPolicy,
   change: AutonomyChange
 ): AutonomyPolicyEvaluation {
-  const protectedFiles = change.files.filter((file) =>
-    policy.protectedPaths.some((pattern) => pathMatchesPattern(file, pattern))
+  const normalizedFiles = change.files.map((file) => ({
+    original: file,
+    normalized: normalizeRelativePath(file)
+  }));
+  const unsafeFiles = normalizedFiles.filter(({ normalized }) => !normalized);
+
+  if (unsafeFiles.length > 0) {
+    return {
+      decision: "HUMAN_GATE",
+      reasons: unsafeFiles.map(({ original }) => `Unsafe path: ${original}`)
+    };
+  }
+
+  const protectedFiles = normalizedFiles.filter(({ normalized }) =>
+    policy.protectedPaths.some((pattern) => pathMatchesPattern(normalized!, pattern))
   );
 
   if (protectedFiles.length > 0) {
     return {
       decision: "HUMAN_GATE",
-      reasons: protectedFiles.map((file) => `Protected path: ${file}`)
+      reasons: protectedFiles.map(({ original }) => `Protected path: ${original}`)
     };
   }
 
