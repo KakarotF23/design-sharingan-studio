@@ -23,6 +23,9 @@ importers:
       '@design-sharingan/agent-runtime':
         specifier: workspace:*
         version: link:../../packages/agent-runtime
+      '@design-sharingan/approval-engine':
+        specifier: workspace:*
+        version: link:../../packages/approval-engine
       '@design-sharingan/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -60,6 +63,22 @@ importers:
       '@openai/codex-sdk':
         specifier: 0.149.0
         version: 0.149.0
+    devDependencies:
+      '@types/node':
+        specifier: latest
+        version: 26.2.0
+      vitest:
+        specifier: latest
+        version: 4.1.11(@types/node@26.2.0)(vite@8.2.2(@types/node@26.2.0))
+
+  packages/approval-engine:
+    dependencies:
+      '@design-sharingan/agent-runtime':
+        specifier: workspace:*
+        version: link:../agent-runtime
+      '@design-sharingan/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
       '@types/node':
         specifier: latest

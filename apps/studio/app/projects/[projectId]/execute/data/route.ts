@@ -1,6 +1,4 @@
-import {
-  loadApprovedExecutionDirection,
-} from "@design-sharingan/project-adapters";
+import { loadSafeExecutionState } from "@design-sharingan/project-adapters";
 import { resolveProjectRequest } from "../../../../../features/projects/project-access";
 
 export const runtime = "nodejs";
@@ -12,7 +10,7 @@ export async function GET(
   const { projectId } = await context.params;
   try {
     const project = await resolveProjectRequest(projectId);
-    const executeSession = await loadApprovedExecutionDirection(
+    const executeSession = await loadSafeExecutionState(
       project.rootPath,
       project.id,
     );

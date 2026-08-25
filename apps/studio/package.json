@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@design-sharingan/agent-runtime": "workspace:*",
+    "@design-sharingan/approval-engine": "workspace:*",
     "@design-sharingan/core": "workspace:*",
     "@design-sharingan/project-adapters": "workspace:*",
     "@design-sharingan/sharingan-engine": "workspace:*",

@@ -3,5 +3,6 @@ export * from "./git";
 export * from "./github-project-adapter";
 export * from "./local-project-adapter";
 export * from "./path-policy";
+export * from "./safe-execution-store";
 export * from "./types";
 export * from "./workspace-store";
