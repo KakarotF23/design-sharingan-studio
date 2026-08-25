@@ -9,10 +9,12 @@ import {
   saveSession,
   transitionLearnSession,
 } from "@design-sharingan/project-adapters";
-import type { ReferenceScanResultSession } from "@design-sharingan/project-adapters";
+import type {
+  ReferenceScanPendingSession,
+  ReferenceScanResultSession,
+} from "@design-sharingan/project-adapters";
 import { scanReference } from "@design-sharingan/sharingan-engine";
 import { createScanAgent } from "../../../../../features/learn/scan-agent";
-import type { ReferenceScanPendingSession } from "../../../../../features/references/reference-types";
 import { createAnalysisStagingDirectory } from "../../../../../features/projects/project-locator";
 import { resolveProjectRequest } from "../../../../../features/projects/project-access";
 import { readProjectJson } from "../../../../../features/projects/project-request";

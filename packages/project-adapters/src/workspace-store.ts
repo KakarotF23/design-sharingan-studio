@@ -926,6 +926,30 @@ export async function transitionLearnSession(
   return saveSession(rootPath, session);
 }
 
+export interface ReferenceScanPendingSession extends DesignSession {
+  type: "REFERENCE_SCAN";
+  status: "DRAFT" | "ANALYZING";
+  referenceId: string;
+  referenceTitle: string;
+  error?: string;
+}
+
+export function isReferenceScanPendingSession(
+  value: unknown,
+): value is ReferenceScanPendingSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<ReferenceScanPendingSession>;
+  return (
+    session.type === "REFERENCE_SCAN" &&
+    (session.status === "DRAFT" || session.status === "ANALYZING") &&
+    typeof session.referenceId === "string" &&
+    session.referenceId.length > 0 &&
+    typeof session.referenceTitle === "string" &&
+    session.referenceTitle.length > 0 &&
+    (session.error === undefined || typeof session.error === "string")
+  );
+}
+
 export interface ReferenceScanResultSession extends DesignSession {
   type: "REFERENCE_SCAN";
   status: "RESULT_READY";
@@ -983,7 +1007,11 @@ export async function commitReferenceScan(
     throw new Error("Reference scan checkpoint evidence is incomplete");
   }
   const finalDesignDNAContents = stableJson(designDNA);
-  if (stableJson(session.designDNA) !== finalDesignDNAContents) {
+  if (
+    stableJson(session.designDNA) !== finalDesignDNAContents ||
+    designDNA.referenceIds.length !== 1 ||
+    designDNA.referenceIds[0] !== reference.id
+  ) {
     throw new Error("Reference scan checkpoint evidence does not match");
   }
   const [existingReference, existingSession] = await Promise.all([
@@ -991,19 +1019,22 @@ export async function commitReferenceScan(
     loadSession(rootPath, session.projectId, session.id),
   ]);
   if (
+    !isReferenceScanPendingSession(existingSession) ||
+    existingSession.status !== "ANALYZING" ||
+    existingSession.id !== session.id ||
+    existingSession.projectId !== session.projectId ||
+    existingSession.referenceId !== session.referenceId ||
+    existingSession.referenceTitle !== session.referenceTitle ||
     existingReference.projectId !== session.projectId ||
     session.referenceId !== reference.id ||
     session.referenceTitle !== reference.title ||
-    existingSession.type !== "REFERENCE_SCAN" ||
-    existingSession.status !== "ANALYZING" ||
     existingSession.createdAt !== session.createdAt ||
     !canTransitionLearnSession("ANALYZING", session.status) ||
     reference.analysisStatus !== "ANALYZED" ||
     reference.imagePath !== existingReference.imagePath ||
     reference.type !== existingReference.type ||
     reference.source !== existingReference.source ||
-    reference.createdAt !== existingReference.createdAt ||
-    !designDNA.referenceIds.includes(reference.id)
+    reference.createdAt !== existingReference.createdAt
   ) {
     throw new Error(
       "Reference scan checkpoint requires an ANALYZING session and matching artifacts",

@@ -199,14 +199,30 @@ function designDNAFixture(): DesignDNA {
   };
 }
 
-function referenceScanResultSessionFixture(id = "session-1") {
+function referenceScanPendingSessionFixture(
+  status: "DRAFT" | "ANALYZING" = "DRAFT",
+  id = "session-1",
+) {
+  return {
+    ...sessionFixture(id),
+    type: "REFERENCE_SCAN" as const,
+    status,
+    referenceId: "reference-1",
+    referenceTitle: "Reference",
+  };
+}
+
+function referenceScanResultSessionFixture(
+  id = "session-1",
+  designDNA = designDNAFixture(),
+) {
   return {
     ...sessionFixture(id),
     type: "REFERENCE_SCAN" as const,
     status: "RESULT_READY" as const,
     referenceId: "reference-1",
     referenceTitle: "Reference",
-    designDNA: designDNAFixture(),
+    designDNA,
     agentThreadId: "thread-1",
   };
 }
@@ -449,7 +465,7 @@ it("enforces the Learn lifecycle and commits a completed reference scan as one r
     "project-1",
     "reference-1",
   );
-  const draft = sessionFixture();
+  const draft = referenceScanPendingSessionFixture();
   const analyzing = { ...draft, status: "ANALYZING" as const };
   const completed = referenceScanResultSessionFixture();
   const analyzedReference = {
@@ -538,13 +554,8 @@ it.each([
     "project-1",
     "reference-1",
   );
-  const draft = sessionFixture();
-  const analyzing = {
-    ...draft,
-    status: "ANALYZING" as const,
-    referenceId: "reference-1",
-    referenceTitle: "Reference",
-  };
+  const draft = referenceScanPendingSessionFixture();
+  const analyzing = { ...draft, status: "ANALYZING" as const };
   await saveSession(rootPath, draft);
   await transitionLearnSession(rootPath, "DRAFT", analyzing);
 
@@ -569,12 +580,95 @@ it.each([
   );
 });
 
+// Production break caught: checking only a persisted session's generic
+// type/status/time lets an incomplete or unrelated ANALYZING record authorize
+// a completed report, while `includes` admits multi-reference provenance for a
+// single-reference SCAN.
+it.each([
+  [
+    "missing pending reference identity",
+    () => ({ ...sessionFixture(), status: "ANALYZING" as const }),
+    () => designDNAFixture(),
+  ],
+  [
+    "a different pending reference id",
+    () => ({
+      ...referenceScanPendingSessionFixture("ANALYZING"),
+      referenceId: "reference-2",
+    }),
+    () => designDNAFixture(),
+  ],
+  [
+    "a different pending reference title",
+    () => ({
+      ...referenceScanPendingSessionFixture("ANALYZING"),
+      referenceTitle: "Another reference",
+    }),
+    () => designDNAFixture(),
+  ],
+  [
+    "extra DesignDNA reference provenance",
+    () => referenceScanPendingSessionFixture("ANALYZING"),
+    () => ({
+      ...designDNAFixture(),
+      referenceIds: ["reference-1", "reference-2"],
+    }),
+  ],
+] as const)(
+  "rejects %s without changing pending evidence",
+  async (_label, pendingSession, checkpointDesignDNA) => {
+    const rootPath = await temporaryProject();
+    await saveProjectMetadata(projectFixture(rootPath));
+    await saveReferenceArtifact(rootPath, referenceFixture(), validPng);
+    const originalReference = await loadReference(
+      rootPath,
+      "project-1",
+      "reference-1",
+    );
+    const originalDesignDNA = {
+      ...designDNAFixture(),
+      id: "dna-before-invalid-checkpoint",
+      hierarchy: ["Existing evidence"],
+    };
+    await saveReferenceDesignDNA(
+      rootPath,
+      "project-1",
+      "reference-1",
+      originalDesignDNA,
+    );
+    const persistedPending = pendingSession();
+    await saveSession(rootPath, persistedPending);
+    const finalDesignDNA = checkpointDesignDNA();
+
+    await expect(
+      commitReferenceScan(rootPath, {
+        reference: { ...originalReference, analysisStatus: "ANALYZED" },
+        designDNA: finalDesignDNA,
+        session: referenceScanResultSessionFixture(
+          persistedPending.id,
+          finalDesignDNA,
+        ),
+      }),
+    ).rejects.toThrow(/matching|evidence/i);
+
+    await expect(
+      loadReference(rootPath, "project-1", "reference-1"),
+    ).resolves.toEqual(originalReference);
+    await expect(
+      loadReferenceDesignDNA(rootPath, "project-1", "reference-1"),
+    ).resolves.toEqual(originalDesignDNA);
+    await expect(
+      loadSession(rootPath, "project-1", persistedPending.id),
+    ).resolves.toEqual(persistedPending);
+  },
+);
+
 // Production break caught: callers must not reset the durable start time while
 // advancing the same Learn session through its lifecycle.
 it("preserves immutable Learn session identity across transitions", async () => {
   const rootPath = await temporaryProject();
   await saveProjectMetadata(projectFixture(rootPath));
-  const draft = sessionFixture();
+  const draft = referenceScanPendingSessionFixture();
   await saveSession(rootPath, draft);
 
   await expect(
@@ -599,7 +693,7 @@ it("rolls back DNA and reference metadata when the final scan checkpoint cannot 
     "project-1",
     "reference-1",
   );
-  const draft = sessionFixture();
+  const draft = referenceScanPendingSessionFixture();
   const analyzing = { ...draft, status: "ANALYZING" as const };
   await saveSession(rootPath, draft);
   await transitionLearnSession(rootPath, "DRAFT", analyzing);
