@@ -1,5 +1,6 @@
 import {
   lstat,
+  link,
   mkdir,
   open,
   readFile,
@@ -12,12 +13,16 @@ import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, extname, join } from "node:path";
 import type {
+  Approval,
+  DesignApproach,
   DesignDNA,
   DesignSession,
+  FeatureBrief,
   LearnSessionStatus,
   Project,
   Reference,
   RenderArtifact,
+  UXImpact,
 } from "@design-sharingan/core";
 import { canTransitionLearnSession } from "@design-sharingan/core";
 import { assertPathInsideWorkspace } from "./path-policy";
@@ -145,6 +150,41 @@ async function atomicWriteJson(
   value: unknown,
 ): Promise<void> {
   await atomicWrite(allowedRoot, destinationPath, stableJson(value));
+}
+
+async function atomicCreateJson(
+  allowedRoot: string,
+  destinationPath: string,
+  value: unknown,
+): Promise<void> {
+  const canonicalDestination = assertPathInsideWorkspace(
+    allowedRoot,
+    destinationPath,
+  );
+  const temporaryPath = assertPathInsideWorkspace(
+    allowedRoot,
+    join(
+      dirname(canonicalDestination),
+      `.${basename(canonicalDestination)}.tmp-${process.pid}-${randomUUID()}`,
+    ),
+  );
+  let temporaryFile: Awaited<ReturnType<typeof open>> | undefined;
+
+  try {
+    temporaryFile = await open(temporaryPath, "wx", 0o600);
+    await temporaryFile.writeFile(stableJson(value));
+    await temporaryFile.sync();
+    await temporaryFile.close();
+    temporaryFile = undefined;
+    await link(temporaryPath, canonicalDestination);
+    await unlink(temporaryPath).catch(() => undefined);
+  } catch (error) {
+    if (temporaryFile !== undefined) {
+      await temporaryFile.close().catch(() => undefined);
+    }
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -717,6 +757,149 @@ function isPersistedDesignDNA(value: unknown): value is DesignDNA {
   );
 }
 
+function isObjectWithOnlyKeys(
+  value: unknown,
+  allowedKeys: readonly string[],
+): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).every((key) => allowedKeys.includes(key))
+  );
+}
+
+function hasNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isFeatureBrief(value: unknown): value is FeatureBrief {
+  if (
+    !isObjectWithOnlyKeys(value, [
+      "name",
+      "goal",
+      "description",
+      "constraints",
+      "mustKeep",
+      "mustNotChange",
+      "successCriteria",
+    ])
+  ) {
+    return false;
+  }
+  return (
+    hasNonEmptyString(value.name) &&
+    hasNonEmptyString(value.goal) &&
+    hasNonEmptyString(value.description) &&
+    isStringArray(value.constraints) &&
+    isStringArray(value.mustKeep) &&
+    isStringArray(value.mustNotChange) &&
+    isStringArray(value.successCriteria)
+  );
+}
+
+function isUXImpact(value: unknown): value is UXImpact {
+  if (
+    !isObjectWithOnlyKeys(value, [
+      "area",
+      "severity",
+      "reason",
+      "affectedRoutes",
+      "affectedComponents",
+      "decisionRequired",
+    ])
+  ) {
+    return false;
+  }
+  return (
+    hasNonEmptyString(value.area) &&
+    ["CRITICAL", "IMPORTANT", "POLISH", "IGNORE"].includes(
+      value.severity as string,
+    ) &&
+    hasNonEmptyString(value.reason) &&
+    isStringArray(value.affectedRoutes) &&
+    isStringArray(value.affectedComponents) &&
+    typeof value.decisionRequired === "boolean"
+  );
+}
+
+function isDesignApproach(value: unknown): value is DesignApproach {
+  if (
+    !isObjectWithOnlyKeys(value, [
+      "id",
+      "title",
+      "summary",
+      "recommended",
+      "pros",
+      "cons",
+      "uxImpact",
+      "estimatedComplexity",
+      "genomeFit",
+      "likelyFiles",
+      "status",
+    ])
+  ) {
+    return false;
+  }
+  return (
+    hasNonEmptyString(value.id) &&
+    /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value.id) &&
+    hasNonEmptyString(value.title) &&
+    hasNonEmptyString(value.summary) &&
+    typeof value.recommended === "boolean" &&
+    isStringArray(value.pros) &&
+    value.pros.length > 0 &&
+    isStringArray(value.cons) &&
+    value.cons.length > 0 &&
+    Array.isArray(value.uxImpact) &&
+    value.uxImpact.length > 0 &&
+    value.uxImpact.every(isUXImpact) &&
+    hasNonEmptyString(value.estimatedComplexity) &&
+    hasNonEmptyString(value.genomeFit) &&
+    isStringArray(value.likelyFiles) &&
+    value.likelyFiles.length > 0 &&
+    value.status === "PROPOSED"
+  );
+}
+
+function isApproval(value: unknown): value is Approval {
+  if (
+    !isObjectWithOnlyKeys(value, [
+      "id",
+      "proposalId",
+      "decision",
+      "scope",
+      "approvedBy",
+      "comment",
+      "createdAt",
+    ])
+  ) {
+    return false;
+  }
+  return (
+    hasNonEmptyString(value.id) &&
+    hasNonEmptyString(value.proposalId) &&
+    ["APPROVED", "REJECTED", "REVISION_REQUESTED"].includes(
+      value.decision as string,
+    ) &&
+    hasNonEmptyString(value.scope) &&
+    hasNonEmptyString(value.approvedBy) &&
+    (value.comment === undefined || typeof value.comment === "string") &&
+    hasNonEmptyString(value.createdAt)
+  );
+}
+
+function isApproachSet(value: unknown): value is DesignApproach[] {
+  return (
+    Array.isArray(value) &&
+    value.length >= 2 &&
+    value.length <= 3 &&
+    value.every(isDesignApproach) &&
+    value.filter((approach) => approach.recommended).length === 1 &&
+    new Set(value.map((approach) => approach.id)).size === value.length
+  );
+}
+
 export async function loadReference(
   rootPath: string,
   projectId: string,
@@ -924,6 +1107,291 @@ export async function transitionLearnSession(
     );
   }
   return saveSession(rootPath, session);
+}
+
+interface FeatureEvolveSessionBase extends DesignSession {
+  type: "FEATURE_EVOLVE";
+  featureBrief: FeatureBrief;
+  referenceIds: string[];
+}
+
+export interface FeatureEvolvePendingSession
+  extends FeatureEvolveSessionBase {
+  status: "DRAFT" | "ANALYZING";
+  error?: string;
+}
+
+export interface FeatureEvolveResultSession extends FeatureEvolveSessionBase {
+  status: "RESULT_READY" | "AWAITING_DECISION";
+  uxImpact: UXImpact[];
+  approaches: DesignApproach[];
+  agentThreadId: string;
+}
+
+export interface FeatureEvolveApprovedSession
+  extends FeatureEvolveSessionBase {
+  status: "APPROVED";
+  uxImpact: UXImpact[];
+  approaches: DesignApproach[];
+  agentThreadId: string;
+  approvedApproachId: string;
+  approval: Approval;
+  executeSessionId: string;
+}
+
+export interface SafeExecutionDraftSession extends DesignSession {
+  type: "SAFE_EXECUTION";
+  status: "IDLE";
+  sourceSessionId: string;
+  approvedApproachId: string;
+  approvalId: string;
+  featureBrief: FeatureBrief;
+  designApproach: DesignApproach;
+}
+
+export function isFeatureEvolvePendingSession(
+  value: unknown,
+): value is FeatureEvolvePendingSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<FeatureEvolvePendingSession>;
+  return (
+    isObjectWithOnlyKeys(value, [
+      "id",
+      "projectId",
+      "type",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "featureBrief",
+      "referenceIds",
+      "error",
+    ]) &&
+    session.type === "FEATURE_EVOLVE" &&
+    (session.status === "DRAFT" || session.status === "ANALYZING") &&
+    isFeatureBrief(session.featureBrief) &&
+    isStringArray(session.referenceIds) &&
+    new Set(session.referenceIds).size === session.referenceIds.length &&
+    (session.error === undefined || typeof session.error === "string")
+  );
+}
+
+export function isFeatureEvolveResultSession(
+  value: unknown,
+): value is FeatureEvolveResultSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<FeatureEvolveResultSession>;
+  return (
+    isObjectWithOnlyKeys(value, [
+      "id",
+      "projectId",
+      "type",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "featureBrief",
+      "referenceIds",
+      "uxImpact",
+      "approaches",
+      "agentThreadId",
+    ]) &&
+    session.type === "FEATURE_EVOLVE" &&
+    (session.status === "RESULT_READY" ||
+      session.status === "AWAITING_DECISION") &&
+    isFeatureBrief(session.featureBrief) &&
+    isStringArray(session.referenceIds) &&
+    new Set(session.referenceIds).size === session.referenceIds.length &&
+    Array.isArray(session.uxImpact) &&
+    session.uxImpact.length > 0 &&
+    session.uxImpact.every(isUXImpact) &&
+    isApproachSet(session.approaches) &&
+    hasNonEmptyString(session.agentThreadId)
+  );
+}
+
+export function isFeatureEvolveApprovedSession(
+  value: unknown,
+): value is FeatureEvolveApprovedSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<FeatureEvolveApprovedSession>;
+  return (
+    isObjectWithOnlyKeys(value, [
+      "id",
+      "projectId",
+      "type",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "featureBrief",
+      "referenceIds",
+      "uxImpact",
+      "approaches",
+      "agentThreadId",
+      "approvedApproachId",
+      "approval",
+      "executeSessionId",
+    ]) &&
+    session.type === "FEATURE_EVOLVE" &&
+    session.status === "APPROVED" &&
+    isFeatureBrief(session.featureBrief) &&
+    isStringArray(session.referenceIds) &&
+    new Set(session.referenceIds).size === session.referenceIds.length &&
+    Array.isArray(session.uxImpact) &&
+    session.uxImpact.length > 0 &&
+    session.uxImpact.every(isUXImpact) &&
+    isApproachSet(session.approaches) &&
+    hasNonEmptyString(session.agentThreadId) &&
+    hasNonEmptyString(session.approvedApproachId) &&
+    isApproval(session.approval) &&
+    hasNonEmptyString(session.executeSessionId)
+  );
+}
+
+export function isSafeExecutionDraftSession(
+  value: unknown,
+): value is SafeExecutionDraftSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<SafeExecutionDraftSession>;
+  return (
+    isObjectWithOnlyKeys(value, [
+      "id",
+      "projectId",
+      "type",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "sourceSessionId",
+      "approvedApproachId",
+      "approvalId",
+      "featureBrief",
+      "designApproach",
+    ]) &&
+    session.type === "SAFE_EXECUTION" &&
+    session.status === "IDLE" &&
+    hasNonEmptyString(session.sourceSessionId) &&
+    hasNonEmptyString(session.approvedApproachId) &&
+    hasNonEmptyString(session.approvalId) &&
+    isFeatureBrief(session.featureBrief) &&
+    isDesignApproach(session.designApproach)
+  );
+}
+
+export async function commitFeatureEvolveResult(
+  rootPath: string,
+  session: FeatureEvolveResultSession,
+): Promise<void> {
+  if (
+    !isFeatureEvolveResultSession(session) ||
+    session.status !== "RESULT_READY"
+  ) {
+    throw new Error("Feature EVOLVE result evidence is incomplete");
+  }
+  const existing = await loadSession(rootPath, session.projectId, session.id);
+  if (
+    !isFeatureEvolvePendingSession(existing) ||
+    existing.status !== "ANALYZING" ||
+    existing.type !== session.type ||
+    existing.createdAt !== session.createdAt ||
+    stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
+    stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
+    !canTransitionLearnSession("ANALYZING", session.status)
+  ) {
+    throw new Error(
+      "Feature EVOLVE result requires a matching ANALYZING session",
+    );
+  }
+  await saveSession(rootPath, session);
+}
+
+export async function approveFeatureEvolveApproach(
+  rootPath: string,
+  checkpoint: {
+    session: FeatureEvolveApprovedSession;
+    approval: Approval;
+    executeSession: SafeExecutionDraftSession;
+  },
+): Promise<void> {
+  const { session, approval, executeSession } = checkpoint;
+  if (
+    !isFeatureEvolveApprovedSession(session) ||
+    !isApproval(approval) ||
+    !isSafeExecutionDraftSession(executeSession)
+  ) {
+    throw new Error("Feature EVOLVE approval checkpoint is incomplete");
+  }
+  const existing = await loadSession(rootPath, session.projectId, session.id);
+  if (!isFeatureEvolveResultSession(existing)) {
+    throw new Error("Feature EVOLVE approval requires matching result evidence");
+  }
+  const selectedApproach = existing.approaches.find(
+    (approach) => approach.id === session.approvedApproachId,
+  );
+  if (
+    existing.status !== "AWAITING_DECISION" ||
+    !canTransitionLearnSession("AWAITING_DECISION", session.status) ||
+    existing.createdAt !== session.createdAt ||
+    stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
+    stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
+    stableJson(existing.uxImpact) !== stableJson(session.uxImpact) ||
+    stableJson(existing.approaches) !== stableJson(session.approaches) ||
+    existing.agentThreadId !== session.agentThreadId ||
+    selectedApproach === undefined ||
+    approval.decision !== "APPROVED" ||
+    approval.scope !== "DESIGN_APPROACH" ||
+    approval.proposalId !== selectedApproach.id ||
+    session.approvedApproachId !== selectedApproach.id ||
+    stableJson(session.approval) !== stableJson(approval) ||
+    session.executeSessionId !== executeSession.id ||
+    executeSession.projectId !== session.projectId ||
+    executeSession.sourceSessionId !== session.id ||
+    executeSession.approvedApproachId !== selectedApproach.id ||
+    executeSession.approvalId !== approval.id ||
+    stableJson(executeSession.featureBrief) !== stableJson(session.featureBrief) ||
+    stableJson(executeSession.designApproach) !== stableJson(selectedApproach)
+  ) {
+    throw new Error(
+      "Feature EVOLVE approval, approach, and execution evidence must match",
+    );
+  }
+
+  assertSafePathSegment(executeSession.id, "Session id");
+  const workspace = await loadValidatedProjectContext(rootPath, session.projectId);
+  const approvalSessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${session.id}.json`),
+  );
+  const executeSessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${executeSession.id}.json`),
+  );
+  const originalSessionContents = stableJson(existing);
+
+  try {
+    // The approved Feature EVOLVE record embeds the first-class Approval and
+    // is made durable before the linked execution draft becomes visible.
+    await atomicWrite(
+      workspace.sessionsPath,
+      approvalSessionPath,
+      stableJson(session),
+    );
+    await atomicCreateJson(
+      workspace.sessionsPath,
+      executeSessionPath,
+      executeSession,
+    );
+  } catch (error) {
+    try {
+      await atomicWrite(
+        workspace.sessionsPath,
+        approvalSessionPath,
+        originalSessionContents,
+      );
+    } catch (rollbackError) {
+      throw new Error("Feature EVOLVE approval and rollback both failed", {
+        cause: { commitError: error, rollbackError },
+      });
+    }
+    throw error;
+  }
 }
 
 export interface ReferenceScanPendingSession extends DesignSession {

@@ -1,5 +1,5 @@
-import { WorkspacePlaceholder } from "../../../../features/projects/workspace-placeholder";
+import { ExecuteWorkspace } from "../../../../features/execute/execute-workspace";
 
 export default function ExecutePage() {
-  return <WorkspacePlaceholder workspace="execute" />;
+  return <ExecuteWorkspace />;
 }

@@ -1,5 +1,5 @@
-import { ScanWorkspace } from "../../../../features/learn/scan-workspace";
+import { LearnWorkspace } from "../../../../features/learn/learn-workspace";
 
 export default function LearnPage() {
-  return <ScanWorkspace />;
+  return <LearnWorkspace />;
 }

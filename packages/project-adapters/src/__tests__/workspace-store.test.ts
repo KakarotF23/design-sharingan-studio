@@ -14,14 +14,20 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
+  Approval,
+  DesignApproach,
   DesignDNA,
   DesignSession,
+  FeatureBrief,
   Project,
   Reference,
   RenderArtifact,
+  UXImpact,
 } from "@design-sharingan/core";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  approveFeatureEvolveApproach,
+  commitFeatureEvolveResult,
   commitReferenceScan,
   ensureDesignWorkspace,
   listReferences,
@@ -226,6 +232,262 @@ function referenceScanResultSessionFixture(
     agentThreadId: "thread-1",
   };
 }
+
+const featureBriefFixture: FeatureBrief = {
+  name: "Evidence inbox",
+  goal: "Triage unresolved design evidence.",
+  description: "Add an evidence inbox without changing navigation.",
+  constraints: ["Use the existing project rail"],
+  mustKeep: ["Reports remain durable history"],
+  mustNotChange: ["Do not add navigation destinations"],
+  successCriteria: ["Reviewers can resolve one item in under a minute"],
+};
+
+const uxImpactFixture: UXImpact = {
+  area: "Reference review",
+  severity: "IMPORTANT",
+  reason: "The prioritization model becomes explicit.",
+  affectedRoutes: ["/projects/:projectId/references"],
+  affectedComponents: ["ReferenceCard"],
+  decisionRequired: true,
+};
+
+function approachFixture(
+  id = "approach-guided-queue",
+  recommended = true,
+): DesignApproach {
+  return {
+    id,
+    title: recommended ? "Guided evidence queue" : "Inline review markers",
+    summary: "Make unresolved evidence explicit without changing navigation.",
+    recommended,
+    pros: ["Preserves the information architecture"],
+    cons: ["Adds a review state to each reference"],
+    uxImpact: [uxImpactFixture],
+    estimatedComplexity: "MEDIUM",
+    genomeFit: "Fits the evidence-first product model.",
+    likelyFiles: ["features/references/reference-card.tsx"],
+    status: "PROPOSED",
+  };
+}
+
+function featureEvolvePendingSessionFixture(
+  status: "DRAFT" | "ANALYZING" = "DRAFT",
+) {
+  return {
+    id: "feature-evolve-1",
+    projectId: "project-1",
+    type: "FEATURE_EVOLVE" as const,
+    status,
+    createdAt: "2026-08-24T09:00:00.000Z",
+    updatedAt: "2026-08-24T10:00:00.000Z",
+    featureBrief: featureBriefFixture,
+    referenceIds: ["reference-1"],
+  };
+}
+
+function featureEvolveResultSessionFixture(
+  status: "RESULT_READY" | "AWAITING_DECISION" = "RESULT_READY",
+) {
+  return {
+    ...featureEvolvePendingSessionFixture("ANALYZING"),
+    status,
+    uxImpact: [uxImpactFixture],
+    approaches: [
+      approachFixture(),
+      approachFixture("approach-inline-markers", false),
+    ],
+    agentThreadId: "thread-feature-evolve-1",
+  };
+}
+
+function approvalFixture(): Approval {
+  return {
+    id: "approval-design-approach-1",
+    proposalId: "approach-guided-queue",
+    decision: "APPROVED",
+    scope: "DESIGN_APPROACH",
+    approvedBy: "local-user",
+    comment: "Proceed with the evidence queue.",
+    createdAt: "2026-08-24T11:00:00.000Z",
+  };
+}
+
+function approvedFeatureEvolveSessionFixture() {
+  return {
+    ...featureEvolveResultSessionFixture("AWAITING_DECISION"),
+    status: "APPROVED" as const,
+    approvedApproachId: "approach-guided-queue",
+    approval: approvalFixture(),
+    executeSessionId: "safe-execution-1",
+  };
+}
+
+function safeExecutionDraftFixture() {
+  return {
+    id: "safe-execution-1",
+    projectId: "project-1",
+    type: "SAFE_EXECUTION" as const,
+    status: "IDLE" as const,
+    createdAt: "2026-08-24T11:00:00.000Z",
+    updatedAt: "2026-08-24T11:00:00.000Z",
+    sourceSessionId: "feature-evolve-1",
+    approvedApproachId: "approach-guided-queue",
+    approvalId: "approval-design-approach-1",
+    featureBrief: featureBriefFixture,
+    designApproach: approachFixture(),
+  };
+}
+
+// Production break caught: a generic session write could skip the explicit
+// Feature EVOLVE lifecycle or persist approaches whose evidence does not match
+// the pending Feature Brief and reference provenance.
+it("commits Feature EVOLVE evidence only from its matching ANALYZING session", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const draft = featureEvolvePendingSessionFixture();
+  const analyzing = featureEvolvePendingSessionFixture("ANALYZING");
+  const result = featureEvolveResultSessionFixture();
+
+  await saveSession(rootPath, draft);
+  await expect(commitFeatureEvolveResult(rootPath, result)).rejects.toThrow(
+    /ANALYZING|matching/i,
+  );
+  await expect(loadSession(rootPath, "project-1", draft.id)).resolves.toEqual(
+    draft,
+  );
+
+  await transitionLearnSession(rootPath, "DRAFT", analyzing);
+  await commitFeatureEvolveResult(rootPath, result);
+  await expect(loadSession(rootPath, "project-1", draft.id)).resolves.toEqual(
+    result,
+  );
+
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await transitionLearnSession(rootPath, "RESULT_READY", awaiting);
+  await expect(loadSession(rootPath, "project-1", draft.id)).resolves.toEqual(
+    awaiting,
+  );
+});
+
+// Production break caught: an approval for a different approach, incomplete
+// result evidence, or mismatched execution provenance must not authorize the
+// draft Task 9 will later consume.
+it.each([
+  [
+    "a stale approach approval",
+    () => ({
+      approved: approvedFeatureEvolveSessionFixture(),
+      approval: { ...approvalFixture(), proposalId: "approach-inline-markers" },
+      execute: safeExecutionDraftFixture(),
+    }),
+  ],
+  [
+    "a non-approved decision",
+    () => ({
+      approved: {
+        ...approvedFeatureEvolveSessionFixture(),
+        approval: { ...approvalFixture(), decision: "REJECTED" as const },
+      },
+      approval: { ...approvalFixture(), decision: "REJECTED" as const },
+      execute: safeExecutionDraftFixture(),
+    }),
+  ],
+  [
+    "a wrong approval scope",
+    () => ({
+      approved: {
+        ...approvedFeatureEvolveSessionFixture(),
+        approval: { ...approvalFixture(), scope: "CHANGE_PROPOSAL" },
+      },
+      approval: { ...approvalFixture(), scope: "CHANGE_PROPOSAL" },
+      execute: safeExecutionDraftFixture(),
+    }),
+  ],
+  [
+    "a mismatched execution source",
+    () => ({
+      approved: approvedFeatureEvolveSessionFixture(),
+      approval: approvalFixture(),
+      execute: { ...safeExecutionDraftFixture(), sourceSessionId: "feature-evolve-2" },
+    }),
+  ],
+  [
+    "a different execution approach",
+    () => ({
+      approved: approvedFeatureEvolveSessionFixture(),
+      approval: approvalFixture(),
+      execute: {
+        ...safeExecutionDraftFixture(),
+        designApproach: approachFixture("approach-inline-markers", false),
+      },
+    }),
+  ],
+] as const)("rejects %s before persisting an approval", async (_label, invalid) => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(rootPath, awaiting);
+  const checkpoint = invalid();
+
+  await expect(
+    approveFeatureEvolveApproach(rootPath, {
+      session: checkpoint.approved as ReturnType<
+        typeof approvedFeatureEvolveSessionFixture
+      >,
+      approval: checkpoint.approval,
+      executeSession: checkpoint.execute as ReturnType<
+        typeof safeExecutionDraftFixture
+      >,
+    }),
+  ).rejects.toThrow(/approval|approach|matching|scope/i);
+
+  await expect(loadSession(rootPath, "project-1", awaiting.id)).resolves.toEqual(
+    awaiting,
+  );
+  await expect(
+    loadSession(rootPath, "project-1", "safe-execution-1"),
+  ).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+// Production break caught: exposing SAFE_EXECUTION before its design approval
+// is durable, or leaving the approval visible after the linked-draft write
+// fails, creates an unauthorized mutation path.
+it("persists approval before the linked SAFE_EXECUTION draft and rolls both back on failure", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(rootPath, awaiting);
+
+  const sessionsPath = join(rootPath, ".design-sharingan", "sessions");
+  await mkdir(join(sessionsPath, "safe-execution-1.json"));
+  await expect(
+    approveFeatureEvolveApproach(rootPath, {
+      session: approvedFeatureEvolveSessionFixture(),
+      approval: approvalFixture(),
+      executeSession: safeExecutionDraftFixture(),
+    }),
+  ).rejects.toThrow();
+  await expect(loadSession(rootPath, "project-1", awaiting.id)).resolves.toEqual(
+    awaiting,
+  );
+  await expect(
+    loadSession(rootPath, "project-1", "safe-execution-1"),
+  ).rejects.toThrow();
+
+  await rm(join(sessionsPath, "safe-execution-1.json"), { recursive: true });
+  await approveFeatureEvolveApproach(rootPath, {
+    session: approvedFeatureEvolveSessionFixture(),
+    approval: approvalFixture(),
+    executeSession: safeExecutionDraftFixture(),
+  });
+  await expect(loadSession(rootPath, "project-1", awaiting.id)).resolves.toEqual(
+    approvedFeatureEvolveSessionFixture(),
+  );
+  await expect(
+    loadSession(rootPath, "project-1", "safe-execution-1"),
+  ).resolves.toEqual(safeExecutionDraftFixture());
+});
 
 // Production break caught: omitting a runtime directory or creating governance makes machine state incomplete or falsely authoritative.
 it("creates only the machine workspace layout and no governance truth", async () => {
