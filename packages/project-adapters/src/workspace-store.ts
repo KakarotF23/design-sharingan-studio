@@ -152,10 +152,10 @@ async function atomicWriteJson(
   await atomicWrite(allowedRoot, destinationPath, stableJson(value));
 }
 
-async function atomicCreateJson(
+async function atomicCreate(
   allowedRoot: string,
   destinationPath: string,
-  value: unknown,
+  contents: string | Uint8Array,
 ): Promise<void> {
   const canonicalDestination = assertPathInsideWorkspace(
     allowedRoot,
@@ -172,7 +172,7 @@ async function atomicCreateJson(
 
   try {
     temporaryFile = await open(temporaryPath, "wx", 0o600);
-    await temporaryFile.writeFile(stableJson(value));
+    await temporaryFile.writeFile(contents);
     await temporaryFile.sync();
     await temporaryFile.close();
     temporaryFile = undefined;
@@ -185,6 +185,14 @@ async function atomicCreateJson(
     await unlink(temporaryPath).catch(() => undefined);
     throw error;
   }
+}
+
+function boundedSessionContents(session: DesignSession): string {
+  const contents = stableJson(session);
+  if (new TextEncoder().encode(contents).byteLength > MAX_RECORD_BYTES) {
+    throw new Error("Session record is too large; maximum size is 1 MiB");
+  }
+  return contents;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -1064,7 +1072,8 @@ export async function saveSession(
     workspace.sessionsPath,
     join(workspace.sessionsPath, `${session.id}.json`),
   );
-  await atomicWriteJson(workspace.sessionsPath, sessionPath, session);
+  const contents = boundedSessionContents(session);
+  await atomicWrite(workspace.sessionsPath, sessionPath, contents);
   return sessionPath;
 }
 
@@ -1318,80 +1327,167 @@ export async function approveFeatureEvolveApproach(
   ) {
     throw new Error("Feature EVOLVE approval checkpoint is incomplete");
   }
-  const existing = await loadSession(rootPath, session.projectId, session.id);
-  if (!isFeatureEvolveResultSession(existing)) {
-    throw new Error("Feature EVOLVE approval requires matching result evidence");
-  }
-  const selectedApproach = existing.approaches.find(
-    (approach) => approach.id === session.approvedApproachId,
-  );
-  if (
-    existing.status !== "AWAITING_DECISION" ||
-    !canTransitionLearnSession("AWAITING_DECISION", session.status) ||
-    existing.createdAt !== session.createdAt ||
-    stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
-    stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
-    stableJson(existing.uxImpact) !== stableJson(session.uxImpact) ||
-    stableJson(existing.approaches) !== stableJson(session.approaches) ||
-    existing.agentThreadId !== session.agentThreadId ||
-    selectedApproach === undefined ||
-    approval.decision !== "APPROVED" ||
-    approval.scope !== "DESIGN_APPROACH" ||
-    approval.proposalId !== selectedApproach.id ||
-    session.approvedApproachId !== selectedApproach.id ||
-    stableJson(session.approval) !== stableJson(approval) ||
-    session.executeSessionId !== executeSession.id ||
-    executeSession.projectId !== session.projectId ||
-    executeSession.sourceSessionId !== session.id ||
-    executeSession.approvedApproachId !== selectedApproach.id ||
-    executeSession.approvalId !== approval.id ||
-    stableJson(executeSession.featureBrief) !== stableJson(session.featureBrief) ||
-    stableJson(executeSession.designApproach) !== stableJson(selectedApproach)
-  ) {
-    throw new Error(
-      "Feature EVOLVE approval, approach, and execution evidence must match",
-    );
-  }
-
+  assertSafePathSegment(session.id, "Session id");
   assertSafePathSegment(executeSession.id, "Session id");
   const workspace = await loadValidatedProjectContext(rootPath, session.projectId);
-  const approvalSessionPath = assertPathInsideWorkspace(
+  // Bound both halves before claiming or replacing any durable record. This
+  // keeps rejection side-effect free and ensures every committed session can
+  // pass the matching bounded read path.
+  const approvalSessionContents = boundedSessionContents(session);
+  const executeSessionContents = boundedSessionContents(executeSession);
+  const approvalClaimPath = assertPathInsideWorkspace(
     workspace.sessionsPath,
-    join(workspace.sessionsPath, `${session.id}.json`),
+    join(workspace.sessionsPath, `.${session.id}.approval.claim`),
   );
-  const executeSessionPath = assertPathInsideWorkspace(
-    workspace.sessionsPath,
-    join(workspace.sessionsPath, `${executeSession.id}.json`),
-  );
-  const originalSessionContents = stableJson(existing);
+  let approvalClaim: Awaited<ReturnType<typeof open>> | undefined;
 
   try {
-    // The approved Feature EVOLVE record embeds the first-class Approval and
-    // is made durable before the linked execution draft becomes visible.
-    await atomicWrite(
-      workspace.sessionsPath,
-      approvalSessionPath,
-      stableJson(session),
+    approvalClaim = await open(approvalClaimPath, "wx", 0o600);
+    await approvalClaim.writeFile(
+      stableJson({ approvalId: approval.id, sessionId: session.id }),
     );
-    await atomicCreateJson(
-      workspace.sessionsPath,
-      executeSessionPath,
-      executeSession,
+    await approvalClaim.sync();
+
+    // Re-read after the exclusive claim. A request queued behind another
+    // completed approval sees APPROVED here and fails closed.
+    const existing = await loadSession(rootPath, session.projectId, session.id);
+    if (!isFeatureEvolveResultSession(existing)) {
+      throw new Error("Feature EVOLVE approval requires matching result evidence");
+    }
+    const selectedApproach = existing.approaches.find(
+      (approach) => approach.id === session.approvedApproachId,
     );
-  } catch (error) {
+    if (
+      existing.status !== "AWAITING_DECISION" ||
+      !canTransitionLearnSession("AWAITING_DECISION", session.status) ||
+      existing.createdAt !== session.createdAt ||
+      stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
+      stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
+      stableJson(existing.uxImpact) !== stableJson(session.uxImpact) ||
+      stableJson(existing.approaches) !== stableJson(session.approaches) ||
+      existing.agentThreadId !== session.agentThreadId ||
+      selectedApproach === undefined ||
+      approval.decision !== "APPROVED" ||
+      approval.scope !== "DESIGN_APPROACH" ||
+      approval.proposalId !== selectedApproach.id ||
+      session.approvedApproachId !== selectedApproach.id ||
+      stableJson(session.approval) !== stableJson(approval) ||
+      session.executeSessionId !== executeSession.id ||
+      executeSession.projectId !== session.projectId ||
+      executeSession.sourceSessionId !== session.id ||
+      executeSession.approvedApproachId !== selectedApproach.id ||
+      executeSession.approvalId !== approval.id ||
+      stableJson(executeSession.featureBrief) !== stableJson(session.featureBrief) ||
+      stableJson(executeSession.designApproach) !== stableJson(selectedApproach)
+    ) {
+      throw new Error(
+        "Feature EVOLVE approval, approach, and execution evidence must match",
+      );
+    }
+
+    const approvalSessionPath = assertPathInsideWorkspace(
+      workspace.sessionsPath,
+      join(workspace.sessionsPath, `${session.id}.json`),
+    );
+    const executeSessionPath = assertPathInsideWorkspace(
+      workspace.sessionsPath,
+      join(workspace.sessionsPath, `${executeSession.id}.json`),
+    );
+    const originalSessionContents = stableJson(existing);
+
     try {
+      // The approved Feature EVOLVE record embeds the first-class Approval and
+      // is made durable before the linked execution draft becomes visible.
       await atomicWrite(
         workspace.sessionsPath,
         approvalSessionPath,
-        originalSessionContents,
+        approvalSessionContents,
       );
-    } catch (rollbackError) {
-      throw new Error("Feature EVOLVE approval and rollback both failed", {
-        cause: { commitError: error, rollbackError },
-      });
+      await atomicCreate(
+        workspace.sessionsPath,
+        executeSessionPath,
+        executeSessionContents,
+      );
+    } catch (error) {
+      try {
+        await atomicWrite(
+          workspace.sessionsPath,
+          approvalSessionPath,
+          originalSessionContents,
+        );
+      } catch (rollbackError) {
+        throw new Error("Feature EVOLVE approval and rollback both failed", {
+          cause: { commitError: error, rollbackError },
+        });
+      }
+      throw error;
     }
-    throw error;
+  } finally {
+    if (approvalClaim !== undefined) {
+      await approvalClaim.close().catch(() => undefined);
+      await unlink(approvalClaimPath).catch(() => undefined);
+    }
   }
+}
+
+export async function loadApprovedExecutionDirection(
+  rootPath: string,
+  projectId: string,
+): Promise<SafeExecutionDraftSession> {
+  const sessions = await listSessions(rootPath, projectId);
+  const executionRecords = sessions.filter(
+    (session) => session.type === "SAFE_EXECUTION",
+  );
+  if (executionRecords.length === 0) {
+    throw new Error("Approved execution source evidence is missing");
+  }
+  if (executionRecords.length > 1) {
+    throw new Error("Multiple SAFE_EXECUTION drafts are ambiguous");
+  }
+  const [executionRecord] = executionRecords;
+  if (!isSafeExecutionDraftSession(executionRecord)) {
+    throw new Error("SAFE_EXECUTION draft evidence is invalid");
+  }
+
+  let sourceRecord: DesignSession;
+  try {
+    sourceRecord = await loadSession(
+      rootPath,
+      projectId,
+      executionRecord.sourceSessionId,
+    );
+  } catch {
+    throw new Error("Approved execution source evidence is missing");
+  }
+  if (!isFeatureEvolveApprovedSession(sourceRecord)) {
+    throw new Error("Approved Feature EVOLVE source evidence is invalid");
+  }
+  const approval = sourceRecord.approval;
+  const selectedApproach = sourceRecord.approaches.find(
+    (approach) => approach.id === sourceRecord.approvedApproachId,
+  );
+  if (
+    selectedApproach === undefined ||
+    sourceRecord.projectId !== projectId ||
+    executionRecord.projectId !== projectId ||
+    sourceRecord.id !== executionRecord.sourceSessionId ||
+    sourceRecord.executeSessionId !== executionRecord.id ||
+    sourceRecord.approvedApproachId !== executionRecord.approvedApproachId ||
+    approval.id !== executionRecord.approvalId ||
+    approval.decision !== "APPROVED" ||
+    approval.scope !== "DESIGN_APPROACH" ||
+    approval.proposalId !== sourceRecord.approvedApproachId ||
+    executionRecord.createdAt !== approval.createdAt ||
+    executionRecord.updatedAt !== approval.createdAt ||
+    sourceRecord.updatedAt !== approval.createdAt ||
+    stableJson(executionRecord.designApproach) !== stableJson(selectedApproach) ||
+    stableJson(executionRecord.featureBrief) !== stableJson(sourceRecord.featureBrief)
+  ) {
+    throw new Error(
+      "Approval, approach, Feature Brief, and Execute evidence do not match",
+    );
+  }
+  return executionRecord;
 }
 
 export interface ReferenceScanPendingSession extends DesignSession {

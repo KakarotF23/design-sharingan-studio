@@ -104,28 +104,42 @@ function recordWithExactKeys(
   );
 }
 
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+function boundedString(value: unknown, maxLength: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= maxLength
+  );
 }
 
-function stringArray(value: unknown, nonEmpty = false): value is string[] {
+function boundedStringArray(
+  value: unknown,
+  options: { maxItems: number; maxItemLength: number; nonEmpty?: boolean },
+): value is string[] {
   return (
     Array.isArray(value) &&
-    (!nonEmpty || value.length > 0) &&
-    value.every(nonEmptyString)
+    (!options.nonEmpty || value.length > 0) &&
+    value.length <= options.maxItems &&
+    value.every((entry) => boundedString(entry, options.maxItemLength))
   );
 }
 
 function isUXImpact(value: unknown): value is UXImpactWireOutput {
   if (!recordWithExactKeys(value, UX_IMPACT_KEYS)) return false;
   return (
-    nonEmptyString(value.area) &&
+    boundedString(value.area, 256) &&
     ["CRITICAL", "IMPORTANT", "POLISH", "IGNORE"].includes(
       value.severity as string,
     ) &&
-    nonEmptyString(value.reason) &&
-    stringArray(value.affectedRoutes) &&
-    stringArray(value.affectedComponents) &&
+    boundedString(value.reason, 2_000) &&
+    boundedStringArray(value.affectedRoutes, {
+      maxItems: 16,
+      maxItemLength: 512,
+    }) &&
+    boundedStringArray(value.affectedComponents, {
+      maxItems: 16,
+      maxItemLength: 512,
+    }) &&
     typeof value.decisionRequired === "boolean"
   );
 }
@@ -133,19 +147,32 @@ function isUXImpact(value: unknown): value is UXImpactWireOutput {
 function isApproach(value: unknown): value is DesignApproachWireOutput {
   if (!recordWithExactKeys(value, APPROACH_KEYS)) return false;
   return (
-    nonEmptyString(value.id) &&
+    boundedString(value.id, 128) &&
     /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value.id) &&
-    nonEmptyString(value.title) &&
-    nonEmptyString(value.summary) &&
+    boundedString(value.title, 256) &&
+    boundedString(value.summary, 2_000) &&
     typeof value.recommended === "boolean" &&
-    stringArray(value.pros, true) &&
-    stringArray(value.cons, true) &&
+    boundedStringArray(value.pros, {
+      maxItems: 12,
+      maxItemLength: 1_000,
+      nonEmpty: true,
+    }) &&
+    boundedStringArray(value.cons, {
+      maxItems: 12,
+      maxItemLength: 1_000,
+      nonEmpty: true,
+    }) &&
     Array.isArray(value.uxImpact) &&
     value.uxImpact.length > 0 &&
+    value.uxImpact.length <= 8 &&
     value.uxImpact.every(isUXImpact) &&
-    nonEmptyString(value.estimatedComplexity) &&
-    nonEmptyString(value.genomeFit) &&
-    stringArray(value.likelyFiles, true) &&
+    boundedString(value.estimatedComplexity, 256) &&
+    boundedString(value.genomeFit, 2_000) &&
+    boundedStringArray(value.likelyFiles, {
+      maxItems: 32,
+      maxItemLength: 512,
+      nonEmpty: true,
+    }) &&
     value.status === "PROPOSED"
   );
 }
@@ -155,6 +182,7 @@ function assertEvolveWireOutput(value: unknown): EvolveWireOutput {
     !recordWithExactKeys(value, ["uxImpact", "approaches"]) ||
     !Array.isArray(value.uxImpact) ||
     value.uxImpact.length === 0 ||
+    value.uxImpact.length > 8 ||
     !value.uxImpact.every(isUXImpact) ||
     !Array.isArray(value.approaches) ||
     value.approaches.length < 2 ||

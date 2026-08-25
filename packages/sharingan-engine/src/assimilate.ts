@@ -119,19 +119,35 @@ function exactRecord(value: unknown, keys: readonly string[]): value is Record<s
   );
 }
 
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+function boundedString(value: unknown, maxLength: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= maxLength
+  );
 }
 
-function nonEmptyStrings(value: unknown): value is string[] {
-  return Array.isArray(value) && value.length > 0 && value.every(nonEmptyString);
+function boundedStrings(
+  value: unknown,
+  options: { maxItems: number; maxItemLength: number },
+): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= options.maxItems &&
+    value.every((entry) => boundedString(entry, options.maxItemLength))
+  );
 }
 
 function isDirection(value: unknown): value is ScanWireOutput {
   if (!exactRecord(value, DIRECTION_KEYS)) return false;
   return (
-    DIRECTION_KEYS.slice(0, 12).every((key) => nonEmptyString(value[key])) &&
-    DIRECTION_KEYS.slice(12).every((key) => nonEmptyStrings(value[key]))
+    DIRECTION_KEYS.slice(0, 12).every((key) =>
+      boundedString(value[key], 2_000),
+    ) &&
+    DIRECTION_KEYS.slice(12).every((key) =>
+      boundedStrings(value[key], { maxItems: 12, maxItemLength: 1_000 }),
+    )
   );
 }
 
@@ -143,15 +159,22 @@ function assertAssimilateWireOutput(
     throw new Error("Codex ASSIMILATE returned invalid structured output");
   }
   if (
-    !nonEmptyString(value.summary) ||
+    !boundedString(value.summary, 4_000) ||
     !Array.isArray(value.sourceMap) ||
     value.sourceMap.length < 2 ||
+    value.sourceMap.length > 16 ||
     !value.sourceMap.every(
       (source) =>
         exactRecord(source, ["referenceIds", "role", "principles"]) &&
-        nonEmptyStrings(source.referenceIds) &&
-        nonEmptyString(source.role) &&
-        nonEmptyStrings(source.principles),
+        boundedStrings(source.referenceIds, {
+          maxItems: 32,
+          maxItemLength: 128,
+        }) &&
+        boundedString(source.role, 256) &&
+        boundedStrings(source.principles, {
+          maxItems: 12,
+          maxItemLength: 1_000,
+        }),
     ) ||
     !isDirection(value.direction)
   ) {

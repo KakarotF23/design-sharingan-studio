@@ -127,4 +127,112 @@ describe("assimilateReferences", () => {
       ),
     ).rejects.toThrow(/at least two/i);
   });
+
+  it.each([
+    ["an oversized summary", { ...wireOutput, summary: "x".repeat(4_001) }],
+    [
+      "an undeclared key",
+      { ...wireOutput, genomeUpdate: "hidden authority" },
+    ],
+    [
+      "too many sources",
+      {
+        ...wireOutput,
+        sourceMap: Array.from({ length: 17 }, (_, index) => ({
+          referenceIds: [index % 2 === 0 ? "reference-1" : "reference-2"],
+          role: `Role ${index}`,
+          principles: ["A principle"],
+        })),
+      },
+    ],
+    [
+      "an oversized direction field",
+      {
+        ...wireOutput,
+        direction: { ...wireOutput.direction, hierarchy: "x".repeat(2_001) },
+      },
+    ],
+    [
+      "too many KRAI decisions",
+      {
+        ...wireOutput,
+        direction: {
+          ...wireOutput.direction,
+          keep: Array.from({ length: 13 }, (_, index) => `Keep ${index}`),
+        },
+      },
+    ],
+  ] as const)("rejects %s", async (_label, malformed) => {
+    await expect(
+      assimilateReferences(
+        {
+          analyses,
+          analysisWorkingDirectory: "/app-state/assimilate-1",
+          projectContext: { name: "Fixture product", routes: ["/references"] },
+        },
+        {
+          agent: {
+            async run<TStructured>() {
+              return {
+                threadId: "thread-assimilate-invalid",
+                structured: malformed as TStructured,
+              };
+            },
+          },
+          createId: () => "unused",
+        },
+      ),
+    ).rejects.toThrow(/structured/i);
+  });
+
+  it("accepts documented output boundaries and publishes them in the schema", async () => {
+    let runInput: CodexAgentRunInput | undefined;
+    const boundaryOutput: AssimilateWireOutput = {
+      summary: "x".repeat(4_000),
+      sourceMap: Array.from({ length: 16 }, (_, index) => ({
+        referenceIds: [index % 2 === 0 ? "reference-1" : "reference-2"],
+        role: `Role ${index}`,
+        principles: ["A bounded principle"],
+      })),
+      direction: {
+        ...wireOutput.direction,
+        hierarchy: "x".repeat(2_000),
+        keep: Array.from({ length: 12 }, (_, index) => `Keep ${index}`),
+      },
+    };
+    const fakeAgent = {
+      async run<TStructured>(input: CodexAgentRunInput) {
+        runInput = input;
+        return {
+          threadId: "thread-assimilate-boundary",
+          finalResponse: JSON.stringify(boundaryOutput),
+          structured: boundaryOutput as TStructured,
+          items: [],
+        } satisfies CodexAgentResult<TStructured>;
+      },
+    };
+
+    await expect(
+      assimilateReferences(
+        {
+          analyses,
+          analysisWorkingDirectory: "/app-state/assimilate-1",
+          projectContext: { name: "Fixture product", routes: [] },
+        },
+        { agent: fakeAgent, createId: () => "dna-boundary" },
+      ),
+    ).resolves.toMatchObject({ summary: boundaryOutput.summary });
+    expect(runInput?.outputSchema).toMatchObject({
+      properties: {
+        summary: { maxLength: 4_000 },
+        sourceMap: { maxItems: 16 },
+        direction: {
+          properties: {
+            hierarchy: { maxLength: 2_000 },
+            keep: { maxItems: 12 },
+          },
+        },
+      },
+    });
+  });
 });

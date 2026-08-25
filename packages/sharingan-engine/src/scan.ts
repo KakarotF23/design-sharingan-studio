@@ -101,13 +101,27 @@ function assertScanWireOutput(value: unknown): ScanWireOutput {
     "visualWeight",
   ] as const;
   const decisionFields = ["keep", "reject", "adapt", "invent"] as const;
+  const expectedFields = [...scalarFields, ...decisionFields];
 
   if (
-    scalarFields.some((field) => typeof output[field] !== "string") ||
+    Object.keys(output).length !== expectedFields.length ||
+    expectedFields.some((field) => !Object.hasOwn(output, field)) ||
+    scalarFields.some(
+      (field) =>
+        typeof output[field] !== "string" ||
+        (output[field] as string).trim().length === 0 ||
+        (output[field] as string).length > 2_000,
+    ) ||
     decisionFields.some(
       (field) =>
         !Array.isArray(output[field]) ||
-        !(output[field] as unknown[]).every((entry) => typeof entry === "string"),
+        (output[field] as unknown[]).length > 12 ||
+        !(output[field] as unknown[]).every(
+          (entry) =>
+            typeof entry === "string" &&
+            entry.trim().length > 0 &&
+            entry.length <= 1_000,
+        ),
     )
   ) {
     throw new Error("Codex SCAN returned invalid structured output");

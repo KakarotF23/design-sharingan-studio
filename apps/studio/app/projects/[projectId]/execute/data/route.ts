@@ -1,6 +1,5 @@
 import {
-  isSafeExecutionDraftSession,
-  listSessions,
+  loadApprovedExecutionDirection,
 } from "@design-sharingan/project-adapters";
 import { resolveProjectRequest } from "../../../../../features/projects/project-access";
 
@@ -13,8 +12,10 @@ export async function GET(
   const { projectId } = await context.params;
   try {
     const project = await resolveProjectRequest(projectId);
-    const sessions = await listSessions(project.rootPath, project.id);
-    const executeSession = sessions.find(isSafeExecutionDraftSession);
+    const executeSession = await loadApprovedExecutionDirection(
+      project.rootPath,
+      project.id,
+    );
     return Response.json({ executeSession });
   } catch {
     return Response.json(

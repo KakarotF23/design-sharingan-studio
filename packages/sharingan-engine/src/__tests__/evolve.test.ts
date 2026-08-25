@@ -209,10 +209,72 @@ describe("evolveFeature", () => {
         approaches: [{ ...wireOutput.approaches[0], implementationPatch: "hidden" }, wireOutput.approaches[1]],
       },
     ],
+    [
+      "an oversized approach summary",
+      {
+        ...wireOutput,
+        approaches: [
+          approach("approach-guided-queue", true, {
+            summary: "x".repeat(2_001),
+          }),
+          wireOutput.approaches[1],
+        ],
+      },
+    ],
+    [
+      "too many trade-off entries",
+      {
+        ...wireOutput,
+        approaches: [
+          approach("approach-guided-queue", true, {
+            pros: Array.from({ length: 13 }, (_, index) => `Pro ${index}`),
+          }),
+          wireOutput.approaches[1],
+        ],
+      },
+    ],
+    [
+      "too many UX impacts",
+      {
+        ...wireOutput,
+        uxImpact: Array.from({ length: 9 }, () => impact),
+      },
+    ],
   ] as const)("rejects %s", async (_label, malformed) => {
     const fake = agentReturning(malformed);
     await expect(
       evolveFeature(evolveInput, { agent: fake.agent }),
     ).rejects.toThrow(/structured|approach/i);
+  });
+
+  it("accepts documented output boundaries and publishes them in the schema", async () => {
+    const boundaryOutput: EvolveWireOutput = {
+      uxImpact: wireOutput.uxImpact,
+      approaches: [
+        approach("approach-guided-queue", true, {
+          summary: "x".repeat(2_000),
+          pros: Array.from({ length: 12 }, (_, index) => `Pro ${index}`),
+        }),
+        wireOutput.approaches[1],
+      ],
+    };
+    const fake = agentReturning(boundaryOutput);
+
+    await expect(
+      evolveFeature(evolveInput, { agent: fake.agent }),
+    ).resolves.toMatchObject({ approaches: boundaryOutput.approaches });
+    expect(fake.input()?.outputSchema).toMatchObject({
+      properties: {
+        uxImpact: { maxItems: 8 },
+        approaches: {
+          items: {
+            properties: {
+              summary: { maxLength: 2_000 },
+              pros: { maxItems: 12 },
+            },
+          },
+        },
+      },
+    });
   });
 });

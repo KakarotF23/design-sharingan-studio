@@ -35,6 +35,7 @@ import {
   loadReference,
   loadReferenceImage,
   loadReferenceDesignDNA,
+  loadApprovedExecutionDirection,
   loadSession,
   loadProjectMetadata,
   saveReferenceDesignDNA,
@@ -314,11 +315,13 @@ function approvalFixture(): Approval {
 }
 
 function approvedFeatureEvolveSessionFixture() {
+  const approval = approvalFixture();
   return {
     ...featureEvolveResultSessionFixture("AWAITING_DECISION"),
     status: "APPROVED" as const,
+    updatedAt: approval.createdAt,
     approvedApproachId: "approach-guided-queue",
-    approval: approvalFixture(),
+    approval,
     executeSessionId: "safe-execution-1",
   };
 }
@@ -336,6 +339,41 @@ function safeExecutionDraftFixture() {
     approvalId: "approval-design-approach-1",
     featureBrief: featureBriefFixture,
     designApproach: approachFixture(),
+  };
+}
+
+function approvalCheckpoint(
+  awaiting: ReturnType<typeof featureEvolveResultSessionFixture>,
+  approachId: string,
+  suffix: string,
+) {
+  const designApproach = awaiting.approaches.find(
+    (approach) => approach.id === approachId,
+  );
+  if (designApproach === undefined) throw new Error("Missing fixture approach");
+  const approval: Approval = {
+    ...approvalFixture(),
+    id: `approval-${suffix}`,
+    proposalId: approachId,
+  };
+  const executeSession = {
+    ...safeExecutionDraftFixture(),
+    id: `safe-execution-${suffix}`,
+    sourceSessionId: awaiting.id,
+    approvedApproachId: approachId,
+    approvalId: approval.id,
+    designApproach,
+  };
+  return {
+    approval,
+    executeSession,
+    session: {
+      ...awaiting,
+      status: "APPROVED" as const,
+      approvedApproachId: approachId,
+      approval,
+      executeSessionId: executeSession.id,
+    },
   };
 }
 
@@ -487,6 +525,207 @@ it("persists approval before the linked SAFE_EXECUTION draft and rolls both back
   await expect(
     loadSession(rootPath, "project-1", "safe-execution-1"),
   ).resolves.toEqual(safeExecutionDraftFixture());
+});
+
+// Production break caught: two requests that both read AWAITING_DECISION can
+// otherwise approve different approaches, create two execution drafts, and let
+// one rollback overwrite the other's successful approved source record.
+it("serializes competing Feature EVOLVE approvals so exactly one direction wins", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(rootPath, awaiting);
+  const guided = approvalCheckpoint(
+    awaiting,
+    "approach-guided-queue",
+    "guided",
+  );
+  const inline = approvalCheckpoint(
+    awaiting,
+    "approach-inline-markers",
+    "inline",
+  );
+
+  const results = await Promise.allSettled([
+    approveFeatureEvolveApproach(rootPath, guided),
+    approveFeatureEvolveApproach(rootPath, inline),
+  ]);
+
+  expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+  expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+  const sessions = await listSessions(rootPath, "project-1");
+  const approved = sessions.find(
+    (session) => session.type === "FEATURE_EVOLVE",
+  ) as ReturnType<typeof approvedFeatureEvolveSessionFixture>;
+  const executionDrafts = sessions.filter(
+    (session) => session.type === "SAFE_EXECUTION",
+  );
+  expect(executionDrafts).toHaveLength(1);
+  expect(approved.status).toBe("APPROVED");
+  expect(executionDrafts[0]).toMatchObject({
+    id: approved.executeSessionId,
+    sourceSessionId: approved.id,
+    approvedApproachId: approved.approvedApproachId,
+    approvalId: approved.approval.id,
+  });
+});
+
+// Production break caught: Execute must not surface a shape-valid draft whose
+// linked approved source session is absent.
+it("rejects an orphan SAFE_EXECUTION draft", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  await saveSession(rootPath, safeExecutionDraftFixture());
+
+  await expect(
+    loadApprovedExecutionDirection(rootPath, "project-1"),
+  ).rejects.toThrow(/source|approved|evidence/i);
+});
+
+// Production break caught: a client-facing Execute projection must derive its
+// authorization from the full relation, not independently valid JSON shapes.
+it.each([
+  [
+    "altered approval",
+    (source: ReturnType<typeof approvedFeatureEvolveSessionFixture>) => ({
+      ...source,
+      approval: { ...source.approval, id: "approval-tampered" },
+    }),
+  ],
+  [
+    "altered selected approach",
+    (source: ReturnType<typeof approvedFeatureEvolveSessionFixture>) => ({
+      ...source,
+      approaches: source.approaches.map((approach) =>
+        approach.id === source.approvedApproachId
+          ? { ...approach, summary: "Tampered direction" }
+          : approach,
+      ),
+    }),
+  ],
+  [
+    "altered Feature Brief",
+    (source: ReturnType<typeof approvedFeatureEvolveSessionFixture>) => ({
+      ...source,
+      featureBrief: { ...source.featureBrief, goal: "Tampered goal" },
+    }),
+  ],
+  [
+    "mismatched execute id",
+    (source: ReturnType<typeof approvedFeatureEvolveSessionFixture>) => ({
+      ...source,
+      executeSessionId: "safe-execution-tampered",
+    }),
+  ],
+] as const)("rejects relational Execute evidence with %s", async (_label, tamper) => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(rootPath, awaiting);
+  await approveFeatureEvolveApproach(rootPath, {
+    session: approvedFeatureEvolveSessionFixture(),
+    approval: approvalFixture(),
+    executeSession: safeExecutionDraftFixture(),
+  });
+  await saveSession(
+    rootPath,
+    tamper(approvedFeatureEvolveSessionFixture()),
+  );
+
+  await expect(
+    loadApprovedExecutionDirection(rootPath, "project-1"),
+  ).rejects.toThrow(/approval|approach|brief|execute|evidence/i);
+});
+
+// Production break caught: without an explicit active-session selector, two
+// drafts make the Execute route ambiguous and must fail closed.
+it("rejects multiple SAFE_EXECUTION drafts instead of choosing one silently", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(rootPath, awaiting);
+  await approveFeatureEvolveApproach(rootPath, {
+    session: approvedFeatureEvolveSessionFixture(),
+    approval: approvalFixture(),
+    executeSession: safeExecutionDraftFixture(),
+  });
+  await saveSession(rootPath, {
+    ...safeExecutionDraftFixture(),
+    id: "safe-execution-2",
+  });
+
+  await expect(
+    loadApprovedExecutionDirection(rootPath, "project-1"),
+  ).rejects.toThrow(/ambiguous|multiple/i);
+});
+
+it("loads an Execute direction only when every approval relation matches", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(rootPath, awaiting);
+  await approveFeatureEvolveApproach(rootPath, {
+    session: approvedFeatureEvolveSessionFixture(),
+    approval: approvalFixture(),
+    executeSession: safeExecutionDraftFixture(),
+  });
+
+  await expect(
+    loadApprovedExecutionDirection(rootPath, "project-1"),
+  ).resolves.toEqual(safeExecutionDraftFixture());
+});
+
+// Production break caught: an engine or internal caller can otherwise commit
+// a session larger than the loader's one-MiB ceiling, making the newly written
+// checkpoint immediately unreadable.
+it("rejects an oversized nested EVOLVE result and preserves ANALYZING", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const analyzing = featureEvolvePendingSessionFixture("ANALYZING");
+  await saveSession(rootPath, analyzing);
+  const oversized = featureEvolveResultSessionFixture();
+  oversized.approaches[0] = {
+    ...oversized.approaches[0],
+    summary: "x".repeat(1024 * 1024),
+  };
+
+  await expect(
+    commitFeatureEvolveResult(rootPath, oversized),
+  ).rejects.toThrow(/too large|1 MiB/i);
+  await expect(
+    loadSession(rootPath, "project-1", analyzing.id),
+  ).resolves.toEqual(analyzing);
+});
+
+// Production break caught: approval persistence writes the source record
+// directly, so it needs the same pre-write byte guard as generic sessions.
+it("rejects an oversized approval checkpoint and preserves AWAITING_DECISION", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(rootPath, awaiting);
+  const oversizedApproval = {
+    ...approvalFixture(),
+    comment: "x".repeat(1024 * 1024),
+  };
+  const oversizedSession = {
+    ...approvedFeatureEvolveSessionFixture(),
+    approval: oversizedApproval,
+  };
+
+  await expect(
+    approveFeatureEvolveApproach(rootPath, {
+      session: oversizedSession,
+      approval: oversizedApproval,
+      executeSession: safeExecutionDraftFixture(),
+    }),
+  ).rejects.toThrow(/too large|1 MiB/i);
+  await expect(
+    loadSession(rootPath, "project-1", awaiting.id),
+  ).resolves.toEqual(awaiting);
+  await expect(
+    loadSession(rootPath, "project-1", "safe-execution-1"),
+  ).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 // Production break caught: omitting a runtime directory or creating governance makes machine state incomplete or falsely authoritative.

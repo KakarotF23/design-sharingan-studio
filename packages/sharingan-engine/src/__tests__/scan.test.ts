@@ -123,4 +123,46 @@ describe("scanReference", () => {
     expect(persisted).toEqual(expected);
     expect(result).toEqual({ designDNA: expected, threadId: "thread-scan-1" });
   });
+
+  it.each([
+    ["an oversized analysis field", { ...wireOutput, hierarchy: "x".repeat(2_001) }],
+    [
+      "too many KRAI decisions",
+      {
+        ...wireOutput,
+        keep: Array.from({ length: 13 }, (_, index) => `Keep ${index}`),
+      },
+    ],
+  ] as const)("rejects %s at the shared SCAN boundary", async (_label, malformed) => {
+    await expect(
+      scanReference(
+        {
+          reference,
+          stagedImagePath: "/app-state/scan-1/reference.png",
+          analysisWorkingDirectory: "/app-state/scan-1",
+          projectContext: {
+            name: "Fixture product",
+            routes: [],
+            componentDirectories: [],
+            designDocuments: [],
+          },
+          analyzeForMe: true,
+        },
+        {
+          agent: {
+            async run<TStructured>() {
+              return {
+                threadId: "thread-scan-invalid",
+                finalResponse: JSON.stringify(malformed),
+                structured: malformed as TStructured,
+                items: [],
+              };
+            },
+          },
+          createId: () => "unused",
+          persist: async () => undefined,
+        },
+      ),
+    ).rejects.toThrow(/structured/i);
+  });
 });

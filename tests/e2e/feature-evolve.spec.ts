@@ -3,15 +3,51 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  readlink,
   rm,
 } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 
 let sandboxPath: string;
 let projectPath: string;
-let sourceBefore: string;
+let targetTreeBefore: Record<string, string>;
+
+async function snapshotTargetTree(
+  rootPath: string,
+): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+
+  async function visit(directoryPath: string, relativeDirectory = ""): Promise<void> {
+    const entries = await readdir(directoryPath, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const relativePath = relativeDirectory
+        ? join(relativeDirectory, entry.name)
+        : entry.name;
+      if (relativePath === ".design-sharingan") continue;
+
+      const absolutePath = join(directoryPath, entry.name);
+      if (entry.isDirectory()) {
+        snapshot[relativePath] = "directory";
+        await visit(absolutePath, relativePath);
+      } else if (entry.isFile()) {
+        snapshot[relativePath] = `file:${createHash("sha256")
+          .update(await readFile(absolutePath))
+          .digest("hex")}`;
+      } else if (entry.isSymbolicLink()) {
+        snapshot[relativePath] = `symlink:${await readlink(absolutePath)}`;
+      } else {
+        snapshot[relativePath] = "other";
+      }
+    }
+  }
+
+  await visit(rootPath);
+  return snapshot;
+}
 
 test.beforeAll(async () => {
   sandboxPath = await mkdtemp(join(tmpdir(), "design-sharingan-evolve-e2e-"));
@@ -19,7 +55,7 @@ test.beforeAll(async () => {
   await cp(resolve(process.cwd(), "tests/fixtures/next-basic"), projectPath, {
     recursive: true,
   });
-  sourceBefore = await readFile(join(projectPath, "package.json"), "utf8");
+  targetTreeBefore = await snapshotTargetTree(projectPath);
 });
 
 test.afterAll(async () => {
@@ -102,9 +138,7 @@ test("creates a Feature Brief, approves one EVOLVE approach, and hands it to Exe
     page.getByText("Ready for change proposal", { exact: true }),
   ).toBeVisible();
 
-  expect(await readFile(join(projectPath, "package.json"), "utf8")).toBe(
-    sourceBefore,
-  );
+  expect(await snapshotTargetTree(projectPath)).toEqual(targetTreeBefore);
 
   const records = await Promise.all(
     (await readdir(join(projectPath, ".design-sharingan", "sessions")))

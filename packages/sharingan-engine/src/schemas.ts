@@ -57,36 +57,57 @@ export interface AssimilateWireOutput {
   direction: ScanWireOutput;
 }
 
-const stringField = { type: "string" } as const;
-const stringArrayField = {
+const analysisStringField = {
+  type: "string",
+  minLength: 1,
+  maxLength: 2_000,
+} as const;
+const shortStringField = {
+  type: "string",
+  minLength: 1,
+  maxLength: 256,
+} as const;
+const identifierStringField = {
+  type: "string",
+  minLength: 1,
+  maxLength: 128,
+} as const;
+const decisionStringArrayField = {
   type: "array",
-  items: { type: "string" },
+  items: { type: "string", minLength: 1, maxLength: 1_000 },
+  maxItems: 12,
 } as const;
 
-const nonEmptyStringArrayField = {
-  ...stringArrayField,
+const nonEmptyDecisionStringArrayField = {
+  ...decisionStringArrayField,
   minItems: 1,
+} as const;
+
+const locatorStringArrayField = {
+  type: "array",
+  items: { type: "string", minLength: 1, maxLength: 512 },
+  maxItems: 16,
 } as const;
 
 export const SCAN_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
-    hierarchy: stringField,
-    layout: stringField,
-    spacing: stringField,
-    typography: stringField,
-    colorLogic: stringField,
-    componentGeometry: stringField,
-    navigation: stringField,
-    interaction: stringField,
-    motion: stringField,
-    density: stringField,
-    emotionalTone: stringField,
-    visualWeight: stringField,
-    keep: stringArrayField,
-    reject: stringArrayField,
-    adapt: stringArrayField,
-    invent: stringArrayField,
+    hierarchy: analysisStringField,
+    layout: analysisStringField,
+    spacing: analysisStringField,
+    typography: analysisStringField,
+    colorLogic: analysisStringField,
+    componentGeometry: analysisStringField,
+    navigation: analysisStringField,
+    interaction: analysisStringField,
+    motion: analysisStringField,
+    density: analysisStringField,
+    emotionalTone: analysisStringField,
+    visualWeight: analysisStringField,
+    keep: decisionStringArrayField,
+    reject: decisionStringArrayField,
+    adapt: decisionStringArrayField,
+    invent: decisionStringArrayField,
   },
   required: [
     "hierarchy",
@@ -112,14 +133,14 @@ export const SCAN_OUTPUT_SCHEMA = {
 const UX_IMPACT_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
-    area: stringField,
+    area: shortStringField,
     severity: {
       type: "string",
       enum: ["CRITICAL", "IMPORTANT", "POLISH", "IGNORE"],
     },
-    reason: stringField,
-    affectedRoutes: stringArrayField,
-    affectedComponents: stringArrayField,
+    reason: analysisStringField,
+    affectedRoutes: locatorStringArrayField,
+    affectedComponents: locatorStringArrayField,
     decisionRequired: { type: "boolean" },
   },
   required: [
@@ -136,20 +157,26 @@ const UX_IMPACT_OUTPUT_SCHEMA = {
 const DESIGN_APPROACH_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
-    id: stringField,
-    title: stringField,
-    summary: stringField,
+    id: identifierStringField,
+    title: shortStringField,
+    summary: analysisStringField,
     recommended: { type: "boolean" },
-    pros: nonEmptyStringArrayField,
-    cons: nonEmptyStringArrayField,
+    pros: nonEmptyDecisionStringArrayField,
+    cons: nonEmptyDecisionStringArrayField,
     uxImpact: {
       type: "array",
       items: UX_IMPACT_OUTPUT_SCHEMA,
       minItems: 1,
+      maxItems: 8,
     },
-    estimatedComplexity: stringField,
-    genomeFit: stringField,
-    likelyFiles: nonEmptyStringArrayField,
+    estimatedComplexity: shortStringField,
+    genomeFit: analysisStringField,
+    likelyFiles: {
+      type: "array",
+      items: { type: "string", minLength: 1, maxLength: 512 },
+      minItems: 1,
+      maxItems: 32,
+    },
     status: { type: "string", enum: ["PROPOSED"] },
   },
   required: [
@@ -175,6 +202,7 @@ export const EVOLVE_OUTPUT_SCHEMA = {
       type: "array",
       items: UX_IMPACT_OUTPUT_SCHEMA,
       minItems: 1,
+      maxItems: 8,
     },
     approaches: {
       type: "array",
@@ -190,9 +218,14 @@ export const EVOLVE_OUTPUT_SCHEMA = {
 const ASSIMILATION_SOURCE_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
-    referenceIds: nonEmptyStringArrayField,
-    role: stringField,
-    principles: nonEmptyStringArrayField,
+    referenceIds: {
+      type: "array",
+      items: { type: "string", minLength: 1, maxLength: 128 },
+      minItems: 1,
+      maxItems: 32,
+    },
+    role: shortStringField,
+    principles: nonEmptyDecisionStringArrayField,
   },
   required: ["referenceIds", "role", "principles"],
   additionalProperties: false,
@@ -201,11 +234,12 @@ const ASSIMILATION_SOURCE_OUTPUT_SCHEMA = {
 export const ASSIMILATE_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
-    summary: stringField,
+    summary: { type: "string", minLength: 1, maxLength: 4_000 },
     sourceMap: {
       type: "array",
       items: ASSIMILATION_SOURCE_OUTPUT_SCHEMA,
       minItems: 2,
+      maxItems: 16,
     },
     direction: SCAN_OUTPUT_SCHEMA,
   },
