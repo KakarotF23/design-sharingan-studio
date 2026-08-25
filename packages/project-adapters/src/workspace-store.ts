@@ -1327,6 +1327,15 @@ export async function approveFeatureEvolveApproach(
   ) {
     throw new Error("Feature EVOLVE approval checkpoint is incomplete");
   }
+  if (
+    session.updatedAt !== approval.createdAt ||
+    executeSession.createdAt !== approval.createdAt ||
+    executeSession.updatedAt !== approval.createdAt
+  ) {
+    throw new Error(
+      "Feature EVOLVE approval checkpoint timestamps must match approval.createdAt",
+    );
+  }
   assertSafePathSegment(session.id, "Session id");
   assertSafePathSegment(executeSession.id, "Session id");
   const workspace = await loadValidatedProjectContext(rootPath, session.projectId);

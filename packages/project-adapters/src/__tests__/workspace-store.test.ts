@@ -359,6 +359,8 @@ function approvalCheckpoint(
   const executeSession = {
     ...safeExecutionDraftFixture(),
     id: `safe-execution-${suffix}`,
+    createdAt: approval.createdAt,
+    updatedAt: approval.createdAt,
     sourceSessionId: awaiting.id,
     approvedApproachId: approachId,
     approvalId: approval.id,
@@ -370,6 +372,7 @@ function approvalCheckpoint(
     session: {
       ...awaiting,
       status: "APPROVED" as const,
+      updatedAt: approval.createdAt,
       approvedApproachId: approachId,
       approval,
       executeSessionId: executeSession.id,
@@ -488,6 +491,81 @@ it.each([
   ).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+type ApprovalCheckpointFixture = ReturnType<typeof approvalCheckpoint>;
+
+const incoherentTimestampCases: readonly [
+  string,
+  (checkpoint: ApprovalCheckpointFixture) => ApprovalCheckpointFixture,
+][] = [
+  [
+    "approved source updatedAt",
+    (checkpoint) => ({
+      ...checkpoint,
+      session: {
+        ...checkpoint.session,
+        updatedAt: "2026-08-24T10:59:59.000Z",
+      },
+    }),
+  ],
+  [
+    "execution createdAt",
+    (checkpoint) => ({
+      ...checkpoint,
+      executeSession: {
+        ...checkpoint.executeSession,
+        createdAt: "2026-08-24T10:59:59.000Z",
+      },
+    }),
+  ],
+  [
+    "execution updatedAt",
+    (checkpoint) => ({
+      ...checkpoint,
+      executeSession: {
+        ...checkpoint.executeSession,
+        updatedAt: "2026-08-24T10:59:59.000Z",
+      },
+    }),
+  ],
+];
+
+// Production break caught: the writer can otherwise persist a checkpoint
+// that its relational Execute loader must reject. Timestamp validation must
+// happen before the exclusive claim, including when a stale claim exists.
+it.each(incoherentTimestampCases)(
+  "rejects incoherent %s before acquiring the approval claim",
+  async (_label, makeIncoherent) => {
+    const rootPath = await temporaryProject();
+    await saveProjectMetadata(projectFixture(rootPath));
+    const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+    await saveSession(rootPath, awaiting);
+    const checkpoint = makeIncoherent(
+      approvalCheckpoint(awaiting, "approach-guided-queue", "timestamp"),
+    );
+    const claimPath = join(
+      rootPath,
+      ".design-sharingan",
+      "sessions",
+      `.${awaiting.id}.approval.claim`,
+    );
+    await writeFile(claimPath, "stale claim remains fail-closed\n");
+
+    await expect(
+      approveFeatureEvolveApproach(rootPath, checkpoint),
+    ).rejects.toThrow(/timestamp|createdAt|updatedAt/i);
+
+    await expect(
+      loadSession(rootPath, "project-1", awaiting.id),
+    ).resolves.toEqual(awaiting);
+    await expect(
+      loadSession(rootPath, "project-1", checkpoint.executeSession.id),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(claimPath, "utf8")).resolves.toBe(
+      "stale claim remains fail-closed\n",
+    );
+  },
+);
+
 // Production break caught: exposing SAFE_EXECUTION before its design approval
 // is durable, or leaving the approval visible after the linked-draft write
 // fails, creates an unauthorized mutation path.
@@ -553,6 +631,11 @@ it("serializes competing Feature EVOLVE approvals so exactly one direction wins"
 
   expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
   expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+  const winningIndex = results.findIndex(
+    (result) => result.status === "fulfilled",
+  );
+  const winner = winningIndex === 0 ? guided : inline;
+  const loser = winningIndex === 0 ? inline : guided;
   const sessions = await listSessions(rootPath, "project-1");
   const approved = sessions.find(
     (session) => session.type === "FEATURE_EVOLVE",
@@ -568,6 +651,14 @@ it("serializes competing Feature EVOLVE approvals so exactly one direction wins"
     approvedApproachId: approved.approvedApproachId,
     approvalId: approved.approval.id,
   });
+  await expect(
+    loadApprovedExecutionDirection(rootPath, "project-1"),
+  ).resolves.toEqual(winner.executeSession);
+  expect(approved.approvedApproachId).toBe(winner.session.approvedApproachId);
+  expect(approved.approvedApproachId).not.toBe(loser.session.approvedApproachId);
+  expect(
+    sessions.some((session) => session.id === loser.executeSession.id),
+  ).toBe(false);
 });
 
 // Production break caught: Execute must not surface a shape-valid draft whose
