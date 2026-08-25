@@ -7,6 +7,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@design-sharingan/core": "workspace:*",
+    "@design-sharingan/project-adapters": "workspace:*",
+    "@design-sharingan/ui": "workspace:*",
     "next": "latest",
     "react": "latest",
     "react-dom": "latest"

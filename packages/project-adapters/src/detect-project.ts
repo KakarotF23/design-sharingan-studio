@@ -105,7 +105,7 @@ async function readPackageJson(rootPath: string): Promise<PackageJson | undefine
   }
 
   const packageFile = await open(
-    packagePath,
+    /* turbopackIgnore: true */ packagePath,
     constants.O_RDONLY | constants.O_NOFOLLOW,
   );
   try {
@@ -353,7 +353,7 @@ function pagesRoute(pagesRoot: string, filePath: string): string | undefined {
 async function detectRoutes(rootPath: string): Promise<string[]> {
   const routes = new Set<string>();
   for (const appDirectory of ["app", join("src", "app")]) {
-    const appRoot = join(rootPath, appDirectory);
+    const appRoot = join(/* turbopackIgnore: true */ rootPath, appDirectory);
     for (const filePath of await walkRouteFiles(appRoot)) {
       const route = appRoute(appRoot, filePath);
       if (route !== undefined) {
@@ -362,7 +362,10 @@ async function detectRoutes(rootPath: string): Promise<string[]> {
     }
   }
   for (const pagesDirectory of ["pages", join("src", "pages")]) {
-    const pagesRoot = join(rootPath, pagesDirectory);
+    const pagesRoot = join(
+      /* turbopackIgnore: true */ rootPath,
+      pagesDirectory,
+    );
     for (const filePath of await walkRouteFiles(pagesRoot)) {
       const route = pagesRoute(pagesRoot, filePath);
       if (route !== undefined) {

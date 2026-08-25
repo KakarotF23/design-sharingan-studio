@@ -37,7 +37,7 @@ export const defaultGitRunner: GitRunner = {
           ...inheritedEnvironment,
           ...options?.environment,
           ...options?.privateEnvironment,
-        },
+        } as NodeJS.ProcessEnv,
         shell: false,
         stdio: ["ignore", "ignore", "ignore"],
       });

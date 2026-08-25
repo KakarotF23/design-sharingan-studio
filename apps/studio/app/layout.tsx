@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import "@design-sharingan/ui/studio.css";
 import "./globals.css";
 
 export const metadata: Metadata = {
