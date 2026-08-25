@@ -18,6 +18,15 @@ interface GitEvidence {
   statusBefore: string;
   statusAfter: string;
   diffAfter: string;
+  truncation: Record<
+    "branch" | "statusBefore" | "statusAfter" | "diffAfter",
+    {
+      truncated: boolean;
+      limitBytes: number;
+      originalBytes: number;
+      retainedBytes: number;
+    }
+  >;
   note?: string;
 }
 
@@ -41,6 +50,13 @@ interface ExecuteSession {
   proposalThreadId?: string;
   decisionApproval?: Approval;
   mutationApproval?: Approval;
+  executionFailure?: {
+    kind: "SAFE_MUTATION_FAILURE";
+    targetDisposition: "RECONCILIATION_REQUIRED";
+    reason: string;
+    affectedPaths: string[];
+    occurredAt: string;
+  };
   mutationEvidence?: {
     proposalId: string;
     threadId: string;
@@ -62,6 +78,9 @@ function activityFor(
   busy: boolean,
   action: SafeAction | undefined,
 ): string {
+  if (session?.status === "APPROVED" && session.executionFailure) {
+    return "Approved execution requires reconciliation; replay is blocked";
+  }
   if (session?.status === "APPROVED") {
     return "Approval persisted; controlled mutation is running";
   }
@@ -139,7 +158,8 @@ export function ExecuteWorkspace() {
     const durableWorkInProgress =
       session?.status === "PREPARING" ||
       session?.status === "PROPOSING" ||
-      session?.status === "APPROVED";
+      (session?.status === "APPROVED" &&
+        session.executionFailure === undefined);
     if (!busy && !durableWorkInProgress) return;
     let cancelled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -159,7 +179,7 @@ export function ExecuteWorkspace() {
       cancelled = true;
       if (timeout !== undefined) clearTimeout(timeout);
     };
-  }, [busy, fetchDurableSession, session?.status]);
+  }, [busy, fetchDurableSession, session?.executionFailure, session?.status]);
 
   async function runAction(
     action: SafeAction,
@@ -191,6 +211,12 @@ export function ExecuteWorkspace() {
       setSession(payload.session);
       setNotice(successNotice);
     } catch (caught) {
+      try {
+        setSession(await fetchDurableSession());
+      } catch {
+        // Keep the action error authoritative when the durable checkpoint is
+        // temporarily unavailable. The existing poll/reload recovery remains.
+      }
       setError(
         caught instanceof Error
           ? caught.message
@@ -203,12 +229,14 @@ export function ExecuteWorkspace() {
   }
 
   const preparing = session?.status === "PREPARING" || session?.status === "PROPOSING";
+  const approvedExecutionActive =
+    session?.status === "APPROVED" && session.executionFailure === undefined;
   const git = session?.mutationEvidence?.git;
 
   return (
     <div
       className="execute-workspace"
-      aria-busy={busy || preparing}
+      aria-busy={busy || preparing || approvedExecutionActive}
     >
       <WorkspaceHeader
         eyebrow={`BOUNDED CHANGE / ${project.name.toUpperCase()}`}
@@ -294,12 +322,29 @@ export function ExecuteWorkspace() {
         </section>
       ) : null}
 
-      {preparing || session?.status === "APPROVED" ? (
+      {preparing || approvedExecutionActive ? (
         <p className="analysis-status" role="status">
           {session.status === "APPROVED"
             ? "Approval persisted. Applying only the exact approved delta…"
             : "Preparing a structured Change Proposal in read-only analysis space…"}
         </p>
+      ) : null}
+
+      {session?.status === "APPROVED" && session.executionFailure ? (
+        <section
+          className="decision-outcome"
+          aria-labelledby="reconciliation-required-title"
+        >
+          <p className="utility-label">APPROVAL RETAINED / REPLAY BLOCKED</p>
+          <h2 id="reconciliation-required-title">
+            Mutation reconciliation required
+          </h2>
+          <p>{session.executionFailure.reason}</p>
+          <p>
+            The target outcome is indeterminate. Inspect these exact paths before
+            any further execution: {session.executionFailure.affectedPaths.join(", ")}.
+          </p>
+        </section>
       ) : null}
 
       {session?.status === "WAITING_APPROVAL" && session.proposal ? (
@@ -367,6 +412,12 @@ export function ExecuteWorkspace() {
           <div className="mutation-evidence__diff">
             <h3>Diff after</h3>
             <pre>{git?.diffAfter || git?.note || "Git diff evidence is unavailable."}</pre>
+            {git?.truncation.diffAfter.truncated ? (
+              <p>
+                Git diff evidence truncated: retained {git.truncation.diffAfter.retainedBytes}
+                {" "}of {git.truncation.diffAfter.originalBytes} UTF-8 bytes.
+              </p>
+            ) : null}
           </div>
           <p>No auto-commit was created.</p>
           <p>Fresh render and verification continue in Task 10; this session remains truthfully at EDITING.</p>

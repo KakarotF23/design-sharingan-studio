@@ -209,6 +209,19 @@ export interface Approval {
   createdAt: ISODateTime;
 }
 
+export type SafeMutationTargetDisposition =
+  | "NO_TARGET_CHANGE"
+  | "FULLY_ROLLED_BACK"
+  | "RECONCILIATION_REQUIRED";
+
+export interface SafeMutationFailureEvidence {
+  kind: "SAFE_MUTATION_FAILURE";
+  targetDisposition: SafeMutationTargetDisposition;
+  reason: string;
+  affectedPaths: string[];
+  occurredAt: ISODateTime;
+}
+
 export interface RenderArtifact {
   id: string;
   sessionId: string;

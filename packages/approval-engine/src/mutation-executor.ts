@@ -25,7 +25,12 @@ import {
   sep,
 } from "node:path";
 import type { CodexAgentRunInput } from "@design-sharingan/agent-runtime";
-import type { Approval, ChangeProposal } from "@design-sharingan/core";
+import type {
+  Approval,
+  ChangeProposal,
+  SafeMutationFailureEvidence,
+  SafeMutationTargetDisposition,
+} from "@design-sharingan/core";
 
 const MAX_APPROVED_PATHS = 128;
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -33,7 +38,6 @@ const MAX_DELTA_BYTES = 8 * 1024 * 1024;
 const MAX_MIRROR_ENTRIES = 512;
 const MAX_GIT_OUTPUT_BYTES = 128 * 1024;
 const GIT_TIMEOUT_MS = 5_000;
-const GIT_TRUNCATION_MARKER = "\n[Git evidence truncated]";
 
 export interface MutationAgent {
   run<TStructured = unknown>(input: CodexAgentRunInput): Promise<{
@@ -53,7 +57,20 @@ export interface GitMutationEvidence {
   statusBefore: string;
   statusAfter: string;
   diffAfter: string;
+  truncation: {
+    branch: GitEvidenceTruncation;
+    statusBefore: GitEvidenceTruncation;
+    statusAfter: GitEvidenceTruncation;
+    diffAfter: GitEvidenceTruncation;
+  };
   note?: string;
+}
+
+export interface GitEvidenceTruncation {
+  truncated: boolean;
+  limitBytes: number;
+  originalBytes: number;
+  retainedBytes: number;
 }
 
 export interface MutationResult {
@@ -76,13 +93,17 @@ interface DeltaRecord extends TargetRecord {
 }
 
 interface AppliedDeltaRecord extends DeltaRecord {
-  appliedContents?: Uint8Array;
+  expectedAppliedContents?: Uint8Array;
+  expectedAppliedMode?: number;
 }
 
 interface GitBefore {
   available: boolean;
   branch?: string;
   statusBefore: string;
+  branchTruncation: GitEvidenceTruncation;
+  statusBeforeTruncation: GitEvidenceTruncation;
+  trackedPaths?: ReadonlySet<string>;
   note?: string;
 }
 
@@ -91,6 +112,47 @@ export interface MutationExecutorOptions {
   proposalThreadId: string;
   agent: MutationAgent;
   mutationDriver?: MutationDriver;
+}
+
+export class SafeMutationExecutionError extends Error {
+  readonly failure: SafeMutationFailureEvidence;
+
+  constructor(
+    targetDisposition: SafeMutationTargetDisposition,
+    affectedPaths: string[],
+    cause: unknown,
+  ) {
+    super(
+      cause instanceof Error
+        ? cause.message
+        : "Safe Mode mutation failed without trustworthy completion evidence",
+      { cause },
+    );
+    this.name = "SafeMutationExecutionError";
+    this.failure = {
+      kind: "SAFE_MUTATION_FAILURE",
+      targetDisposition,
+      reason: boundedUtf8(this.message, 2_000).value,
+      affectedPaths,
+      occurredAt: new Date().toISOString(),
+    };
+  }
+}
+
+class MutationTransactionError extends Error {
+  readonly targetDisposition:
+    | "FULLY_ROLLED_BACK"
+    | "RECONCILIATION_REQUIRED";
+
+  constructor(
+    targetDisposition: "FULLY_ROLLED_BACK" | "RECONCILIATION_REQUIRED",
+    message: string,
+    cause: unknown,
+  ) {
+    super(message, { cause });
+    this.name = "MutationTransactionError";
+    this.targetDisposition = targetDisposition;
+  }
 }
 
 const defaultMutationDriver: MutationDriver = {
@@ -133,7 +195,7 @@ function safeIdentifier(value: string): boolean {
 function safeRelativePath(path: string): boolean {
   return (
     path.length > 0 &&
-    path.length <= 512 &&
+    Buffer.byteLength(path, "utf8") <= 512 &&
     !/[\u0000-\u001f\u007f]/.test(path) &&
     !path.includes("\\") &&
     !path.startsWith("/") &&
@@ -482,7 +544,10 @@ async function assertTargetStillMatches(record: TargetRecord): Promise<void> {
     throw new Error(`Approved target became stale: ${record.relativePath}`);
   }
   const current = await securelyReadRegularFile(record.absolutePath);
-  if (!equalBytes(current.contents, record.originalContents as Uint8Array)) {
+  if (
+    !equalBytes(current.contents, record.originalContents as Uint8Array) ||
+    current.mode !== record.originalMode
+  ) {
     throw new Error(`Approved target became stale: ${record.relativePath}`);
   }
 }
@@ -494,31 +559,43 @@ async function applyTransaction(
 ): Promise<void> {
   const applied: AppliedDeltaRecord[] = [];
   const createdDirectories: string[] = [];
+  let uncertainOperationError: unknown;
   try {
     for (const delta of deltas) {
       await assertSafeAncestors(rootPath, delta.relativePath);
       await assertTargetStillMatches(delta);
-      if (delta.operation !== "delete") {
-        await ensureSafeParentDirectories(
-          rootPath,
-          delta.relativePath,
-          createdDirectories,
-        );
-        await driver.write(
-          delta.absolutePath,
-          delta.nextContents as Uint8Array,
-          delta.operation === "modify"
-            ? (delta.originalMode as number)
-            : 0o644,
-        );
-      } else {
-        await driver.remove(delta.absolutePath);
+      const expected = expectedAppliedTarget(delta);
+      try {
+        if (delta.operation !== "delete") {
+          await ensureSafeParentDirectories(
+            rootPath,
+            delta.relativePath,
+            createdDirectories,
+          );
+          await driver.write(
+            delta.absolutePath,
+            delta.nextContents as Uint8Array,
+            expected.expectedAppliedMode as number,
+          );
+        } else {
+          await driver.remove(delta.absolutePath);
+        }
+      } catch (operationError) {
+        if (await targetMatchesApplied(expected)) {
+          applied.push(expected);
+        } else if (!(await targetMatchesOriginal(delta))) {
+          uncertainOperationError = new Error(
+            `Mutation outcome is indeterminate for ${delta.relativePath}`,
+          );
+        }
+        throw operationError;
       }
-      applied.push(await captureAppliedTarget(delta));
+      applied.push(expected);
+      await assertTargetMatchesApplied(expected);
     }
     await validateAppliedDelta(deltas);
   } catch (commitError) {
-    let rollbackError: unknown;
+    let rollbackError: unknown = uncertainOperationError;
     for (const delta of [...applied].reverse()) {
       try {
         await assertRollbackStillOwnsTarget(delta);
@@ -536,28 +613,110 @@ async function applyTransaction(
             delta.originalMode as number,
           );
         }
+        await assertTargetMatchesOriginal(delta);
       } catch (error) {
         rollbackError ??= error;
       }
     }
     for (const directoryPath of [...createdDirectories].reverse()) {
-      await rmdir(directoryPath).catch(() => undefined);
+      try {
+        await rmdir(directoryPath);
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+          rollbackError ??= error;
+        }
+      }
+    }
+    for (const delta of deltas) {
+      if (!(await targetMatchesOriginal(delta))) {
+        rollbackError ??= new Error(
+          `Rollback could not prove the original target: ${delta.relativePath}`,
+        );
+      }
     }
     if (rollbackError !== undefined) {
-      throw new Error("Safe Mode mutation and rollback both failed", {
-        cause: { commitError, rollbackError },
-      });
+      throw new MutationTransactionError(
+        "RECONCILIATION_REQUIRED",
+        "Safe Mode mutation and rollback both failed",
+        { commitError, rollbackError },
+      );
     }
-    throw commitError;
+    throw new MutationTransactionError(
+      "FULLY_ROLLED_BACK",
+      commitError instanceof Error
+        ? commitError.message
+        : "Safe Mode mutation failed and was fully rolled back",
+      commitError,
+    );
   }
 }
 
-async function captureAppliedTarget(
+function expectedAppliedTarget(
   delta: DeltaRecord,
-): Promise<AppliedDeltaRecord> {
+): AppliedDeltaRecord {
   if (delta.operation === "delete") return delta;
-  const current = await securelyReadRegularFile(delta.absolutePath);
-  return { ...delta, appliedContents: current.contents };
+  return {
+    ...delta,
+    expectedAppliedContents: delta.nextContents,
+    expectedAppliedMode:
+      delta.operation === "modify" ? delta.originalMode : 0o644,
+  };
+}
+
+async function targetMatchesApplied(
+  delta: AppliedDeltaRecord,
+): Promise<boolean> {
+  const entry = await lstatIfPresent(delta.absolutePath);
+  if (delta.operation === "delete") return entry === undefined;
+  if (entry === undefined || entry.isSymbolicLink() || !entry.isFile()) {
+    return false;
+  }
+  try {
+    const current = await securelyReadRegularFile(delta.absolutePath);
+    return (
+      equalBytes(
+        current.contents,
+        delta.expectedAppliedContents as Uint8Array,
+      ) && current.mode === delta.expectedAppliedMode
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function assertTargetMatchesApplied(
+  delta: AppliedDeltaRecord,
+): Promise<void> {
+  if (!(await targetMatchesApplied(delta))) {
+    throw new Error(
+      `Approved ${delta.operation} content or mode mismatch: ${delta.relativePath}`,
+    );
+  }
+}
+
+async function targetMatchesOriginal(delta: DeltaRecord): Promise<boolean> {
+  const entry = await lstatIfPresent(delta.absolutePath);
+  if (delta.operation === "create") return entry === undefined;
+  if (entry === undefined || entry.isSymbolicLink() || !entry.isFile()) {
+    return false;
+  }
+  try {
+    const current = await securelyReadRegularFile(delta.absolutePath);
+    return (
+      equalBytes(current.contents, delta.originalContents as Uint8Array) &&
+      current.mode === delta.originalMode
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function assertTargetMatchesOriginal(delta: DeltaRecord): Promise<void> {
+  if (!(await targetMatchesOriginal(delta))) {
+    throw new Error(
+      `Rollback could not restore the original target: ${delta.relativePath}`,
+    );
+  }
 }
 
 async function assertRollbackStillOwnsTarget(
@@ -577,8 +736,7 @@ async function assertRollbackStillOwnsTarget(
       `Rollback refused because the applied target changed: ${delta.relativePath}`,
     );
   }
-  const current = await securelyReadRegularFile(delta.absolutePath);
-  if (!equalBytes(current.contents, delta.appliedContents as Uint8Array)) {
+  if (!(await targetMatchesApplied(delta))) {
     throw new Error(
       `Rollback refused because another writer changed: ${delta.relativePath}`,
     );
@@ -614,19 +772,62 @@ function boundedAppend(
   return currentBytes + chunk.byteLength;
 }
 
-function boundedGitEvidence(value: string): string {
-  const wasTruncated = value.includes(GIT_TRUNCATION_MARKER);
-  const normalized = value.split(GIT_TRUNCATION_MARKER).join("");
-  const encoded = Buffer.from(normalized, "utf8");
-  if (encoded.byteLength <= MAX_GIT_OUTPUT_BYTES && !wasTruncated) {
-    return normalized;
+function decodeUtf8Prefix(value: Uint8Array): string {
+  for (let end = value.byteLength; end >= Math.max(0, value.byteLength - 3); end -= 1) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(
+        value.subarray(0, end),
+      );
+    } catch {
+      // A UTF-8 code point can span at most four bytes. Trim only the
+      // incomplete trailing sequence; never rewrite literal evidence.
+    }
   }
-  const marker = Buffer.from(GIT_TRUNCATION_MARKER, "utf8");
-  const prefix = encoded
-    .subarray(0, MAX_GIT_OUTPUT_BYTES - marker.byteLength)
-    .toString("utf8")
-    .replace(/\uFFFD$/, "");
-  return `${prefix}${GIT_TRUNCATION_MARKER}`;
+  return "";
+}
+
+function boundedUtf8(
+  value: string,
+  maximumBytes: number,
+): { value: string; truncation: GitEvidenceTruncation } {
+  const encoded = Buffer.from(value, "utf8");
+  if (encoded.byteLength <= maximumBytes) {
+    return {
+      value,
+      truncation: {
+        truncated: false,
+        limitBytes: maximumBytes,
+        originalBytes: encoded.byteLength,
+        retainedBytes: encoded.byteLength,
+      },
+    };
+  }
+  const retained = decodeUtf8Prefix(encoded.subarray(0, maximumBytes));
+  return {
+    value: retained,
+    truncation: {
+      truncated: true,
+      limitBytes: maximumBytes,
+      originalBytes: encoded.byteLength,
+      retainedBytes: Buffer.byteLength(retained, "utf8"),
+    },
+  };
+}
+
+function mergeTruncation(
+  source: GitEvidenceTruncation,
+  retained: GitEvidenceTruncation,
+  sourceOriginalBytes = source.originalBytes,
+): GitEvidenceTruncation {
+  const truncated = source.truncated || retained.truncated;
+  return {
+    truncated,
+    limitBytes: retained.limitBytes,
+    originalBytes: truncated
+      ? Math.max(sourceOriginalBytes, retained.originalBytes)
+      : retained.originalBytes,
+    retainedBytes: retained.retainedBytes,
+  };
 }
 
 function redactSensitiveGitOutput(value: string): string {
@@ -667,7 +868,11 @@ const hardenedGitConfig = [
 async function runGit(
   cwd: string,
   args: readonly string[],
-): Promise<{ ok: boolean; output: string }> {
+): Promise<{
+  ok: boolean;
+  output: string;
+  truncation: GitEvidenceTruncation;
+}> {
   return new Promise((resolvePromise) => {
     const chunks: Buffer[] = [];
     let outputBytes = 0;
@@ -700,14 +905,20 @@ async function runGit(
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      const raw = Buffer.concat(chunks).toString("utf8");
+      const truncated = outputBytes > MAX_GIT_OUTPUT_BYTES;
+      const raw = decodeUtf8Prefix(Buffer.concat(chunks));
+      const output = truncated ? raw : raw.trimEnd();
       resolvePromise({
         ok,
-        output: boundedGitEvidence(
-          outputBytes > MAX_GIT_OUTPUT_BYTES
-            ? `${raw}${GIT_TRUNCATION_MARKER}`
-            : raw.trimEnd(),
-        ),
+        output,
+        truncation: {
+          truncated,
+          limitBytes: MAX_GIT_OUTPUT_BYTES,
+          originalBytes: truncated
+            ? outputBytes
+            : Buffer.byteLength(output, "utf8"),
+          retainedBytes: Buffer.byteLength(output, "utf8"),
+        },
       });
     };
     child.once("error", () => finish(false));
@@ -715,7 +926,10 @@ async function runGit(
   });
 }
 
-async function captureGitBefore(rootPath: string): Promise<GitBefore> {
+async function captureGitBefore(
+  rootPath: string,
+  records: readonly TargetRecord[],
+): Promise<GitBefore> {
   const repository = await runGit(rootPath, [
     "rev-parse",
     "--is-inside-work-tree",
@@ -724,18 +938,50 @@ async function captureGitBefore(rootPath: string): Promise<GitBefore> {
     return {
       available: false,
       statusBefore: "",
+      branchTruncation: {
+        truncated: false,
+        limitBytes: MAX_GIT_OUTPUT_BYTES,
+        originalBytes: 0,
+        retainedBytes: 0,
+      },
+      statusBeforeTruncation: {
+        truncated: false,
+        limitBytes: MAX_GIT_OUTPUT_BYTES,
+        originalBytes: 0,
+        retainedBytes: 0,
+      },
       note: "Git metadata is unavailable for this project.",
     };
   }
-  const [branch, status] = await Promise.all([
+  const [branch, status, tracked] = await Promise.all([
     runGit(rootPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
     runGit(rootPath, ["status", "--porcelain=v1", "--untracked-files=all", "--", "."]),
+    runGit(rootPath, [
+      "ls-files",
+      "-z",
+      "--",
+      ...records.map((record) => record.relativePath),
+    ]),
   ]);
   return {
     available: true,
     branch: branch.ok ? branch.output : "DETACHED",
     statusBefore: status.ok ? status.output : "Git status before was unavailable.",
-    ...(!status.ok ? { note: "Some Git before-state evidence was unavailable." } : {}),
+    branchTruncation: branch.truncation,
+    statusBeforeTruncation: status.truncation,
+    ...(tracked.ok && !tracked.truncation.truncated
+      ? {
+          trackedPaths: new Set(
+            tracked.output.split("\0").filter((path) => path.length > 0),
+          ),
+        }
+      : {}),
+    ...(!status.ok ||
+    status.truncation.truncated ||
+    !tracked.ok ||
+    tracked.truncation.truncated
+      ? { note: "Some Git before-state evidence was unavailable." }
+      : {}),
   };
 }
 
@@ -750,6 +996,12 @@ async function captureGitAfter(
       statusBefore: before.statusBefore,
       statusAfter: "",
       diffAfter: "",
+      truncation: {
+        branch: { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 },
+        statusBefore: { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 },
+        statusAfter: { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 },
+        diffAfter: { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 },
+      },
       note: before.note,
     };
   }
@@ -763,30 +1015,69 @@ async function captureGitAfter(
       ...deltas.map((delta) => delta.relativePath),
     ]),
   ]);
-  const createdEvidence = deltas
+  const untrackedEvidence = deltas
     .filter(
-      (delta): delta is DeltaRecord & { nextContents: Uint8Array } =>
-        delta.operation === "create" && delta.nextContents !== undefined,
+      (delta) =>
+        before.trackedPaths !== undefined &&
+        !before.trackedPaths.has(delta.relativePath),
     )
-    .map(renderCreatedFileDiff)
+    .map(renderUntrackedFileDiff)
     .join("\n");
-  const exactDiff = [diff.ok ? diff.output : "", createdEvidence]
+  const exactDiff = [diff.ok ? diff.output : "", untrackedEvidence]
     .filter((part) => part !== "")
     .join("\n");
+  const branch =
+    before.branch === undefined
+      ? undefined
+      : boundedUtf8(redactSensitiveGitOutput(before.branch), MAX_GIT_OUTPUT_BYTES);
+  const statusBefore = boundedUtf8(
+    redactSensitiveGitOutput(before.statusBefore),
+    MAX_GIT_OUTPUT_BYTES,
+  );
+  const statusAfter = status.ok
+    ? boundedUtf8(redactSensitiveGitOutput(status.output), MAX_GIT_OUTPUT_BYTES)
+    : boundedUtf8("Git status after was unavailable.", MAX_GIT_OUTPUT_BYTES);
+  const diffAfter = diff.ok
+    ? boundedUtf8(redactSensitiveGitOutput(exactDiff), MAX_GIT_OUTPUT_BYTES)
+    : boundedUtf8("Git diff after was unavailable.", MAX_GIT_OUTPUT_BYTES);
+  const untrackedEvidenceBytes = Buffer.byteLength(untrackedEvidence, "utf8");
+  const exactDiffSourceBytes =
+    diff.truncation.originalBytes +
+    (diff.output !== "" && untrackedEvidence !== "" ? 1 : 0) +
+    untrackedEvidenceBytes;
   return {
     available: true,
-    branch:
-      before.branch === undefined
-        ? undefined
-        : redactSensitiveGitOutput(before.branch),
-    statusBefore: redactSensitiveGitOutput(before.statusBefore),
-    statusAfter: status.ok
-      ? redactSensitiveGitOutput(status.output)
-      : "Git status after was unavailable.",
-    diffAfter: diff.ok
-      ? boundedGitEvidence(redactSensitiveGitOutput(exactDiff))
-      : "Git diff after was unavailable.",
-    ...(!status.ok || !diff.ok
+    branch: branch?.value,
+    statusBefore: statusBefore.value,
+    statusAfter: statusAfter.value,
+    diffAfter: diffAfter.value,
+    truncation: {
+      branch:
+        branch === undefined
+          ? { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 }
+          : mergeTruncation(
+              before.branchTruncation,
+              branch.truncation,
+            ),
+      statusBefore: mergeTruncation(
+        before.statusBeforeTruncation,
+        statusBefore.truncation,
+      ),
+      statusAfter: mergeTruncation(
+        status.truncation,
+        statusAfter.truncation,
+      ),
+      diffAfter: mergeTruncation(
+        diff.truncation,
+        diffAfter.truncation,
+        exactDiffSourceBytes,
+      ),
+    },
+    ...(!status.ok ||
+    status.truncation.truncated ||
+    !diff.ok ||
+    diff.truncation.truncated ||
+    before.trackedPaths === undefined
       ? { note: "Some Git after-state evidence was unavailable or exceeded bounds." }
       : before.note === undefined
         ? {}
@@ -794,39 +1085,63 @@ async function captureGitAfter(
   };
 }
 
-function renderCreatedFileDiff(
-  delta: DeltaRecord & { nextContents: Uint8Array },
-): string {
-  let contents: string;
+function decodeText(contents: Uint8Array): string | undefined {
   try {
-    contents = new TextDecoder("utf-8", { fatal: true }).decode(
-      delta.nextContents,
-    );
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(contents);
+    return decoded.includes("\0") ? undefined : decoded;
   } catch {
-    return [
-      `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
-      "new file mode 100644",
-      `Binary file b/${delta.relativePath} created`,
-    ].join("\n");
+    return undefined;
   }
-  if (contents.includes("\0")) {
-    return [
-      `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
-      "new file mode 100644",
-      `Binary file b/${delta.relativePath} created`,
-    ].join("\n");
-  }
-  const lines = contents.endsWith("\n")
+}
+
+function linesForEvidence(contents: string): string[] {
+  if (contents.length === 0) return [];
+  return contents.endsWith("\n")
     ? contents.slice(0, -1).split("\n")
     : contents.split("\n");
+}
+
+function renderUntrackedFileDiff(delta: DeltaRecord): string {
+  const before =
+    delta.operation === "create"
+      ? undefined
+      : decodeText(delta.originalContents as Uint8Array);
+  const after =
+    delta.operation === "delete"
+      ? undefined
+      : decodeText(delta.nextContents as Uint8Array);
+  if (
+    (delta.operation !== "create" && before === undefined) ||
+    (delta.operation !== "delete" && after === undefined)
+  ) {
+    return [
+      `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
+      `Binary files ${
+        delta.operation === "create" ? "/dev/null" : `a/${delta.relativePath}`
+      } and ${
+        delta.operation === "delete" ? "/dev/null" : `b/${delta.relativePath}`
+      } differ`,
+    ].join("\n");
+  }
+  const beforeLines = before === undefined ? [] : linesForEvidence(before);
+  const afterLines = after === undefined ? [] : linesForEvidence(after);
   return [
     `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
-    "new file mode 100644",
-    "--- /dev/null",
-    `+++ b/${delta.relativePath}`,
-    `@@ -0,0 +1,${lines.length} @@`,
-    ...lines.map((line) => `+${line}`),
-    ...(contents.endsWith("\n") ? [] : ["\\ No newline at end of file"]),
+    ...(delta.operation === "create" ? ["new file mode 100644"] : []),
+    ...(delta.operation === "delete" ? ["deleted file mode 100644"] : []),
+    delta.operation === "create" ? "--- /dev/null" : `--- a/${delta.relativePath}`,
+    delta.operation === "delete" ? "+++ /dev/null" : `+++ b/${delta.relativePath}`,
+    `@@ -${beforeLines.length === 0 ? "0,0" : `1,${beforeLines.length}`} +${
+      afterLines.length === 0 ? "0,0" : `1,${afterLines.length}`
+    } @@`,
+    ...beforeLines.map((line) => `-${line}`),
+    ...(before !== undefined && before.length > 0 && !before.endsWith("\n")
+      ? ["\\ No newline at end of file"]
+      : []),
+    ...afterLines.map((line) => `+${line}`),
+    ...(after !== undefined && after.length > 0 && !after.endsWith("\n")
+      ? ["\\ No newline at end of file"]
+      : []),
   ].join("\n");
 }
 
@@ -896,20 +1211,24 @@ export class MutationExecutor {
     proposal: ChangeProposal;
     approval: Approval | undefined;
   }): Promise<MutationResult> {
-    validateGate(input.proposal, input.approval);
-    if (
-      this.options.proposalThreadId.length === 0 ||
-      this.options.proposalThreadId.length > 256
-    ) {
-      throw new Error("Safe Mode proposal thread id is invalid");
-    }
-    const requestedRecords = validateProposalPaths(input.proposal);
-    const rootPath = await canonicalWorkspaceRoot(this.options.workspaceRoot);
-    const claim = await acquireExecutionClaim(rootPath, input.proposal.id);
+    let claim:
+      | { handle: Awaited<ReturnType<typeof open>>; path: string }
+      | undefined;
     let mirrorRoot: string | undefined;
+    let targetMutationApplied = false;
     try {
+      validateGate(input.proposal, input.approval);
+      if (
+        this.options.proposalThreadId.length === 0 ||
+        Buffer.byteLength(this.options.proposalThreadId, "utf8") > 256
+      ) {
+        throw new Error("Safe Mode proposal thread id is invalid");
+      }
+      const requestedRecords = validateProposalPaths(input.proposal);
+      const rootPath = await canonicalWorkspaceRoot(this.options.workspaceRoot);
+      claim = await acquireExecutionClaim(rootPath, input.proposal.id);
       const targetRecords = await captureTargetRecords(rootPath, requestedRecords);
-      const gitBefore = await captureGitBefore(rootPath);
+      const gitBefore = await captureGitBefore(rootPath, targetRecords);
       mirrorRoot = await mkdtemp(
         join(await realpath(tmpdir()), "design-sharingan-mutation-"),
       );
@@ -943,6 +1262,7 @@ export class MutationExecutor {
         deltas,
         this.options.mutationDriver ?? defaultMutationDriver,
       );
+      targetMutationApplied = true;
       const git = await captureGitAfter(rootPath, gitBefore, deltas);
       return {
         proposalId: input.proposal.id,
@@ -950,12 +1270,31 @@ export class MutationExecutor {
         filesChanged: deltas.map((delta) => delta.relativePath),
         git,
       };
+    } catch (error) {
+      if (error instanceof SafeMutationExecutionError) throw error;
+      const targetDisposition =
+        error instanceof MutationTransactionError
+          ? error.targetDisposition
+          : targetMutationApplied
+            ? "RECONCILIATION_REQUIRED"
+            : "NO_TARGET_CHANGE";
+      throw new SafeMutationExecutionError(
+        targetDisposition,
+        [
+          ...input.proposal.filesToCreate,
+          ...input.proposal.filesToModify,
+          ...input.proposal.filesToDelete,
+        ],
+        error,
+      );
     } finally {
       if (mirrorRoot !== undefined) {
         await rm(mirrorRoot, { force: true, recursive: true }).catch(() => undefined);
       }
-      await claim.handle.close().catch(() => undefined);
-      await rm(claim.path, { force: true }).catch(() => undefined);
+      await claim?.handle.close().catch(() => undefined);
+      if (claim !== undefined) {
+        await rm(claim.path, { force: true }).catch(() => undefined);
+      }
     }
   }
 }

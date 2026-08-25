@@ -184,7 +184,7 @@ function boundedString(value: unknown, maximum: number): value is string {
   return (
     typeof value === "string" &&
     value.trim().length > 0 &&
-    value.length <= maximum
+    Buffer.byteLength(value, "utf8") <= maximum
   );
 }
 
@@ -222,7 +222,7 @@ function isUxImpact(value: unknown): value is UXImpact {
 
 function safeRelativePath(value: string): boolean {
   return (
-    value.length <= 512 &&
+    Buffer.byteLength(value, "utf8") <= 512 &&
     !value.includes("\\") &&
     !value.includes("\0") &&
     !value.startsWith("/") &&
@@ -318,7 +318,8 @@ export async function generateChangeProposal(
     !boundedString(input.analysisWorkingDirectory, 4_096) ||
     !boundedString(input.projectContext.name, 256) ||
     (input.threadId !== undefined && !boundedString(input.threadId, 256)) ||
-    (input.revisionRequest !== undefined && input.revisionRequest.length > 2_000)
+    (input.revisionRequest !== undefined &&
+      Buffer.byteLength(input.revisionRequest, "utf8") > 2_000)
   ) {
     throw new Error("Safe Mode proposal input is invalid");
   }

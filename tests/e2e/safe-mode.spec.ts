@@ -7,6 +7,7 @@ import {
   readdir,
   readlink,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -195,9 +196,91 @@ test("keeps the target unchanged until proposal approval, then applies one bound
   await expect(page.locator(".safe-activity")).toContainText(/read-only/i);
   await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
   await expect(page.getByRole("heading", { name: "Safe Mode change proposal" })).toBeVisible();
+
+  const sessionDirectory = join(
+    projectPath,
+    ".design-sharingan",
+    "sessions",
+  );
+  const waitingRecordFile = (
+    await Promise.all(
+      (await readdir(sessionDirectory))
+        .filter((file) => file.endsWith(".json"))
+        .map(async (file) => ({
+          file,
+          record: JSON.parse(
+            await readFile(join(sessionDirectory, file), "utf8"),
+          ) as Record<string, any>,
+        })),
+    )
+  ).find(({ record }) => record.type === "SAFE_EXECUTION");
+  expect(waitingRecordFile?.record.status).toBe("WAITING_APPROVAL");
+  const waitingRecordPath = join(
+    sessionDirectory,
+    waitingRecordFile?.file as string,
+  );
+  const waitingRecordContents = await readFile(waitingRecordPath, "utf8");
+  await page.route("**/execute/proposal/approve", async (route) => {
+    const reconciliation = structuredClone(
+      waitingRecordFile?.record,
+    ) as Record<string, any>;
+    const occurredAt = new Date().toISOString();
+    const approval = {
+      id: "approval-fast-reconciliation",
+      proposalId: reconciliation.proposal.id,
+      decision: "APPROVED",
+      scope: "CHANGE_PROPOSAL",
+      approvedBy: "local-user",
+      createdAt: occurredAt,
+    };
+    reconciliation.status = "APPROVED";
+    reconciliation.updatedAt = occurredAt;
+    reconciliation.mutationApproval = approval;
+    reconciliation.proposalHistory.at(-1).decisionApproval = approval;
+    reconciliation.executionFailure = {
+      kind: "SAFE_MUTATION_FAILURE",
+      targetDisposition: "RECONCILIATION_REQUIRED",
+      reason: "Target ownership became indeterminate before completion.",
+      affectedPaths: [
+        ...reconciliation.proposal.filesToCreate,
+        ...reconciliation.proposal.filesToModify,
+        ...reconciliation.proposal.filesToDelete,
+      ],
+      occurredAt,
+    };
+    await writeFile(
+      waitingRecordPath,
+      `${JSON.stringify(reconciliation)}\n`,
+      "utf8",
+    );
+    await route.fulfill({
+      status: 422,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: "The approved mutation could not be applied safely.",
+      }),
+    });
+  });
+  await page.getByRole("button", { name: "Approve & Execute" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Mutation reconciliation required" }),
+  ).toBeVisible();
+  await expect(page.locator(".execute-workspace")).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+  await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
+  await page.unroute("**/execute/proposal/approve");
+  await writeFile(waitingRecordPath, waitingRecordContents, "utf8");
+  await page.reload();
+
   await page.getByRole("button", { name: "Approve & Execute" }).click();
   await expect(page.locator(".safe-activity")).toContainText(
     "Approval persisted; controlled mutation is running",
+  );
+  await expect(page.locator(".execute-workspace")).toHaveAttribute(
+    "aria-busy",
+    "true",
   );
   await page.reload();
 
@@ -280,4 +363,57 @@ test("keeps the target unchanged until proposal approval, then applies one bound
       },
     ],
   });
+
+  const safeRecordPath = join(
+    projectPath,
+    ".design-sharingan",
+    "sessions",
+    `${safeRecord?.id as string}.json`,
+  );
+  const editingRecord = structuredClone(safeRecord) as Record<string, any>;
+  const retainedDiff = editingRecord.mutationEvidence.git.diffAfter as string;
+  editingRecord.mutationEvidence.git.truncation.diffAfter = {
+    truncated: true,
+    limitBytes: 128 * 1024,
+    originalBytes: 128 * 1024 + 100,
+    retainedBytes: Buffer.byteLength(retainedDiff, "utf8"),
+  };
+  await writeFile(safeRecordPath, `${JSON.stringify(editingRecord)}\n`, "utf8");
+  await page.reload();
+  await expect(page.getByText(/Git diff evidence truncated: retained/i)).toBeVisible();
+
+  const reconciliationRecord = structuredClone(editingRecord);
+  const occurredAt = new Date().toISOString();
+  reconciliationRecord.status = "APPROVED";
+  reconciliationRecord.updatedAt = occurredAt;
+  reconciliationRecord.executionFailure = {
+    kind: "SAFE_MUTATION_FAILURE",
+    targetDisposition: "RECONCILIATION_REQUIRED",
+    reason: "Target bytes no longer match the approved delta.",
+    affectedPaths: ["package.json"],
+    occurredAt,
+  };
+  delete reconciliationRecord.mutationEvidence;
+  await writeFile(
+    safeRecordPath,
+    `${JSON.stringify(reconciliationRecord)}\n`,
+    "utf8",
+  );
+  let dataRequests = 0;
+  page.on("request", (request) => {
+    if (request.url().includes("/execute/data")) dataRequests += 1;
+  });
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "Mutation reconciliation required" }),
+  ).toBeVisible();
+  await expect(page.locator(".execute-workspace")).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+  await expect(page.locator(".safe-activity")).toContainText(/reconciliation/i);
+  await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
+  const requestsAfterRecovery = dataRequests;
+  await page.waitForTimeout(240);
+  expect(dataRequests).toBe(requestsAfterRecovery);
 });

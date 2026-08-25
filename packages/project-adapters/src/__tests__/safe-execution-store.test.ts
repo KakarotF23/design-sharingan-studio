@@ -8,6 +8,7 @@ import type {
   DesignApproach,
   FeatureBrief,
   Project,
+  SafeMutationFailureEvidence,
 } from "@design-sharingan/core";
 import {
   approveAndExecuteSafeProposal,
@@ -101,6 +102,45 @@ function mutationApproval(overrides: Partial<Approval> = {}): Approval {
     scope: "CHANGE_PROPOSAL",
     approvedBy: "local-user",
     createdAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+function classifiedMutationFailure(
+  targetDisposition: SafeMutationFailureEvidence["targetDisposition"],
+  overrides: Partial<SafeMutationFailureEvidence> = {},
+): Error & { failure: SafeMutationFailureEvidence } {
+  return Object.assign(new Error("executor rejected mirror delta"), {
+    failure: {
+      kind: "SAFE_MUTATION_FAILURE" as const,
+      targetDisposition,
+      reason: "executor rejected mirror delta",
+      affectedPaths: ["src/reference-card.tsx"],
+      occurredAt: new Date().toISOString(),
+      ...overrides,
+    },
+  });
+}
+
+function gitTruncation(
+  overrides: Partial<{
+    branch: { truncated: boolean; limitBytes: number; originalBytes: number; retainedBytes: number };
+    statusBefore: { truncated: boolean; limitBytes: number; originalBytes: number; retainedBytes: number };
+    statusAfter: { truncated: boolean; limitBytes: number; originalBytes: number; retainedBytes: number };
+    diffAfter: { truncated: boolean; limitBytes: number; originalBytes: number; retainedBytes: number };
+  }> = {},
+) {
+  const empty = {
+    truncated: false,
+    limitBytes: 128 * 1024,
+    originalBytes: 0,
+    retainedBytes: 0,
+  };
+  return {
+    branch: { ...empty },
+    statusBefore: { ...empty },
+    statusAfter: { ...empty },
+    diffAfter: { ...empty },
     ...overrides,
   };
 }
@@ -392,6 +432,27 @@ describe("Safe execution proposal lifecycle", () => {
       record.mutationApproval.id = reusedId;
       record.proposalHistory[1].decisionApproval.id = reusedId;
     }],
+    ["oversized multibyte Git evidence", (record: any) => {
+      record.mutationEvidence.git.diffAfter = "界".repeat(50_000);
+      record.mutationEvidence.git.truncation.diffAfter = {
+        truncated: false,
+        limitBytes: 128 * 1024,
+        originalBytes: 150_000,
+        retainedBytes: 150_000,
+      };
+    }],
+    ["incoherent retained Git byte count", (record: any) => {
+      record.mutationEvidence.git.truncation.diffAfter.retainedBytes = 1;
+    }],
+    ["dishonest Git truncation claim", (record: any) => {
+      record.mutationEvidence.git.diffAfter = "";
+      record.mutationEvidence.git.truncation.diffAfter = {
+        truncated: true,
+        limitBytes: 128 * 1024,
+        originalBytes: 1,
+        retainedBytes: 0,
+      };
+    }],
   ] as const)("rejects tampered persisted SAFE_EXECUTION evidence: %s", async (_label, tamper) => {
     const { rootPath, project, waiting } = await awaitingProposal();
     const revision = mutationApproval({
@@ -435,6 +496,7 @@ describe("Safe execution proposal lifecycle", () => {
           statusBefore: "",
           statusAfter: "",
           diffAfter: "",
+          truncation: gitTruncation(),
           note: "Git unavailable",
         },
       }),
@@ -519,6 +581,11 @@ describe("Safe execution human decisions", () => {
             statusBefore: "",
             statusAfter: " M src/reference-card.tsx",
             diffAfter: "diff --git a/src/reference-card.tsx b/src/reference-card.tsx",
+            truncation: gitTruncation({
+              branch: { truncated: false, limitBytes: 128 * 1024, originalBytes: 7, retainedBytes: 7 },
+              statusAfter: { truncated: false, limitBytes: 128 * 1024, originalBytes: 25, retainedBytes: 25 },
+              diffAfter: { truncated: false, limitBytes: 128 * 1024, originalBytes: 60, retainedBytes: 60 },
+            }),
           },
         };
       },
@@ -536,6 +603,43 @@ describe("Safe execution human decisions", () => {
     expect((await loadSafeExecutionState(rootPath, project.id)).status).toBe(
       "EDITING",
     );
+  });
+
+  it("persists a literal truncation marker as content with truthful non-truncated byte metadata", async () => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const literalDiff = "+[Git evidence truncated]";
+    const literalBytes = Buffer.byteLength(literalDiff, "utf8");
+    const editing = await approveAndExecuteSafeProposal(
+      rootPath,
+      project.id,
+      waiting.id,
+      mutationApproval(),
+      async () => ({
+        proposalId: waiting.proposal.id,
+        threadId: waiting.proposalThreadId,
+        filesChanged: ["src/reference-card.tsx"],
+        git: {
+          available: true,
+          statusBefore: "",
+          statusAfter: "",
+          diffAfter: literalDiff,
+          truncation: gitTruncation({
+            diffAfter: {
+              truncated: false,
+              limitBytes: 128 * 1024,
+              originalBytes: literalBytes,
+              retainedBytes: literalBytes,
+            },
+          }),
+        },
+      }),
+    );
+
+    expect(editing.mutationEvidence.git.diffAfter).toBe(literalDiff);
+    expect(editing.mutationEvidence.git.truncation.diffAfter.truncated).toBe(
+      false,
+    );
+    expect(await loadSafeExecutionState(rootPath, project.id)).toEqual(editing);
   });
 
   it.each([
@@ -563,7 +667,9 @@ describe("Safe execution human decisions", () => {
     );
   });
 
-  it("rolls an ordinary execution failure back to WAITING_APPROVAL without losing the proposal", async () => {
+  it.each(["NO_TARGET_CHANGE", "FULLY_ROLLED_BACK"] as const)(
+    "restores WAITING_APPROVAL only for a proven %s execution failure",
+    async (targetDisposition) => {
     const { rootPath, project, waiting } = await awaitingProposal();
     await expect(
       approveAndExecuteSafeProposal(
@@ -572,14 +678,82 @@ describe("Safe execution human decisions", () => {
         waiting.id,
         mutationApproval(),
         async () => {
-          throw new Error("executor rejected mirror delta");
+          throw classifiedMutationFailure(targetDisposition);
         },
       ),
     ).rejects.toThrow(/executor rejected/i);
     expect(await loadSafeExecutionState(rootPath, project.id)).toEqual(waiting);
+    },
+  );
+
+  it("retains approval and blocks replay when an unclassified execution failure is indeterminate", async () => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const approval = mutationApproval();
+    await expect(
+      approveAndExecuteSafeProposal(
+        rootPath,
+        project.id,
+        waiting.id,
+        approval,
+        async () => {
+          throw new Error("unclassified executor transport failure");
+        },
+      ),
+    ).rejects.toThrow(/transport failure/i);
+
+    const persisted = await loadSafeExecutionState(rootPath, project.id);
+    expect(persisted).toMatchObject({
+      status: "APPROVED",
+      mutationApproval: approval,
+      executionFailure: {
+        kind: "SAFE_MUTATION_FAILURE",
+        targetDisposition: "RECONCILIATION_REQUIRED",
+        affectedPaths: ["src/reference-card.tsx"],
+      },
+    });
+    let replayExecutions = 0;
+    await expect(
+      approveAndExecuteSafeProposal(
+        rootPath,
+        project.id,
+        waiting.id,
+        mutationApproval({ id: "approval-replay" }),
+        async () => {
+          replayExecutions += 1;
+          throw new Error("must not replay");
+        },
+      ),
+    ).rejects.toThrow(/not waiting/i);
+    expect(replayExecutions).toBe(0);
   });
 
-  it("keeps APPROVED when a completed executor returns invalid evidence so mutation cannot be replayed", async () => {
+  it("persists bounded classified reconciliation evidence without discarding approval", async () => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const approval = mutationApproval();
+    const failure = classifiedMutationFailure("RECONCILIATION_REQUIRED", {
+      reason: "Target bytes no longer match the approved delta.",
+    });
+    await expect(
+      approveAndExecuteSafeProposal(
+        rootPath,
+        project.id,
+        waiting.id,
+        approval,
+        async () => {
+          throw failure;
+        },
+      ),
+    ).rejects.toBe(failure);
+
+    expect(await loadSafeExecutionState(rootPath, project.id)).toMatchObject({
+      status: "APPROVED",
+      updatedAt: failure.failure.occurredAt,
+      mutationApproval: approval,
+      executionFailure: failure.failure,
+    });
+  });
+
+  it("marks a completed executor with invalid evidence for reconciliation so mutation cannot be replayed", async () => {
     const { rootPath, project, waiting } = await awaitingProposal();
     const approval = mutationApproval();
     await expect(
@@ -597,6 +771,7 @@ describe("Safe execution human decisions", () => {
             statusBefore: "",
             statusAfter: "",
             diffAfter: "",
+            truncation: gitTruncation(),
             note: "Git unavailable",
           },
         }),
@@ -607,7 +782,22 @@ describe("Safe execution human decisions", () => {
       status: "APPROVED",
       mutationApproval: approval,
       proposal: { id: waiting.proposal.id },
+      executionFailure: {
+        targetDisposition: "RECONCILIATION_REQUIRED",
+        affectedPaths: ["src/reference-card.tsx"],
+      },
     });
+    await expect(
+      approveAndExecuteSafeProposal(
+        rootPath,
+        project.id,
+        waiting.id,
+        mutationApproval({ id: "approval-invalid-evidence-replay" }),
+        async () => {
+          throw new Error("must not replay invalid evidence");
+        },
+      ),
+    ).rejects.toThrow(/not waiting/i);
   });
 
   it("serializes double approval so one callback mutates and a loser cannot clobber its EDITING winner", async () => {
@@ -629,6 +819,7 @@ describe("Safe execution human decisions", () => {
           statusBefore: "",
           statusAfter: "",
           diffAfter: "",
+          truncation: gitTruncation(),
           note: "Git unavailable",
         },
       };

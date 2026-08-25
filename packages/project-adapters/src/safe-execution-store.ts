@@ -7,6 +7,7 @@ import type {
   DesignApproach,
   DesignSession,
   FeatureBrief,
+  SafeMutationFailureEvidence,
   SafeExecutionStatus,
   UXImpact,
 } from "@design-sharingan/core";
@@ -74,6 +75,7 @@ export interface SafeExecutionApprovedSession extends SafeExecutionBase {
   proposalThreadId: string;
   mutationApproval: Approval;
   proposalHistory: SafeProposalHistoryEntry[];
+  executionFailure?: SafeMutationFailureEvidence;
 }
 
 export interface SafeGitEvidence {
@@ -82,7 +84,20 @@ export interface SafeGitEvidence {
   statusBefore: string;
   statusAfter: string;
   diffAfter: string;
+  truncation: {
+    branch: SafeGitEvidenceTruncation;
+    statusBefore: SafeGitEvidenceTruncation;
+    statusAfter: SafeGitEvidenceTruncation;
+    diffAfter: SafeGitEvidenceTruncation;
+  };
   note?: string;
+}
+
+export interface SafeGitEvidenceTruncation {
+  truncated: boolean;
+  limitBytes: number;
+  originalBytes: number;
+  retainedBytes: number;
 }
 
 export interface SafeMutationResult {
@@ -144,7 +159,7 @@ function nonEmpty(value: unknown, maximum = 4_000): value is string {
   return (
     typeof value === "string" &&
     value.trim().length > 0 &&
-    value.length <= maximum
+    Buffer.byteLength(value, "utf8") <= maximum
   );
 }
 
@@ -164,7 +179,7 @@ function safeIdentifier(value: unknown): value is string {
 function safeRelativePath(path: string): boolean {
   return (
     path.length > 0 &&
-    path.length <= 512 &&
+    Buffer.byteLength(path, "utf8") <= 512 &&
     !/[\u0000-\u001f\u007f]/.test(path) &&
     !path.includes("\\") &&
     !path.startsWith("/") &&
@@ -338,7 +353,8 @@ function isApproval(value: unknown): value is Approval {
     nonEmpty(value.scope, 128) &&
     nonEmpty(value.approvedBy, 256) &&
     (value.comment === undefined ||
-      (typeof value.comment === "string" && value.comment.length <= 2_000)) &&
+      (typeof value.comment === "string" &&
+        Buffer.byteLength(value.comment, "utf8") <= 2_000)) &&
     isIsoTimestamp(value.createdAt)
   );
 }
@@ -483,6 +499,53 @@ function isSafeBase(value: unknown): value is SafeExecutionBase {
   );
 }
 
+function isGitEvidenceTruncation(
+  value: unknown,
+  evidence: string,
+): value is SafeGitEvidenceTruncation {
+  if (
+    !exactKeys(value, [
+      "truncated",
+      "limitBytes",
+      "originalBytes",
+      "retainedBytes",
+    ]) ||
+    typeof value.truncated !== "boolean" ||
+    value.limitBytes !== 128 * 1024 ||
+    typeof value.originalBytes !== "number" ||
+    !Number.isSafeInteger(value.originalBytes) ||
+    value.originalBytes < 0 ||
+    typeof value.retainedBytes !== "number" ||
+    !Number.isSafeInteger(value.retainedBytes) ||
+    value.retainedBytes < 0 ||
+    value.retainedBytes !== Buffer.byteLength(evidence, "utf8") ||
+    value.retainedBytes > value.limitBytes
+  ) {
+    return false;
+  }
+  return value.truncated
+    ? value.originalBytes > value.limitBytes
+    : value.originalBytes === value.retainedBytes;
+}
+
+function isGitEvidenceTruncationSet(
+  value: unknown,
+  evidence: {
+    branch?: string;
+    statusBefore: string;
+    statusAfter: string;
+    diffAfter: string;
+  },
+): value is SafeGitEvidence["truncation"] {
+  return (
+    exactKeys(value, ["branch", "statusBefore", "statusAfter", "diffAfter"]) &&
+    isGitEvidenceTruncation(value.branch, evidence.branch ?? "") &&
+    isGitEvidenceTruncation(value.statusBefore, evidence.statusBefore) &&
+    isGitEvidenceTruncation(value.statusAfter, evidence.statusAfter) &&
+    isGitEvidenceTruncation(value.diffAfter, evidence.diffAfter)
+  );
+}
+
 function isSafeGitEvidence(value: unknown): value is SafeGitEvidence {
   const keys =
     value !== null &&
@@ -494,6 +557,7 @@ function isSafeGitEvidence(value: unknown): value is SafeGitEvidence {
           "statusBefore",
           "statusAfter",
           "diffAfter",
+          "truncation",
           ...(Object.hasOwn(value, "note") ? ["note"] : []),
         ]
       : [];
@@ -502,12 +566,42 @@ function isSafeGitEvidence(value: unknown): value is SafeGitEvidence {
     typeof value.available === "boolean" &&
     (value.branch === undefined || nonEmpty(value.branch, 512)) &&
     typeof value.statusBefore === "string" &&
-    value.statusBefore.length <= 128 * 1024 &&
+    Buffer.byteLength(value.statusBefore, "utf8") <= 128 * 1024 &&
     typeof value.statusAfter === "string" &&
-    value.statusAfter.length <= 128 * 1024 &&
+    Buffer.byteLength(value.statusAfter, "utf8") <= 128 * 1024 &&
     typeof value.diffAfter === "string" &&
-    value.diffAfter.length <= 128 * 1024 &&
+    Buffer.byteLength(value.diffAfter, "utf8") <= 128 * 1024 &&
+    isGitEvidenceTruncationSet(value.truncation, {
+      ...(typeof value.branch === "string" ? { branch: value.branch } : {}),
+      statusBefore: value.statusBefore,
+      statusAfter: value.statusAfter,
+      diffAfter: value.diffAfter,
+    }) &&
     (value.note === undefined || nonEmpty(value.note, 2_000))
+  );
+}
+
+function isSafeMutationFailureEvidence(
+  value: unknown,
+): value is SafeMutationFailureEvidence {
+  return (
+    exactKeys(value, [
+      "kind",
+      "targetDisposition",
+      "reason",
+      "affectedPaths",
+      "occurredAt",
+    ]) &&
+    value.kind === "SAFE_MUTATION_FAILURE" &&
+    [
+      "NO_TARGET_CHANGE",
+      "FULLY_ROLLED_BACK",
+      "RECONCILIATION_REQUIRED",
+    ].includes(value.targetDisposition as string) &&
+    nonEmpty(value.reason, 2_000) &&
+    stringArray(value.affectedPaths, 128, 512) &&
+    value.affectedPaths.length > 0 &&
+    isIsoTimestamp(value.occurredAt)
   );
 }
 
@@ -641,6 +735,8 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
         session.updatedAt === session.decisionApproval.createdAt
       );
     case "APPROVED":
+      {
+        const hasExecutionFailure = Object.hasOwn(value, "executionFailure");
       return (
         exactKeys(value, [
           ...baseKeys,
@@ -648,6 +744,7 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
           "proposalThreadId",
           "mutationApproval",
           "proposalHistory",
+          ...(hasExecutionFailure ? ["executionFailure"] : []),
         ]) &&
         isChangeProposal(session.proposal) &&
         session.proposal.sessionId === session.id &&
@@ -667,8 +764,22 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
           session.proposalThreadId,
           session.mutationApproval,
         ) &&
-        session.updatedAt === session.mutationApproval.createdAt
+        (hasExecutionFailure
+          ? isSafeMutationFailureEvidence(session.executionFailure) &&
+            session.executionFailure.targetDisposition ===
+              "RECONCILIATION_REQUIRED" &&
+            stableJson(session.executionFailure.affectedPaths) ===
+              stableJson([
+                ...session.proposal.filesToCreate,
+                ...session.proposal.filesToModify,
+                ...session.proposal.filesToDelete,
+              ]) &&
+            session.updatedAt === session.executionFailure.occurredAt &&
+            Date.parse(session.executionFailure.occurredAt) >=
+              Date.parse(session.mutationApproval.createdAt)
+          : session.updatedAt === session.mutationApproval.createdAt)
       );
+      }
     case "EDITING":
       return (
         exactKeys(value, [
@@ -1006,6 +1117,69 @@ function assertMutationResult(
   }
 }
 
+function classifiedExecutionFailure(
+  error: unknown,
+  approved: SafeExecutionApprovedSession,
+): SafeMutationFailureEvidence | undefined {
+  const failure =
+    error !== null && typeof error === "object" && "failure" in error
+      ? error.failure
+      : undefined;
+  const expectedPaths = [
+    ...approved.proposal.filesToCreate,
+    ...approved.proposal.filesToModify,
+    ...approved.proposal.filesToDelete,
+  ];
+  return isSafeMutationFailureEvidence(failure) &&
+    stableJson(failure.affectedPaths) === stableJson(expectedPaths) &&
+    Date.parse(failure.occurredAt) >= Date.parse(approved.mutationApproval.createdAt)
+    ? failure
+    : undefined;
+}
+
+function reconciliationFailure(
+  error: unknown,
+  approved: SafeExecutionApprovedSession,
+): SafeMutationFailureEvidence {
+  const classified = classifiedExecutionFailure(error, approved);
+  if (classified?.targetDisposition === "RECONCILIATION_REQUIRED") {
+    return classified;
+  }
+  return {
+    kind: "SAFE_MUTATION_FAILURE",
+    targetDisposition: "RECONCILIATION_REQUIRED",
+    reason:
+      "Execution ended without proof that the approved target delta was absent or fully rolled back.",
+    affectedPaths: [
+      ...approved.proposal.filesToCreate,
+      ...approved.proposal.filesToModify,
+      ...approved.proposal.filesToDelete,
+    ],
+    occurredAt: new Date().toISOString(),
+  };
+}
+
+async function persistReconciliationCheckpoint(
+  rootPath: string,
+  approved: SafeExecutionApprovedSession,
+  error: unknown,
+): Promise<void> {
+  const executionFailure = reconciliationFailure(error, approved);
+  const reconciliation: SafeExecutionApprovedSession = {
+    ...approved,
+    updatedAt: executionFailure.occurredAt,
+    executionFailure,
+  };
+  await saveSafeExecutionSession(rootPath, reconciliation).catch(
+    (checkpointError) => {
+      throw new Error(
+        "Safe Mode execution and reconciliation checkpoint both failed",
+        { cause: { executionError: error, checkpointError } },
+      );
+    },
+  );
+}
+
 export async function approveAndExecuteSafeProposal(
   rootPath: string,
   projectId: string,
@@ -1047,31 +1221,44 @@ export async function approveAndExecuteSafeProposal(
     try {
       result = await execute(approved);
     } catch (error) {
-      await saveSafeExecutionSession(rootPath, waiting).catch((rollbackError) => {
-        throw new Error("Safe Mode execution and rollback both failed", {
-          cause: { executionError: error, rollbackError },
+      const classified = classifiedExecutionFailure(error, approved);
+      if (
+        classified?.targetDisposition === "NO_TARGET_CHANGE" ||
+        classified?.targetDisposition === "FULLY_ROLLED_BACK"
+      ) {
+        await saveSafeExecutionSession(rootPath, waiting).catch((rollbackError) => {
+          throw new Error("Safe Mode execution and checkpoint rollback both failed", {
+            cause: { executionError: error, rollbackError },
+          });
         });
-      });
+        throw error;
+      }
+      await persistReconciliationCheckpoint(rootPath, approved, error);
       throw error;
     }
     // A resolved executor may already have changed the active target. From
     // this point onward, preserve the durable approval on any evidence or
     // persistence failure so a retry cannot replay that mutation.
-    assertMutationResult(approved, result);
-    const completedAt = new Date().toISOString();
-    const editing: SafeExecutionEditingSession = {
-      ...transitionedBase(approved, "EDITING"),
-      updatedAt: completedAt,
-      proposal: approved.proposal,
-      proposalThreadId: approved.proposalThreadId,
-      mutationApproval: approved.mutationApproval,
-      mutationEvidence: { ...result, completedAt },
-      proposalHistory: approved.proposalHistory,
-    };
-    if (!isSafeExecutionSession(editing)) {
-      throw new Error("Safe Mode editing checkpoint is invalid");
+    try {
+      assertMutationResult(approved, result);
+      const completedAt = new Date().toISOString();
+      const editing: SafeExecutionEditingSession = {
+        ...transitionedBase(approved, "EDITING"),
+        updatedAt: completedAt,
+        proposal: approved.proposal,
+        proposalThreadId: approved.proposalThreadId,
+        mutationApproval: approved.mutationApproval,
+        mutationEvidence: { ...result, completedAt },
+        proposalHistory: approved.proposalHistory,
+      };
+      if (!isSafeExecutionSession(editing)) {
+        throw new Error("Safe Mode editing checkpoint is invalid");
+      }
+      await saveSafeExecutionSession(rootPath, editing);
+      return editing;
+    } catch (error) {
+      await persistReconciliationCheckpoint(rootPath, approved, error);
+      throw error;
     }
-    await saveSafeExecutionSession(rootPath, editing);
-    return editing;
   });
 }
