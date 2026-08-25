@@ -291,6 +291,43 @@ describe("CodexAgent", () => {
     expect((error as Error).message).not.toContain(JSON.stringify(secret));
   });
 
+  // Production break caught: V8 composes `name: message` when materializing a stack, which can recreate a configured secret even when both fields are independently safe.
+  it("does not re-form configured secrets in surfaced error stacks", async () => {
+    const secret = "CodexError: failed";
+    const providerError = new Error("failed", { cause: secret });
+    providerError.name = "CodexError";
+    const provider: CodexProvider = {
+      startThread() {
+        return {
+          id: "thread-composed-error",
+          async run() {
+            throw providerError;
+          },
+        };
+      },
+      resumeThread() {
+        throw new Error("unexpected resume");
+      },
+    };
+    const agent = new CodexAgent({
+      provider,
+      environment: { PRIVATE_TOKEN: secret },
+      secretEnvironmentKeys: ["PRIVATE_TOKEN"],
+    });
+
+    const caught = await agent
+      .run({ workingDirectory: "/project", prompt: "Analyze safely" })
+      .catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(Error);
+    const surfaced = caught as Error;
+    expect(surfaced.name).not.toContain(secret);
+    expect(surfaced.message).not.toContain(secret);
+    expect(surfaced.stack).not.toContain(secret);
+    expect(surfaced.cause).toBeUndefined();
+    expect(String(surfaced.cause)).not.toContain(secret);
+  });
+
   // Production break caught: secrets in event property names are just as surfacing/loggable as secrets in their nested values.
   it("sanitizes nested event keys and values", async () => {
     const keySecret = "private-key-name";

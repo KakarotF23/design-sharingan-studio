@@ -155,6 +155,10 @@ export class CodexAgent {
       if (error instanceof Error) {
         surfaced.name = this.redact(error.name);
       }
+      const composedStack = surfaced.stack;
+      if (composedStack !== undefined) {
+        surfaced.stack = this.redact(composedStack);
+      }
       throw surfaced;
     }
   }
