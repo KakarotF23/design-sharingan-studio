@@ -37,6 +37,8 @@ export async function POST(
     Object.keys(body).length > 3 ||
     !safeId(body.sessionId) ||
     (body.decision !== "REVISION_REQUESTED" && body.decision !== "REJECTED") ||
+    (body.decision === "REVISION_REQUESTED" &&
+      (typeof body.comment !== "string" || body.comment.trim().length === 0)) ||
     (body.comment !== undefined &&
       (typeof body.comment !== "string" || body.comment.length > 2_000))
   ) {

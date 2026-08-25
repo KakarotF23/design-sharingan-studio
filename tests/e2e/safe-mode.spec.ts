@@ -125,6 +125,10 @@ test("keeps the target unchanged until proposal approval, then applies one bound
     }, { intervals: [10], timeout: 5_000 })
     .toBe("PROPOSING");
 
+  await page.reload();
+  await expect(page.locator(".safe-activity")).toContainText(/read-only/i);
+  await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
+
   await expect(page.getByRole("heading", { name: "Safe Mode change proposal" })).toBeVisible();
   await expect(page.getByText("package.json", { exact: true })).toBeVisible();
   await expect(page.getByText("LOW RISK", { exact: true })).toBeVisible();
@@ -140,14 +144,62 @@ test("keeps the target unchanged until proposal approval, then applies one bound
   ).toEqual({ clientWidth: 390, scrollWidth: 390 });
   expect(await snapshotTargetTree(projectPath)).toEqual(targetTreeBefore);
 
+  let releaseRejectedRequest: (() => void) | undefined;
+  const holdRejectedRequest = new Promise<void>((resolve) => {
+    releaseRejectedRequest = resolve;
+  });
+  await page.route("**/execute/proposal/decision", async (route) => {
+    await holdRejectedRequest;
+    await route.abort("failed");
+  });
+  await page.getByRole("button", { name: "Reject" }).click();
+  await expect(page.locator(".safe-activity")).toContainText(
+    "Recording proposal rejection",
+  );
+  await expect(page.locator(".approval-actions .primary-button")).toHaveText(
+    "Approve & Execute",
+  );
+  await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
+  releaseRejectedRequest?.();
+  await expect(page.getByRole("alert")).toBeVisible();
+  await page.unroute("**/execute/proposal/decision");
+
+  const revisionInstruction =
+    "Keep the fixture change metadata-only and preserve every existing script.";
+  await expect(page.getByRole("button", { name: "Request Revision" })).toBeDisabled();
+  await page.getByLabel("Revision instruction").fill(revisionInstruction);
+  let releaseRevisionRequest: (() => void) | undefined;
+  const holdRevisionRequest = new Promise<void>((resolve) => {
+    releaseRevisionRequest = resolve;
+  });
+  await page.route("**/execute/proposal/decision", async (route) => {
+    await holdRevisionRequest;
+    const response = await route.fetch();
+    await route.fulfill({ response });
+  });
   await page.getByRole("button", { name: "Request Revision" }).click();
+  await expect(page.locator(".safe-activity")).toContainText(
+    "Recording your revision instruction",
+  );
+  await expect(page.locator(".approval-actions .primary-button")).toHaveText(
+    "Approve & Execute",
+  );
+  await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
+  releaseRevisionRequest?.();
   await expect(
     page.getByRole("heading", { name: "Revision requested" }),
   ).toBeVisible();
+  await page.unroute("**/execute/proposal/decision");
   expect(await snapshotTargetTree(projectPath)).toEqual(targetTreeBefore);
   await page.getByRole("button", { name: "Prepare revised proposal" }).click();
+  await expect(page.locator(".safe-activity")).toContainText(/read-only/i);
+  await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
   await expect(page.getByRole("heading", { name: "Safe Mode change proposal" })).toBeVisible();
   await page.getByRole("button", { name: "Approve & Execute" }).click();
+  await expect(page.locator(".safe-activity")).toContainText(
+    "Approval persisted; controlled mutation is running",
+  );
+  await page.reload();
 
   await expect(
     page.getByRole("heading", { name: "Approved mutation applied" }),
@@ -205,5 +257,27 @@ test("keeps the target unchanged until proposal approval, then applies one bound
       filesChanged: ["package.json"],
       git: { available: true, branch: "safe-mode-fixture" },
     },
+    proposalHistory: [
+      {
+        proposal: { status: "PROPOSED" },
+        proposalThreadId: "fake-safe-mode-proposal-thread",
+        decisionApproval: {
+          decision: "REVISION_REQUESTED",
+          comment: revisionInstruction,
+          scope: "CHANGE_PROPOSAL",
+        },
+      },
+      {
+        proposal: {
+          id: (safeRecord?.proposal as { id?: string } | undefined)?.id,
+          status: "PROPOSED",
+        },
+        proposalThreadId: "fake-safe-mode-proposal-thread",
+        decisionApproval: {
+          decision: "APPROVED",
+          scope: "CHANGE_PROPOSAL",
+        },
+      },
+    ],
   });
 });

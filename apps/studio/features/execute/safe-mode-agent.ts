@@ -51,6 +51,7 @@ export function createSafeMutationAgent(): MutationAgent {
   if (process.env.DESIGN_SHARINGAN_FAKE_AGENT === "1") {
     return {
       async run<TStructured>(input: CodexAgentRunInput) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 250));
         const packagePath = join(input.workingDirectory, "package.json");
         const project = JSON.parse(await readFile(packagePath, "utf8")) as Record<
           string,

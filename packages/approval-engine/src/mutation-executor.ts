@@ -13,7 +13,7 @@ import {
   rm,
   rmdir,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import {
   basename,
   dirname,
@@ -33,6 +33,7 @@ const MAX_DELTA_BYTES = 8 * 1024 * 1024;
 const MAX_MIRROR_ENTRIES = 512;
 const MAX_GIT_OUTPUT_BYTES = 128 * 1024;
 const GIT_TIMEOUT_MS = 5_000;
+const GIT_TRUNCATION_MARKER = "\n[Git evidence truncated]";
 
 export interface MutationAgent {
   run<TStructured = unknown>(input: CodexAgentRunInput): Promise<{
@@ -72,6 +73,10 @@ interface TargetRecord {
 
 interface DeltaRecord extends TargetRecord {
   nextContents?: Uint8Array;
+}
+
+interface AppliedDeltaRecord extends DeltaRecord {
+  appliedContents?: Uint8Array;
 }
 
 interface GitBefore {
@@ -129,7 +134,7 @@ function safeRelativePath(path: string): boolean {
   return (
     path.length > 0 &&
     path.length <= 512 &&
-    !path.includes("\0") &&
+    !/[\u0000-\u001f\u007f]/.test(path) &&
     !path.includes("\\") &&
     !path.startsWith("/") &&
     !isAbsolute(path) &&
@@ -150,8 +155,10 @@ function protectedPath(path: string): boolean {
     first === ".git" ||
     first === ".design-sharingan" ||
     first === "design-governance" ||
+    segments.includes(".direnv") ||
     fileName === ".env" ||
     fileName.startsWith(".env.") ||
+    fileName.startsWith(".envrc") ||
     fileName.endsWith(".env")
   );
 }
@@ -278,6 +285,9 @@ async function securelyReadRegularFile(path: string): Promise<{
   mode: number;
 }> {
   const pathEntry = await lstat(path);
+  if (pathEntry.nlink !== 1) {
+    throw new Error("Approved target has an unsafe hard link count");
+  }
   if (
     pathEntry.isSymbolicLink() ||
     !pathEntry.isFile() ||
@@ -290,6 +300,7 @@ async function securelyReadRegularFile(path: string): Promise<{
     const handleEntry = await handle.stat();
     if (
       !handleEntry.isFile() ||
+      handleEntry.nlink !== 1 ||
       handleEntry.dev !== pathEntry.dev ||
       handleEntry.ino !== pathEntry.ino ||
       handleEntry.size !== pathEntry.size ||
@@ -349,7 +360,9 @@ async function seedMirror(mirrorRoot: string, records: TargetRecord[]): Promise<
     if (record.operation !== "create") {
       await defaultMutationDriver.write(
         mirrorPath,
-        record.originalContents as Uint8Array,
+        record.operation === "delete"
+          ? new Uint8Array()
+          : (record.originalContents as Uint8Array),
         record.originalMode as number,
       );
     }
@@ -479,7 +492,7 @@ async function applyTransaction(
   deltas: DeltaRecord[],
   driver: MutationDriver,
 ): Promise<void> {
-  const applied: DeltaRecord[] = [];
+  const applied: AppliedDeltaRecord[] = [];
   const createdDirectories: string[] = [];
   try {
     for (const delta of deltas) {
@@ -501,13 +514,14 @@ async function applyTransaction(
       } else {
         await driver.remove(delta.absolutePath);
       }
-      applied.push(delta);
+      applied.push(await captureAppliedTarget(delta));
     }
     await validateAppliedDelta(deltas);
   } catch (commitError) {
     let rollbackError: unknown;
     for (const delta of [...applied].reverse()) {
       try {
+        await assertRollbackStillOwnsTarget(delta);
         if (delta.operation === "create") {
           await driver.remove(delta.absolutePath);
         } else {
@@ -535,6 +549,39 @@ async function applyTransaction(
       });
     }
     throw commitError;
+  }
+}
+
+async function captureAppliedTarget(
+  delta: DeltaRecord,
+): Promise<AppliedDeltaRecord> {
+  if (delta.operation === "delete") return delta;
+  const current = await securelyReadRegularFile(delta.absolutePath);
+  return { ...delta, appliedContents: current.contents };
+}
+
+async function assertRollbackStillOwnsTarget(
+  delta: AppliedDeltaRecord,
+): Promise<void> {
+  const entry = await lstatIfPresent(delta.absolutePath);
+  if (delta.operation === "delete") {
+    if (entry !== undefined) {
+      throw new Error(
+        `Rollback refused to overwrite a recreated target: ${delta.relativePath}`,
+      );
+    }
+    return;
+  }
+  if (entry === undefined || entry.isSymbolicLink() || !entry.isFile()) {
+    throw new Error(
+      `Rollback refused because the applied target changed: ${delta.relativePath}`,
+    );
+  }
+  const current = await securelyReadRegularFile(delta.absolutePath);
+  if (!equalBytes(current.contents, delta.appliedContents as Uint8Array)) {
+    throw new Error(
+      `Rollback refused because another writer changed: ${delta.relativePath}`,
+    );
   }
 }
 
@@ -567,6 +614,56 @@ function boundedAppend(
   return currentBytes + chunk.byteLength;
 }
 
+function boundedGitEvidence(value: string): string {
+  const wasTruncated = value.includes(GIT_TRUNCATION_MARKER);
+  const normalized = value.split(GIT_TRUNCATION_MARKER).join("");
+  const encoded = Buffer.from(normalized, "utf8");
+  if (encoded.byteLength <= MAX_GIT_OUTPUT_BYTES && !wasTruncated) {
+    return normalized;
+  }
+  const marker = Buffer.from(GIT_TRUNCATION_MARKER, "utf8");
+  const prefix = encoded
+    .subarray(0, MAX_GIT_OUTPUT_BYTES - marker.byteLength)
+    .toString("utf8")
+    .replace(/\uFFFD$/, "");
+  return `${prefix}${GIT_TRUNCATION_MARKER}`;
+}
+
+function redactSensitiveGitOutput(value: string): string {
+  const secrets = Object.entries(process.env)
+    .filter(
+      ([key, secret]) =>
+        /(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|CREDENTIAL|PRIVATE_KEY|AUTH)/i.test(
+          key,
+        ) &&
+        typeof secret === "string" &&
+        secret.length >= 8,
+    )
+    .map(([, secret]) => secret as string)
+    .sort((left, right) => right.length - left.length);
+  let redacted = value;
+  for (const secret of secrets) {
+    redacted = redacted.split(secret).join("[REDACTED]");
+  }
+  return redacted.replace(
+    /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,})\b/g,
+    "[REDACTED]",
+  );
+}
+
+const hardenedGitConfig = [
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.untrackedCache=false",
+  "-c",
+  `core.hooksPath=${devNull}`,
+  "-c",
+  "diff.external=",
+  "-c",
+  "pager.diff=false",
+] as const;
+
 async function runGit(
   cwd: string,
   args: readonly string[],
@@ -575,14 +672,21 @@ async function runGit(
     const chunks: Buffer[] = [];
     let outputBytes = 0;
     let finished = false;
-    const environment = Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([key]) => !key.toUpperCase().startsWith("GIT_"),
-      ),
-    ) as NodeJS.ProcessEnv;
-    const child = spawn("git", [...args], {
+    const gitEnvironment: NodeJS.ProcessEnv = {
+      NODE_ENV: process.env.NODE_ENV,
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: devNull,
+      GIT_ATTR_NOSYSTEM: "1",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_PAGER: "cat",
+      GIT_TERMINAL_PROMPT: "0",
+      LC_ALL: "C",
+      LANG: "C",
+    };
+    const child = spawn("git", [...hardenedGitConfig, ...args], {
       cwd,
-      env: environment,
+      env: gitEnvironment,
       shell: false,
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -598,8 +702,12 @@ async function runGit(
       clearTimeout(timer);
       const raw = Buffer.concat(chunks).toString("utf8");
       resolvePromise({
-        ok: ok && outputBytes <= MAX_GIT_OUTPUT_BYTES,
-        output: raw.trimEnd(),
+        ok,
+        output: boundedGitEvidence(
+          outputBytes > MAX_GIT_OUTPUT_BYTES
+            ? `${raw}${GIT_TRUNCATION_MARKER}`
+            : raw.trimEnd(),
+        ),
       });
     };
     child.once("error", () => finish(false));
@@ -634,6 +742,7 @@ async function captureGitBefore(rootPath: string): Promise<GitBefore> {
 async function captureGitAfter(
   rootPath: string,
   before: GitBefore,
+  deltas: readonly DeltaRecord[],
 ): Promise<GitMutationEvidence> {
   if (!before.available) {
     return {
@@ -646,20 +755,79 @@ async function captureGitAfter(
   }
   const [status, diff] = await Promise.all([
     runGit(rootPath, ["status", "--porcelain=v1", "--untracked-files=all", "--", "."]),
-    runGit(rootPath, ["diff", "--no-ext-diff", "--", "."]),
+    runGit(rootPath, [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--",
+      ...deltas.map((delta) => delta.relativePath),
+    ]),
   ]);
+  const createdEvidence = deltas
+    .filter(
+      (delta): delta is DeltaRecord & { nextContents: Uint8Array } =>
+        delta.operation === "create" && delta.nextContents !== undefined,
+    )
+    .map(renderCreatedFileDiff)
+    .join("\n");
+  const exactDiff = [diff.ok ? diff.output : "", createdEvidence]
+    .filter((part) => part !== "")
+    .join("\n");
   return {
     available: true,
-    branch: before.branch,
-    statusBefore: before.statusBefore,
-    statusAfter: status.ok ? status.output : "Git status after was unavailable.",
-    diffAfter: diff.ok ? diff.output : "Git diff after was unavailable.",
+    branch:
+      before.branch === undefined
+        ? undefined
+        : redactSensitiveGitOutput(before.branch),
+    statusBefore: redactSensitiveGitOutput(before.statusBefore),
+    statusAfter: status.ok
+      ? redactSensitiveGitOutput(status.output)
+      : "Git status after was unavailable.",
+    diffAfter: diff.ok
+      ? boundedGitEvidence(redactSensitiveGitOutput(exactDiff))
+      : "Git diff after was unavailable.",
     ...(!status.ok || !diff.ok
       ? { note: "Some Git after-state evidence was unavailable or exceeded bounds." }
       : before.note === undefined
         ? {}
         : { note: before.note }),
   };
+}
+
+function renderCreatedFileDiff(
+  delta: DeltaRecord & { nextContents: Uint8Array },
+): string {
+  let contents: string;
+  try {
+    contents = new TextDecoder("utf-8", { fatal: true }).decode(
+      delta.nextContents,
+    );
+  } catch {
+    return [
+      `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
+      "new file mode 100644",
+      `Binary file b/${delta.relativePath} created`,
+    ].join("\n");
+  }
+  if (contents.includes("\0")) {
+    return [
+      `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
+      "new file mode 100644",
+      `Binary file b/${delta.relativePath} created`,
+    ].join("\n");
+  }
+  const lines = contents.endsWith("\n")
+    ? contents.slice(0, -1).split("\n")
+    : contents.split("\n");
+  return [
+    `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
+    "new file mode 100644",
+    "--- /dev/null",
+    `+++ b/${delta.relativePath}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((line) => `+${line}`),
+    ...(contents.endsWith("\n") ? [] : ["\\ No newline at end of file"]),
+  ].join("\n");
 }
 
 async function acquireExecutionClaim(
@@ -685,7 +853,7 @@ async function acquireExecutionClaim(
     throw new Error("Safe Mode execution claim directory is not private");
   }
   const digest = createHash("sha256")
-    .update(`${rootPath}\0${proposalId}`)
+    .update(rootPath)
     .digest("hex");
   const path = join(claimRoot, `${digest}.claim`);
   try {
@@ -775,7 +943,7 @@ export class MutationExecutor {
         deltas,
         this.options.mutationDriver ?? defaultMutationDriver,
       );
-      const git = await captureGitAfter(rootPath, gitBefore);
+      const git = await captureGitAfter(rootPath, gitBefore, deltas);
       return {
         proposalId: input.proposal.id,
         threadId: result.threadId,

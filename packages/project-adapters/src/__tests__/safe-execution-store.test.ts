@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -100,7 +100,7 @@ function mutationApproval(overrides: Partial<Approval> = {}): Approval {
     decision: "APPROVED",
     scope: "CHANGE_PROPOSAL",
     approvedBy: "local-user",
-    createdAt: "2026-08-25T02:00:00.000Z",
+    createdAt: new Date().toISOString(),
     ...overrides,
   };
 }
@@ -277,6 +277,198 @@ describe("Safe execution proposal lifecycle", () => {
       proposal: { id: "proposal-safe-1" },
     });
     expect(runs).toBe(1);
+  });
+
+  it("retains an append-only revision decision and prior proposal through reproposal", async () => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const instruction =
+      "Keep the marker text visible, reduce its contrast, and do not change the route.";
+    const revisionApproval = mutationApproval({
+      id: "approval-revision-1",
+      decision: "REVISION_REQUESTED",
+      comment: instruction,
+    });
+    const revising = await decideSafeExecutionProposal(
+      rootPath,
+      project.id,
+      waiting.id,
+      revisionApproval,
+    );
+    const revised = await prepareSafeExecutionProposal(
+      rootPath,
+      project.id,
+      waiting.id,
+      async (source) => {
+        expect(source.revisionRequest).toBe(instruction);
+        return {
+          proposal: proposal({
+            id: "proposal-safe-2",
+            summary: "Add a quieter review marker.",
+          }),
+          threadId: waiting.proposalThreadId,
+        };
+      },
+    );
+
+    expect(
+      (revising as unknown as { proposalHistory: unknown[] }).proposalHistory,
+    ).toEqual([
+      {
+        proposal: waiting.proposal,
+        proposalThreadId: waiting.proposalThreadId,
+        proposedAt: waiting.updatedAt,
+        decisionApproval: revisionApproval,
+      },
+    ]);
+    expect(
+      (revised as unknown as { proposalHistory: unknown[] }).proposalHistory,
+    ).toEqual([
+      {
+        proposal: waiting.proposal,
+        proposalThreadId: waiting.proposalThreadId,
+        proposedAt: waiting.updatedAt,
+        decisionApproval: revisionApproval,
+      },
+      {
+        proposal: revised.proposal,
+        proposalThreadId: waiting.proposalThreadId,
+        proposedAt: revised.updatedAt,
+      },
+    ]);
+    expect(await loadSafeExecutionState(rootPath, project.id)).toEqual(revised);
+  });
+
+  it.each([
+    ["unsafe escape", (record: any) => {
+      record.proposal.filesToModify = ["../outside.ts"];
+    }],
+    ["protected environment path", (record: any) => {
+      record.proposal.filesToModify = ["config/.env.local"];
+    }],
+    ["duplicate proposal paths", (record: any) => {
+      record.proposal.filesToModify = [
+        "src/reference-card.tsx",
+        "src/reference-card.tsx",
+      ];
+    }],
+    ["overlapping proposal operations", (record: any) => {
+      record.proposal.filesToDelete = ["src/reference-card.tsx"];
+    }],
+    ["unapproved mutation evidence path", (record: any) => {
+      record.mutationEvidence.filesChanged = ["src/unapproved.ts"];
+    }],
+    ["reordered mutation evidence paths", (record: any) => {
+      record.mutationEvidence.filesChanged = [
+        "src/reference-card.tsx",
+        "src/created.ts",
+      ];
+    }],
+    ["incoherent 1900 creation time", (record: any) => {
+      record.createdAt = "1900-01-01T00:00:00.000Z";
+    }],
+    ["non-ISO update time", (record: any) => {
+      record.updatedAt = "August 25, 2026";
+    }],
+    ["completion/update mismatch", (record: any) => {
+      record.mutationEvidence.completedAt = "2026-08-25T23:59:59.999Z";
+    }],
+    ["approval after completion", (record: any) => {
+      record.mutationApproval.createdAt = "2126-08-25T00:00:00.000Z";
+    }],
+    ["prior proposal thread mismatch", (record: any) => {
+      record.proposalHistory[0].proposalThreadId = "thread-other";
+    }],
+    ["prior proposal before session creation", (record: any) => {
+      record.proposalHistory[0].proposedAt = "1900-01-01T00:00:00.000Z";
+    }],
+    ["blank prior revision instruction", (record: any) => {
+      record.proposalHistory[0].decisionApproval.comment = "   ";
+    }],
+    ["prior decision proposal mismatch", (record: any) => {
+      record.proposalHistory[0].decisionApproval.proposalId = "proposal-other";
+    }],
+    ["reused decision approval id", (record: any) => {
+      const reusedId = record.proposalHistory[0].decisionApproval.id;
+      record.mutationApproval.id = reusedId;
+      record.proposalHistory[1].decisionApproval.id = reusedId;
+    }],
+  ] as const)("rejects tampered persisted SAFE_EXECUTION evidence: %s", async (_label, tamper) => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const revision = mutationApproval({
+      id: "approval-revision-1",
+      decision: "REVISION_REQUESTED",
+      comment: "Make the marker quieter without changing its route.",
+    });
+    await decideSafeExecutionProposal(
+      rootPath,
+      project.id,
+      waiting.id,
+      revision,
+    );
+    const revised = await prepareSafeExecutionProposal(
+      rootPath,
+      project.id,
+      waiting.id,
+      async () => ({
+        proposal: proposal({
+          id: "proposal-safe-2",
+          filesToCreate: ["src/created.ts"],
+        }),
+        threadId: waiting.proposalThreadId,
+      }),
+    );
+    const approval = mutationApproval({
+      id: "approval-mutation-2",
+      proposalId: revised.proposal.id,
+    });
+    const editing = await approveAndExecuteSafeProposal(
+      rootPath,
+      project.id,
+      revised.id,
+      approval,
+      async () => ({
+        proposalId: revised.proposal.id,
+        threadId: revised.proposalThreadId,
+        filesChanged: ["src/created.ts", "src/reference-card.tsx"],
+        git: {
+          available: false,
+          statusBefore: "",
+          statusAfter: "",
+          diffAfter: "",
+          note: "Git unavailable",
+        },
+      }),
+    );
+    const record = structuredClone(editing) as any;
+    tamper(record);
+    const sessionPath = join(
+      rootPath,
+      ".design-sharingan",
+      "sessions",
+      `${editing.id}.json`,
+    );
+    await writeFile(sessionPath, `${JSON.stringify(record)}\n`, "utf8");
+
+    await expect(
+      loadSafeExecutionState(rootPath, project.id),
+    ).rejects.toThrow(/invalid|evidence|match|ambiguous/i);
+  });
+
+  it("rejects an unsafe generated proposal at the durable writer boundary", async () => {
+    const { rootPath, project, execute } = await initializedExecution();
+
+    await expect(
+      prepareSafeExecutionProposal(
+        rootPath,
+        project.id,
+        execute.id,
+        async () => ({
+          proposal: proposal({ filesToModify: ["../outside.ts"] }),
+          threadId: "thread-proposal-1",
+        }),
+      ),
+    ).rejects.toThrow(/proposal evidence|invalid/i);
+    expect(await loadSafeExecutionState(rootPath, project.id)).toEqual(execute);
   });
 });
 

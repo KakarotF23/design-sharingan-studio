@@ -1242,6 +1242,39 @@ textarea:focus-visible {
   border-bottom: 1px solid var(--steel);
 }
 
+.revision-instruction {
+  display: grid;
+  flex: 1 1 100%;
+  gap: 0.45rem;
+  color: #bcc4cf;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.revision-instruction textarea {
+  width: 100%;
+  min-height: 5.6rem;
+  resize: vertical;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid #3d4652;
+  border-radius: 0.35rem;
+  color: var(--bone);
+  background: #0c1015;
+  font: inherit;
+  font-size: 0.84rem;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.revision-instruction textarea:focus-visible {
+  outline: 2px solid #b04a50;
+  outline-offset: 2px;
+}
+
 .approval-actions__reject {
   color: #e2a0a3 !important;
   border-color: #6d3539 !important;

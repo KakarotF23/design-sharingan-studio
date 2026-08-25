@@ -1,5 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import {
+  chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
@@ -380,6 +382,7 @@ describe("controlled mirror mutation", () => {
   it.each([
     ["workspace escape", { filesToModify: ["../outside.ts"] }],
     ["absolute path", { filesToModify: ["/tmp/outside.ts"] }],
+    ["control character path", { filesToModify: ["src/file\nname.ts"] }],
     ["duplicate path", { filesToModify: ["src/file.ts", "src/file.ts"] }],
     [
       "overlapping operation sets",
@@ -417,6 +420,8 @@ describe("controlled mirror mutation", () => {
     "design-governance/DESIGN-GENOME.md",
     ".env",
     "config/.env.local",
+    ".envrc",
+    ".direnv/environment",
   ])("always rejects protected mutation path %s", async (relativePath) => {
     const workspaceRoot = await temporaryWorkspace();
     let runs = 0;
@@ -470,6 +475,75 @@ describe("controlled mirror mutation", () => {
     await expect(readFile(join(outsideRoot, "escape.ts"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it.each(["modify", "delete"] as const)(
+    "rejects an approved %s target hard-linked to an external inode before the agent can read it",
+    async (operation) => {
+      const workspaceRoot = await temporaryWorkspace();
+      const outsideRoot = await temporaryWorkspace();
+      const sensitivePath = join(outsideRoot, "sensitive.txt");
+      await writeFile(sensitivePath, "external-sensitive-bytes\n", "utf8");
+      await mkdir(join(workspaceRoot, "src"), { recursive: true });
+      await link(sensitivePath, join(workspaceRoot, "src/linked.ts"));
+      let agentRuns = 0;
+      const executor = new MutationExecutor({
+        workspaceRoot,
+        proposalThreadId: "thread-proposal-1",
+        agent: {
+          async run<TStructured>() {
+            agentRuns += 1;
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      });
+
+      await expect(
+        executor.apply({
+          proposal: proposalFixture({
+            filesToModify: operation === "modify" ? ["src/linked.ts"] : [],
+            filesToDelete: operation === "delete" ? ["src/linked.ts"] : [],
+          }),
+          approval: approvalFixture(),
+        }),
+      ).rejects.toThrow(/hard link|link count/i);
+      expect(agentRuns).toBe(0);
+      expect(await readFile(sensitivePath, "utf8")).toBe(
+        "external-sensitive-bytes\n",
+      );
+    },
+  );
+
+  it("seeds an empty delete placeholder instead of disclosing the target contents to the mutation mirror", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(
+      workspaceRoot,
+      "src/obsolete.ts",
+      "sensitive obsolete implementation\n",
+    );
+    let mirroredBeforeDelete: string | undefined;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          const mirrorPath = join(input.workingDirectory, "src/obsolete.ts");
+          mirroredBeforeDelete = await readFile(mirrorPath, "utf8");
+          await rm(mirrorPath);
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    await executor.apply({
+      proposal: proposalFixture({
+        filesToModify: [],
+        filesToDelete: ["src/obsolete.ts"],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(mirroredBeforeDelete).toBe("");
   });
 
   it.each([
@@ -652,6 +726,134 @@ describe("controlled mirror mutation", () => {
     );
   });
 
+  it("serializes different proposals for the same target before either can capture or mutate", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/shared.ts", "original\n");
+    await writeWorkspaceFile(workspaceRoot, "src/later.ts", "original later\n");
+    let firstApplied: (() => void) | undefined;
+    const reachedFirstApply = new Promise<void>((resolve) => {
+      firstApplied = resolve;
+    });
+    let releaseFailure: (() => void) | undefined;
+    const mayFail = new Promise<void>((resolve) => {
+      releaseFailure = resolve;
+    });
+    let writes = 0;
+    const first = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-a",
+      mutationDriver: {
+        async write(path, contents) {
+          writes += 1;
+          if (writes === 1) {
+            await writeFile(path, contents);
+            firstApplied?.();
+            return;
+          }
+          if (writes === 2) {
+            await mayFail;
+            throw new Error("injected later write failure");
+          }
+          await writeFile(path, contents);
+        },
+        async remove(path) {
+          await rm(path);
+        },
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/shared.ts", "proposal A\n");
+          await writeWorkspaceFile(input.workingDirectory, "src/later.ts", "proposal A later\n");
+          return { threadId: "thread-proposal-a", structured: null as TStructured };
+        },
+      },
+    });
+    const firstRun = first.apply({
+      proposal: proposalFixture({
+        id: "proposal-a",
+        filesToModify: ["src/shared.ts", "src/later.ts"],
+      }),
+      approval: approvalFixture({ proposalId: "proposal-a" }),
+    });
+    await reachedFirstApply;
+
+    const second = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-b",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/shared.ts", "proposal B winner\n");
+          return { threadId: "thread-proposal-b", structured: null as TStructured };
+        },
+      },
+    });
+    const secondOutcome = await second
+      .apply({
+        proposal: proposalFixture({
+          id: "proposal-b",
+          filesToModify: ["src/shared.ts"],
+        }),
+        approval: approvalFixture({ proposalId: "proposal-b" }),
+      })
+      .then(
+        () => "resolved" as const,
+        (error: unknown) =>
+          error instanceof Error && /already being executed/i.test(error.message)
+            ? ("serialized" as const)
+            : ("unexpected rejection" as const),
+      );
+    releaseFailure?.();
+    await expect(firstRun).rejects.toThrow(/injected later write failure/i);
+
+    expect(secondOutcome).toBe("serialized");
+    expect(await readFile(join(workspaceRoot, "src/shared.ts"), "utf8")).toBe(
+      "original\n",
+    );
+  });
+
+  it("does not roll back over bytes changed by another writer after this transaction applied", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/shared.ts", "original\n");
+    await writeWorkspaceFile(workspaceRoot, "src/later.ts", "original later\n");
+    let writes = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      mutationDriver: {
+        async write(path, contents) {
+          writes += 1;
+          if (writes === 2) {
+            await writeFile(join(workspaceRoot, "src/shared.ts"), "external winner\n");
+            throw new Error("injected later write failure");
+          }
+          await writeFile(path, contents);
+        },
+        async remove(path) {
+          await rm(path);
+        },
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/shared.ts", "proposal bytes\n");
+          await writeWorkspaceFile(input.workingDirectory, "src/later.ts", "later bytes\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({
+          filesToModify: ["src/shared.ts", "src/later.ts"],
+        }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/rollback both failed/i);
+    expect(await readFile(join(workspaceRoot, "src/shared.ts"), "utf8")).toBe(
+      "external winner\n",
+    );
+  });
+
   it("fails closed when the mutation turn does not continue the exact proposal thread", async () => {
     const workspaceRoot = await temporaryWorkspace();
     await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
@@ -719,5 +921,209 @@ describe("controlled mirror mutation", () => {
     expect(result.git.statusAfter).toContain("src/file.ts");
     expect(result.git.diffAfter).toContain("+after");
     expect(headAfter).toBe(headBefore);
+  });
+
+  it("limits Git diff evidence to approved paths and includes approved created-file content", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    await writeWorkspaceFile(workspaceRoot, "private/unrelated.txt", "clean\n");
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    await execFile("git", ["add", "."], { cwd: workspaceRoot });
+    await execFile(
+      "git",
+      [
+        "-c",
+        "user.name=Design Sharingan Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+      ],
+      { cwd: workspaceRoot },
+    );
+    await writeWorkspaceFile(
+      workspaceRoot,
+      "private/unrelated.txt",
+      "UNRELATED-TOP-SECRET\n",
+    );
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/created.ts",
+            "export const approvedCreate = true;\n",
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToCreate: ["src/created.ts"],
+        filesToModify: [],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(result.git.statusAfter).toContain("private/unrelated.txt");
+    expect(result.git.diffAfter).toContain("src/created.ts");
+    expect(result.git.diffAfter).toContain("+export const approvedCreate = true;");
+    expect(result.git.diffAfter).not.toContain("private/unrelated.txt");
+    expect(result.git.diffAfter).not.toContain("UNRELATED-TOP-SECRET");
+  });
+
+  it("bounds oversized created-file Git evidence with an explicit truncation marker", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/created.ts",
+            `${"bounded evidence line\n".repeat(12_000)}`,
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToCreate: ["src/created.ts"],
+        filesToModify: [],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(Buffer.byteLength(result.git.diffAfter, "utf8")).toBeLessThanOrEqual(
+      128 * 1024,
+    );
+    expect(result.git.diffAfter).toContain("[Git evidence truncated]");
+    expect(result.git.diffAfter.match(/\[Git evidence truncated\]/g)).toHaveLength(
+      1,
+    );
+  });
+
+  it("does not execute repository-configured fsmonitor, textconv, or external diff helpers", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    const outsideRoot = await temporaryWorkspace();
+    const sentinelPath = join(outsideRoot, "helper-invoked.txt");
+    const helperPath = join(outsideRoot, "malicious-helper.mjs");
+    await writeFile(
+      helperPath,
+      `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(sentinelPath)}, "invoked\\n");\n`,
+      "utf8",
+    );
+    await chmod(helperPath, 0o700);
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    await writeWorkspaceFile(workspaceRoot, ".gitattributes", "src/file.ts diff=unsafe\n");
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    await execFile("git", ["add", "."], { cwd: workspaceRoot });
+    await execFile(
+      "git",
+      [
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "user.name=Design Sharingan Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+      ],
+      { cwd: workspaceRoot },
+    );
+    await execFile("git", ["config", "core.fsmonitor", helperPath], {
+      cwd: workspaceRoot,
+    });
+    await execFile("git", ["config", "diff.unsafe.textconv", helperPath], {
+      cwd: workspaceRoot,
+    });
+    await execFile("git", ["config", "diff.external", helperPath], {
+      cwd: workspaceRoot,
+    });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    });
+
+    await expect(readFile(sentinelPath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("redacts sensitive environment values from an approved Git diff", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    const secret = "task-nine-sensitive-token-value";
+    const previous = process.env.DESIGN_SHARINGAN_TEST_SECRET;
+    process.env.DESIGN_SHARINGAN_TEST_SECRET = secret;
+    try {
+      await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+      await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+      await execFile("git", ["add", "."], { cwd: workspaceRoot });
+      await execFile(
+        "git",
+        [
+          "-c",
+          "user.name=Design Sharingan Test",
+          "-c",
+          "user.email=test@example.invalid",
+          "commit",
+          "-m",
+          "fixture",
+        ],
+        { cwd: workspaceRoot },
+      );
+      const executor = new MutationExecutor({
+        workspaceRoot,
+        proposalThreadId: "thread-proposal-1",
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            await writeWorkspaceFile(
+              input.workingDirectory,
+              "src/file.ts",
+              `export const token = ${JSON.stringify(secret)};\n`,
+            );
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      });
+
+      const result = await executor.apply({
+        proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+        approval: approvalFixture(),
+      });
+
+      expect(result.git.diffAfter).not.toContain(secret);
+      expect(result.git.diffAfter).toContain("[REDACTED]");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.DESIGN_SHARINGAN_TEST_SECRET;
+      } else {
+        process.env.DESIGN_SHARINGAN_TEST_SECRET = previous;
+      }
+    }
   });
 });

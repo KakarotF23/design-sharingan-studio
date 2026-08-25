@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { open, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, posix } from "node:path";
 import type {
   Approval,
   ChangeProposal,
@@ -34,6 +34,13 @@ interface SafeExecutionBase extends DesignSession {
   designApproach: DesignApproach;
 }
 
+export interface SafeProposalHistoryEntry {
+  proposal: ChangeProposal;
+  proposalThreadId: string;
+  proposedAt: string;
+  decisionApproval?: Approval;
+}
+
 export interface SafeExecutionPreparingSession extends SafeExecutionBase {
   status: "PREPARING";
 }
@@ -43,12 +50,14 @@ export interface SafeExecutionProposingSession extends SafeExecutionBase {
   revisionRequest?: string;
   previousProposal?: ChangeProposal;
   previousProposalThreadId?: string;
+  proposalHistory?: SafeProposalHistoryEntry[];
 }
 
 export interface SafeExecutionWaitingSession extends SafeExecutionBase {
   status: "WAITING_APPROVAL";
   proposal: ChangeProposal;
   proposalThreadId: string;
+  proposalHistory: SafeProposalHistoryEntry[];
 }
 
 export interface SafeExecutionDecisionSession extends SafeExecutionBase {
@@ -56,6 +65,7 @@ export interface SafeExecutionDecisionSession extends SafeExecutionBase {
   proposal: ChangeProposal;
   proposalThreadId: string;
   decisionApproval: Approval;
+  proposalHistory: SafeProposalHistoryEntry[];
 }
 
 export interface SafeExecutionApprovedSession extends SafeExecutionBase {
@@ -63,6 +73,7 @@ export interface SafeExecutionApprovedSession extends SafeExecutionBase {
   proposal: ChangeProposal;
   proposalThreadId: string;
   mutationApproval: Approval;
+  proposalHistory: SafeProposalHistoryEntry[];
 }
 
 export interface SafeGitEvidence {
@@ -91,6 +102,7 @@ export interface SafeExecutionEditingSession extends SafeExecutionBase {
   proposalThreadId: string;
   mutationApproval: Approval;
   mutationEvidence: SafeMutationEvidence;
+  proposalHistory: SafeProposalHistoryEntry[];
 }
 
 export type SafeExecutionSession =
@@ -133,6 +145,66 @@ function nonEmpty(value: unknown, maximum = 4_000): value is string {
     typeof value === "string" &&
     value.trim().length > 0 &&
     value.length <= maximum
+  );
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || value.length !== 24) return false;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value;
+}
+
+function safeIdentifier(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value)
+  );
+}
+
+function safeRelativePath(path: string): boolean {
+  return (
+    path.length > 0 &&
+    path.length <= 512 &&
+    !/[\u0000-\u001f\u007f]/.test(path) &&
+    !path.includes("\\") &&
+    !path.startsWith("/") &&
+    !isAbsolute(path) &&
+    path !== "." &&
+    path !== ".." &&
+    !path
+      .split("/")
+      .some((segment) => segment === "" || segment === "." || segment === "..") &&
+    posix.normalize(path) === path
+  );
+}
+
+function protectedPath(path: string): boolean {
+  const segments = path.toLowerCase().split("/");
+  const first = segments[0];
+  const fileName = segments.at(-1) ?? "";
+  return (
+    first === ".git" ||
+    first === ".design-sharingan" ||
+    first === "design-governance" ||
+    segments.includes(".direnv") ||
+    fileName === ".env" ||
+    fileName.startsWith(".env.") ||
+    fileName.startsWith(".envrc") ||
+    fileName.endsWith(".env")
+  );
+}
+
+function validProposalPaths(value: ChangeProposal): boolean {
+  const paths = [
+    ...value.filesToCreate,
+    ...value.filesToModify,
+    ...value.filesToDelete,
+  ];
+  return (
+    paths.length > 0 &&
+    paths.length <= 128 &&
+    new Set(paths).size === paths.length &&
+    paths.every((path) => safeRelativePath(path) && !protectedPath(path))
   );
 }
 
@@ -258,8 +330,8 @@ function isApproval(value: unknown): value is Approval {
       : required;
   return (
     exactKeys(value, keys) &&
-    nonEmpty(value.id, 128) &&
-    nonEmpty(value.proposalId, 128) &&
+    safeIdentifier(value.id) &&
+    safeIdentifier(value.proposalId) &&
     ["APPROVED", "REJECTED", "REVISION_REQUESTED"].includes(
       value.decision as string,
     ) &&
@@ -267,7 +339,7 @@ function isApproval(value: unknown): value is Approval {
     nonEmpty(value.approvedBy, 256) &&
     (value.comment === undefined ||
       (typeof value.comment === "string" && value.comment.length <= 2_000)) &&
-    nonEmpty(value.createdAt, 64)
+    isIsoTimestamp(value.createdAt)
   );
 }
 
@@ -290,8 +362,8 @@ function isChangeProposal(value: unknown): value is ChangeProposal {
       "policyViolations",
       "status",
     ]) &&
-    nonEmpty(value.id, 128) &&
-    nonEmpty(value.sessionId, 128) &&
+    safeIdentifier(value.id) &&
+    safeIdentifier(value.sessionId) &&
     nonEmpty(value.summary) &&
     nonEmpty(value.reason) &&
     stringArray(value.filesToCreate, 64, 512) &&
@@ -308,21 +380,85 @@ function isChangeProposal(value: unknown): value is ChangeProposal {
     value.requiresHumanApproval === true &&
     stringArray(value.policyViolations, 32, 1_000) &&
     value.status === "PROPOSED" &&
-    [
-      ...value.filesToCreate,
-      ...value.filesToModify,
-      ...value.filesToDelete,
-    ].length > 0 &&
-    new Set([
-      ...value.filesToCreate,
-      ...value.filesToModify,
-      ...value.filesToDelete,
-    ]).size ===
-      [
-        ...value.filesToCreate,
-        ...value.filesToModify,
-        ...value.filesToDelete,
-      ].length
+    validProposalPaths(value as unknown as ChangeProposal)
+  );
+}
+
+function isProposalHistory(
+  value: unknown,
+  sessionId: string,
+  sessionCreatedAt: string,
+): value is SafeProposalHistoryEntry[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 16) {
+    return false;
+  }
+  const ids = new Set<string>();
+  const approvalIds = new Set<string>();
+  let threadId: string | undefined;
+  let priorDecisionAt: string | undefined;
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
+    const keys =
+      entry !== null &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      Object.hasOwn(entry, "decisionApproval")
+        ? ["proposal", "proposalThreadId", "proposedAt", "decisionApproval"]
+        : ["proposal", "proposalThreadId", "proposedAt"];
+    if (
+      !exactKeys(entry, keys) ||
+      !isChangeProposal(entry.proposal) ||
+      entry.proposal.sessionId !== sessionId ||
+      ids.has(entry.proposal.id) ||
+      !nonEmpty(entry.proposalThreadId, 256) ||
+      !isIsoTimestamp(entry.proposedAt) ||
+      Date.parse(entry.proposedAt) < Date.parse(sessionCreatedAt) ||
+      (threadId !== undefined && entry.proposalThreadId !== threadId) ||
+      (priorDecisionAt !== undefined &&
+        Date.parse(entry.proposedAt) < Date.parse(priorDecisionAt))
+    ) {
+      return false;
+    }
+    ids.add(entry.proposal.id);
+    threadId ??= entry.proposalThreadId;
+    if (entry.decisionApproval === undefined) {
+      if (index !== value.length - 1) return false;
+      priorDecisionAt = undefined;
+      continue;
+    }
+    if (
+      !isApproval(entry.decisionApproval) ||
+      approvalIds.has(entry.decisionApproval.id) ||
+      entry.decisionApproval.scope !== "CHANGE_PROPOSAL" ||
+      entry.decisionApproval.proposalId !== entry.proposal.id ||
+      (entry.decisionApproval.decision === "REVISION_REQUESTED" &&
+        !nonEmpty(entry.decisionApproval.comment, 2_000)) ||
+      Date.parse(entry.decisionApproval.createdAt) < Date.parse(entry.proposedAt) ||
+      (index < value.length - 1 &&
+        entry.decisionApproval.decision !== "REVISION_REQUESTED")
+    ) {
+      return false;
+    }
+    approvalIds.add(entry.decisionApproval.id);
+    priorDecisionAt = entry.decisionApproval.createdAt;
+  }
+  return true;
+}
+
+function historyMatchesCurrent(
+  history: SafeProposalHistoryEntry[],
+  proposal: ChangeProposal,
+  proposalThreadId: string,
+  decision?: Approval,
+): boolean {
+  const current = history.at(-1);
+  return (
+    current !== undefined &&
+    stableJson(current.proposal) === stableJson(proposal) &&
+    current.proposalThreadId === proposalThreadId &&
+    (decision === undefined
+      ? current.decisionApproval === undefined
+      : stableJson(current.decisionApproval) === stableJson(decision))
   );
 }
 
@@ -332,15 +468,16 @@ function isSafeBase(value: unknown): value is SafeExecutionBase {
   }
   const session = value as Partial<SafeExecutionBase>;
   return (
-    nonEmpty(session.id, 128) &&
-    nonEmpty(session.projectId, 128) &&
+    safeIdentifier(session.id) &&
+    safeIdentifier(session.projectId) &&
     session.type === "SAFE_EXECUTION" &&
     nonEmpty(session.status, 64) &&
-    nonEmpty(session.createdAt, 64) &&
-    nonEmpty(session.updatedAt, 64) &&
-    nonEmpty(session.sourceSessionId, 128) &&
-    nonEmpty(session.approvedApproachId, 128) &&
-    nonEmpty(session.approvalId, 128) &&
+    isIsoTimestamp(session.createdAt) &&
+    isIsoTimestamp(session.updatedAt) &&
+    Date.parse(session.updatedAt) >= Date.parse(session.createdAt) &&
+    safeIdentifier(session.sourceSessionId) &&
+    safeIdentifier(session.approvedApproachId) &&
+    safeIdentifier(session.approvalId) &&
     isFeatureBrief(session.featureBrief) &&
     isDesignApproach(session.designApproach)
   );
@@ -388,7 +525,7 @@ function isMutationEvidence(value: unknown): value is SafeMutationEvidence {
     stringArray(value.filesChanged, 128, 512) &&
     value.filesChanged.length > 0 &&
     isSafeGitEvidence(value.git) &&
-    nonEmpty(value.completedAt, 64)
+    isIsoTimestamp(value.completedAt)
   );
 }
 
@@ -408,6 +545,7 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
         ...(Object.hasOwn(value, "previousProposalThreadId")
           ? ["previousProposalThreadId"]
           : []),
+        ...(Object.hasOwn(value, "proposalHistory") ? ["proposalHistory"] : []),
       ];
       return (
         exactKeys(value, keys) &&
@@ -419,18 +557,54 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
           nonEmpty(session.previousProposalThreadId, 256)) &&
         ((session.revisionRequest === undefined &&
           session.previousProposal === undefined &&
-          session.previousProposalThreadId === undefined) ||
+          session.previousProposalThreadId === undefined &&
+          session.proposalHistory === undefined) ||
           (session.revisionRequest !== undefined &&
             session.previousProposal !== undefined &&
-            session.previousProposalThreadId !== undefined))
+            session.previousProposalThreadId !== undefined &&
+            isProposalHistory(
+              session.proposalHistory,
+              session.id as string,
+              session.createdAt as string,
+            ) &&
+            historyMatchesCurrent(
+              session.proposalHistory,
+              session.previousProposal,
+              session.previousProposalThreadId,
+              session.proposalHistory.at(-1)?.decisionApproval,
+            ) &&
+            session.proposalHistory.at(-1)?.decisionApproval?.decision ===
+              "REVISION_REQUESTED" &&
+            session.proposalHistory.at(-1)?.decisionApproval?.comment ===
+              session.revisionRequest &&
+            Date.parse(session.updatedAt as string) >=
+              Date.parse(
+                session.proposalHistory.at(-1)?.decisionApproval?.createdAt as string,
+              )))
       );
     }
     case "WAITING_APPROVAL":
       return (
-        exactKeys(value, [...baseKeys, "proposal", "proposalThreadId"]) &&
+        exactKeys(value, [
+          ...baseKeys,
+          "proposal",
+          "proposalThreadId",
+          "proposalHistory",
+        ]) &&
         isChangeProposal(session.proposal) &&
         session.proposal.sessionId === session.id &&
-        nonEmpty(session.proposalThreadId, 256)
+        nonEmpty(session.proposalThreadId, 256) &&
+        isProposalHistory(
+          session.proposalHistory,
+          session.id,
+          session.createdAt as string,
+        ) &&
+        historyMatchesCurrent(
+          session.proposalHistory,
+          session.proposal,
+          session.proposalThreadId,
+        ) &&
+        session.proposalHistory.at(-1)?.proposedAt === session.updatedAt
       );
     case "REVISING":
     case "REJECTED":
@@ -440,6 +614,7 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
           "proposal",
           "proposalThreadId",
           "decisionApproval",
+          "proposalHistory",
         ]) &&
         isChangeProposal(session.proposal) &&
         session.proposal.sessionId === session.id &&
@@ -449,7 +624,21 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
         session.decisionApproval.scope === "CHANGE_PROPOSAL" &&
         (session.status === "REVISING"
           ? session.decisionApproval.decision === "REVISION_REQUESTED"
-          : session.decisionApproval.decision === "REJECTED")
+          : session.decisionApproval.decision === "REJECTED") &&
+        (session.status !== "REVISING" ||
+          nonEmpty(session.decisionApproval.comment, 2_000)) &&
+        isProposalHistory(
+          session.proposalHistory,
+          session.id,
+          session.createdAt as string,
+        ) &&
+        historyMatchesCurrent(
+          session.proposalHistory,
+          session.proposal,
+          session.proposalThreadId,
+          session.decisionApproval,
+        ) &&
+        session.updatedAt === session.decisionApproval.createdAt
       );
     case "APPROVED":
       return (
@@ -458,6 +647,7 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
           "proposal",
           "proposalThreadId",
           "mutationApproval",
+          "proposalHistory",
         ]) &&
         isChangeProposal(session.proposal) &&
         session.proposal.sessionId === session.id &&
@@ -465,7 +655,19 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
         isApproval(session.mutationApproval) &&
         session.mutationApproval.decision === "APPROVED" &&
         session.mutationApproval.scope === "CHANGE_PROPOSAL" &&
-        session.mutationApproval.proposalId === session.proposal.id
+        session.mutationApproval.proposalId === session.proposal.id &&
+        isProposalHistory(
+          session.proposalHistory,
+          session.id,
+          session.createdAt as string,
+        ) &&
+        historyMatchesCurrent(
+          session.proposalHistory,
+          session.proposal,
+          session.proposalThreadId,
+          session.mutationApproval,
+        ) &&
+        session.updatedAt === session.mutationApproval.createdAt
       );
     case "EDITING":
       return (
@@ -475,6 +677,7 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
           "proposalThreadId",
           "mutationApproval",
           "mutationEvidence",
+          "proposalHistory",
         ]) &&
         isChangeProposal(session.proposal) &&
         session.proposal.sessionId === session.id &&
@@ -485,11 +688,41 @@ function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
         session.mutationApproval.proposalId === session.proposal.id &&
         isMutationEvidence(session.mutationEvidence) &&
         session.mutationEvidence.proposalId === session.proposal.id &&
-        session.mutationEvidence.threadId === session.proposalThreadId
+        session.mutationEvidence.threadId === session.proposalThreadId &&
+        stableJson(session.mutationEvidence.filesChanged) ===
+          stableJson([
+            ...session.proposal.filesToCreate,
+            ...session.proposal.filesToModify,
+            ...session.proposal.filesToDelete,
+          ]) &&
+        session.mutationEvidence.completedAt === session.updatedAt &&
+        Date.parse(session.mutationApproval.createdAt) <=
+          Date.parse(session.mutationEvidence.completedAt) &&
+        isProposalHistory(
+          session.proposalHistory,
+          session.id,
+          session.createdAt as string,
+        ) &&
+        historyMatchesCurrent(
+          session.proposalHistory,
+          session.proposal,
+          session.proposalThreadId,
+          session.mutationApproval,
+        )
       );
     default:
       return false;
   }
+}
+
+async function saveSafeExecutionSession(
+  rootPath: string,
+  session: SafeExecutionSession,
+): Promise<void> {
+  if (!isSafeExecutionSession(session)) {
+    throw new Error("Safe execution writer rejected invalid session evidence");
+  }
+  await saveSession(rootPath, session);
 }
 
 function assertSourceRelation(
@@ -512,6 +745,11 @@ function assertSourceRelation(
     approval.decision !== "APPROVED" ||
     approval.scope !== "DESIGN_APPROACH" ||
     approval.proposalId !== selected.id ||
+    !isIsoTimestamp(source.createdAt) ||
+    !isIsoTimestamp(source.updatedAt) ||
+    !isIsoTimestamp(approval.createdAt) ||
+    source.updatedAt !== approval.createdAt ||
+    Date.parse(source.updatedAt) < Date.parse(source.createdAt) ||
     session.createdAt !== approval.createdAt ||
     stableJson(session.featureBrief) !== stableJson(source.featureBrief) ||
     stableJson(session.designApproach) !== stableJson(selected)
@@ -630,18 +868,21 @@ export async function prepareSafeExecutionProposal(
       let proposing: SafeExecutionProposingSession;
       if (starting.status === "IDLE") {
         const preparing = transitionedBase(starting, "PREPARING");
-        await saveSession(rootPath, preparing);
+        await saveSafeExecutionSession(rootPath, preparing);
         proposing = transitionedBase(preparing, "PROPOSING");
       } else {
+        if (starting.proposalHistory.length >= 16) {
+          throw new Error("Safe Mode proposal history is at its bounded limit");
+        }
         proposing = {
           ...transitionedBase(starting, "PROPOSING"),
-          revisionRequest:
-            starting.decisionApproval.comment?.trim() || "Revision requested.",
+          revisionRequest: starting.decisionApproval.comment as string,
           previousProposal: starting.proposal,
           previousProposalThreadId: starting.proposalThreadId,
+          proposalHistory: starting.proposalHistory,
         };
       }
-      await saveSession(rootPath, proposing);
+      await saveSafeExecutionSession(rootPath, proposing);
       const generated = await runProposal(proposing);
       if (
         !isChangeProposal(generated.proposal) ||
@@ -652,18 +893,27 @@ export async function prepareSafeExecutionProposal(
       ) {
         throw new Error("Generated Safe Mode proposal evidence is invalid");
       }
+      const waitingBase = transitionedBase(proposing, "WAITING_APPROVAL");
       const waiting: SafeExecutionWaitingSession = {
-        ...transitionedBase(proposing, "WAITING_APPROVAL"),
+        ...waitingBase,
         proposal: generated.proposal,
         proposalThreadId: generated.threadId,
+        proposalHistory: [
+          ...(proposing.proposalHistory ?? []),
+          {
+            proposal: generated.proposal,
+            proposalThreadId: generated.threadId,
+            proposedAt: waitingBase.updatedAt,
+          },
+        ],
       };
       if (!isSafeExecutionSession(waiting)) {
         throw new Error("Safe Mode proposal checkpoint is invalid");
       }
-      await saveSession(rootPath, waiting);
+      await saveSafeExecutionSession(rootPath, waiting);
       return waiting;
     } catch (error) {
-      await saveSession(rootPath, starting).catch((rollbackError) => {
+      await saveSafeExecutionSession(rootPath, starting).catch((rollbackError) => {
         throw new Error("Safe Mode proposal and rollback both failed", {
           cause: { proposalError: error, rollbackError },
         });
@@ -707,17 +957,29 @@ export async function decideSafeExecutionProposal(
     if (status === undefined || !canTransitionSafeExecution(state.status, status)) {
       throw new Error("Safe Mode non-execution decision is invalid");
     }
+    if (
+      status === "REVISING" &&
+      !nonEmpty(approval.comment?.trim(), 2_000)
+    ) {
+      throw new Error("Safe Mode revision requires a bounded instruction");
+    }
+    const proposalHistory = state.proposalHistory.map((entry, index) =>
+      index === state.proposalHistory.length - 1
+        ? { ...entry, decisionApproval: approval }
+        : entry,
+    );
     const decided: SafeExecutionDecisionSession = {
       ...transitionedBase(state, status),
       updatedAt: approval.createdAt,
       proposal: state.proposal,
       proposalThreadId: state.proposalThreadId,
       decisionApproval: approval,
+      proposalHistory,
     };
     if (!isSafeExecutionSession(decided)) {
       throw new Error("Safe Mode decision checkpoint is invalid");
     }
-    await saveSession(rootPath, decided);
+    await saveSafeExecutionSession(rootPath, decided);
     return decided;
   });
 }
@@ -771,16 +1033,21 @@ export async function approveAndExecuteSafeProposal(
       proposal: waiting.proposal,
       proposalThreadId: waiting.proposalThreadId,
       mutationApproval: approval,
+      proposalHistory: waiting.proposalHistory.map((entry, index) =>
+        index === waiting.proposalHistory.length - 1
+          ? { ...entry, decisionApproval: approval }
+          : entry,
+      ),
     };
     if (!isSafeExecutionSession(approved)) {
       throw new Error("Safe Mode approval checkpoint is invalid");
     }
-    await saveSession(rootPath, approved);
+    await saveSafeExecutionSession(rootPath, approved);
     let result: SafeMutationResult;
     try {
       result = await execute(approved);
     } catch (error) {
-      await saveSession(rootPath, waiting).catch((rollbackError) => {
+      await saveSafeExecutionSession(rootPath, waiting).catch((rollbackError) => {
         throw new Error("Safe Mode execution and rollback both failed", {
           cause: { executionError: error, rollbackError },
         });
@@ -799,11 +1066,12 @@ export async function approveAndExecuteSafeProposal(
       proposalThreadId: approved.proposalThreadId,
       mutationApproval: approved.mutationApproval,
       mutationEvidence: { ...result, completedAt },
+      proposalHistory: approved.proposalHistory,
     };
     if (!isSafeExecutionSession(editing)) {
       throw new Error("Safe Mode editing checkpoint is invalid");
     }
-    await saveSession(rootPath, editing);
+    await saveSafeExecutionSession(rootPath, editing);
     return editing;
   });
 }

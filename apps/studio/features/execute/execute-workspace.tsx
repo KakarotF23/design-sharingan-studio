@@ -7,7 +7,7 @@ import type {
   FeatureBrief,
 } from "@design-sharingan/core";
 import { ModeSwitcher, WorkspaceHeader } from "@design-sharingan/ui";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useStudioProject } from "../projects/project-shell";
 import { ApprovalActions } from "./approval-actions";
 import { ChangeProposalView } from "./change-proposal-view";
@@ -50,23 +50,48 @@ interface ExecuteSession {
   };
 }
 
-function activityFor(session: ExecuteSession | undefined, busy: boolean): string {
-  if (busy) return "Applying the selected Safe Mode action…";
+type SafeAction =
+  | "PREPARE_PROPOSAL"
+  | "PREPARE_REVISION"
+  | "REQUEST_REVISION"
+  | "REJECT_PROPOSAL"
+  | "APPROVE_PROPOSAL";
+
+function activityFor(
+  session: ExecuteSession | undefined,
+  busy: boolean,
+  action: SafeAction | undefined,
+): string {
+  if (session?.status === "APPROVED") {
+    return "Approval persisted; controlled mutation is running";
+  }
+  if (busy) {
+    switch (action) {
+      case "PREPARE_PROPOSAL":
+        return "Preparing a read-only change proposal; no mutation is authorized";
+      case "PREPARE_REVISION":
+        return "Preparing the requested read-only proposal revision; no mutation is authorized";
+      case "REQUEST_REVISION":
+        return "Recording your revision instruction; no mutation is authorized";
+      case "REJECT_PROPOSAL":
+        return "Recording proposal rejection; no mutation is authorized";
+      case "APPROVE_PROPOSAL":
+        return "Persisting exact proposal approval before any mutation begins";
+    }
+  }
   switch (session?.status) {
     case "IDLE":
       return "Approved direction ready for proposal preparation";
     case "PREPARING":
       return "Preparing change proposal evidence";
     case "PROPOSING":
-      return "Codex is preparing a bounded change proposal";
+      return "Codex is preparing a bounded read-only change proposal";
     case "WAITING_APPROVAL":
       return "Waiting for explicit Change Proposal approval";
     case "REVISING":
       return "Revision requested; target source remains unchanged";
     case "REJECTED":
       return "Proposal rejected; no mutation was authorized";
-    case "APPROVED":
-      return "Approval persisted; controlled mutation is running";
     case "EDITING":
       return "Approved mutation applied; render verification is next";
     default:
@@ -79,23 +104,27 @@ export function ExecuteWorkspace() {
   const [session, setSession] = useState<ExecuteSession>();
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [activeAction, setActiveAction] = useState<SafeAction>();
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
 
-  useEffect(() => {
-    fetch(`/projects/${encodeURIComponent(project.id)}/execute/data`, {
+  const fetchDurableSession = useCallback(async (): Promise<ExecuteSession | undefined> => {
+    const response = await fetch(`/projects/${encodeURIComponent(project.id)}/execute/data`, {
       cache: "no-store",
-    })
-      .then(async (response) => {
-        const payload = (await response.json()) as {
-          executeSession?: ExecuteSession;
-          error?: string;
-        };
-        if (!response.ok) {
-          throw new Error(payload.error ?? "Approved direction is unavailable.");
-        }
-        setSession(payload.executeSession);
-      })
+    });
+    const payload = (await response.json()) as {
+      executeSession?: ExecuteSession;
+      error?: string;
+    };
+    if (!response.ok) {
+      throw new Error(payload.error ?? "Approved direction is unavailable.");
+    }
+    return payload.executeSession;
+  }, [project.id]);
+
+  useEffect(() => {
+    fetchDurableSession()
+      .then(setSession)
       .catch((caught: unknown) => {
         setError(
           caught instanceof Error
@@ -104,15 +133,43 @@ export function ExecuteWorkspace() {
         );
       })
       .finally(() => setLoaded(true));
-  }, [project.id]);
+  }, [fetchDurableSession]);
+
+  useEffect(() => {
+    const durableWorkInProgress =
+      session?.status === "PREPARING" ||
+      session?.status === "PROPOSING" ||
+      session?.status === "APPROVED";
+    if (!busy && !durableWorkInProgress) return;
+    let cancelled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const current = await fetchDurableSession();
+        if (!cancelled) setSession(current);
+      } catch {
+        // The action request remains authoritative. A later poll or its final
+        // response can still recover the durable checkpoint.
+      } finally {
+        if (!cancelled) timeout = setTimeout(poll, 80);
+      }
+    };
+    timeout = setTimeout(poll, 40);
+    return () => {
+      cancelled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
+    };
+  }, [busy, fetchDurableSession, session?.status]);
 
   async function runAction(
+    action: SafeAction,
     endpoint: string,
     body: Record<string, unknown>,
     successNotice: string,
   ): Promise<void> {
     if (session === undefined || busy) return;
     setBusy(true);
+    setActiveAction(action);
     setError(undefined);
     setNotice(undefined);
     try {
@@ -141,6 +198,7 @@ export function ExecuteWorkspace() {
       );
     } finally {
       setBusy(false);
+      setActiveAction(undefined);
     }
   }
 
@@ -160,7 +218,7 @@ export function ExecuteWorkspace() {
       />
       <p className="safe-activity" role="status" aria-live="polite">
         <span aria-hidden="true" />
-        {activityFor(session, busy)}
+        {activityFor(session, busy, activeAction)}
       </p>
       {error ? <p className="form-error" role="alert">{error}</p> : null}
       {notice ? <p className="form-success" role="status">{notice}</p> : null}
@@ -218,6 +276,9 @@ export function ExecuteWorkspace() {
             disabled={busy}
             onClick={() =>
               void runAction(
+                session.status === "REVISING"
+                  ? "PREPARE_REVISION"
+                  : "PREPARE_PROPOSAL",
                 "",
                 {},
                 session.status === "REVISING"
@@ -246,19 +307,28 @@ export function ExecuteWorkspace() {
           <ChangeProposalView proposal={session.proposal} />
           <ApprovalActions
             busy={busy}
-            onApprove={() => void runAction("/approve", {}, "Approved mutation applied")}
-            onRevision={() =>
+            onApprove={() =>
               void runAction(
+                "APPROVE_PROPOSAL",
+                "/approve",
+                {},
+                "Approved mutation applied",
+              )
+            }
+            onRevision={(instruction) =>
+              void runAction(
+                "REQUEST_REVISION",
                 "/decision",
                 {
                   decision: "REVISION_REQUESTED",
-                  comment: "Revise the proposal while preserving the approved direction.",
+                  comment: instruction,
                 },
                 "Revision requested",
               )
             }
             onReject={() =>
               void runAction(
+                "REJECT_PROPOSAL",
                 "/decision",
                 { decision: "REJECTED", comment: "Proposal rejected by local user." },
                 "Proposal rejected",
