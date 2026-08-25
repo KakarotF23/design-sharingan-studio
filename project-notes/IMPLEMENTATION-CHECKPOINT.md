@@ -14,7 +14,7 @@ Current approved state:
 - [x] Task 3 — Workspace Persistence
 - [x] Task 4 — Project Adapters
 - [x] Task 5 — Codex Agent Runtime
-- [ ] Task 6 — Studio Shell
+- [x] Task 6 — Studio Shell
 - [ ] Task 7 — V1 SCAN
 - [ ] Task 8 — ASSIMILATE / EVOLVE
 - [ ] Task 9 — Safe Mode
@@ -30,7 +30,7 @@ Current approved state:
 
 Codex development proceeds autonomously within the currently approved phase:
 
-- Phase 1 — Foundation: Tasks 1–6 (in progress; Tasks 1–5 verified)
+- Phase 1 — Foundation: Tasks 1–6 (complete; awaiting phase-gate review)
 - Phase 2 — Design Intelligence: Tasks 7–10
 - Phase 3 — Mangekyō: Task 11
 - Phase 4 — Eternal + Final Verification: Tasks 12–16
