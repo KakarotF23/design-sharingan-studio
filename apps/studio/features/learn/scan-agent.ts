@@ -24,6 +24,9 @@ export function createScanAgent(): ScanAgent {
   if (process.env.DESIGN_SHARINGAN_FAKE_AGENT === "1") {
     return {
       async run<TStructured>() {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 250);
+        });
         return {
           threadId: "fake-reference-scan-thread",
           finalResponse: JSON.stringify(fakeOutput),

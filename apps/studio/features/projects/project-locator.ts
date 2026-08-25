@@ -2,7 +2,16 @@ import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, normalize } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  normalize,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import type { Project } from "@design-sharingan/core";
 import { loadProjectMetadata } from "@design-sharingan/project-adapters";
 
@@ -64,8 +73,65 @@ async function validateStateDirectory(create: boolean): Promise<string> {
   return rootPath;
 }
 
-export async function createAnalysisStagingDirectory(): Promise<string> {
+async function canonicalizeAllowingMissing(path: string): Promise<string> {
+  let existingAncestor = resolve(path);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      await lstat(existingAncestor);
+      return join(await realpath(existingAncestor), ...missingSegments);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        const parentPath = dirname(existingAncestor);
+        if (parentPath === existingAncestor) throw error;
+        missingSegments.unshift(basename(existingAncestor));
+        existingAncestor = parentPath;
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+function pathContains(rootPath: string, candidatePath: string): boolean {
+  const relativePath = relative(rootPath, candidatePath);
+  return (
+    relativePath === "" ||
+    (!isAbsolute(relativePath) &&
+      relativePath !== ".." &&
+      !relativePath.startsWith(`..${sep}`))
+  );
+}
+
+async function assertDisjointAnalysisRoot(
+  targetRootPath: string,
+  stateRoot: string,
+): Promise<void> {
+  const [canonicalTarget, canonicalState] = await Promise.all([
+    realpath(targetRootPath),
+    canonicalizeAllowingMissing(stateRoot),
+  ]);
+  const targetEntry = await lstat(targetRootPath);
+  if (
+    targetEntry.isSymbolicLink() ||
+    !targetEntry.isDirectory() ||
+    canonicalTarget !== targetRootPath ||
+    pathContains(canonicalTarget, canonicalState) ||
+    pathContains(canonicalState, canonicalTarget)
+  ) {
+    throw new Error(
+      "Analysis state and target project roots must not overlap",
+    );
+  }
+}
+
+export async function createAnalysisStagingDirectory(
+  targetRootPath: string,
+): Promise<string> {
+  const configuredStateRoot = stateRootPath();
+  await assertDisjointAnalysisRoot(targetRootPath, configuredStateRoot);
   const stateRoot = await validateStateDirectory(true);
+  await assertDisjointAnalysisRoot(targetRootPath, stateRoot);
   const analysisRoot = join(stateRoot, "analysis");
   await mkdir(/* turbopackIgnore: true */ analysisRoot, {
     mode: 0o700,

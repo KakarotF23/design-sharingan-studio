@@ -1,4 +1,5 @@
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -21,12 +22,14 @@ import type {
 } from "@design-sharingan/core";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  commitReferenceScan,
   ensureDesignWorkspace,
   listReferences,
   listSessions,
   loadReference,
   loadReferenceImage,
   loadReferenceDesignDNA,
+  loadSession,
   loadProjectMetadata,
   saveReferenceDesignDNA,
   saveGuardedProjectMetadata,
@@ -34,6 +37,7 @@ import {
   saveReferenceArtifact,
   saveRenderArtifact,
   saveSession,
+  transitionLearnSession,
   updateReference,
   validateReferenceImage,
 } from "../workspace-store";
@@ -371,6 +375,14 @@ it("accepts only bounded raster references whose signature matches the declared 
   expect(() =>
     validateReferenceImage("image/png", new Uint8Array(10 * 1024 * 1024 + 1)),
   ).toThrow(/10 MiB/i);
+  for (const inheritedName of ["constructor", "toString", "__proto__"]) {
+    expect(() =>
+      validateReferenceImage(
+        inheritedName,
+        new TextEncoder().encode("not an image"),
+      ),
+    ).toThrow(/PNG, JPEG, WebP, or GIF/i);
+  }
 });
 
 // Production break caught: write-only reference/session helpers make the References, Learn, and Reports workspaces lose durable state after navigation or reload.
@@ -413,6 +425,100 @@ it("reads, lists, updates, and attaches DesignDNA to durable reference and sessi
     sessionFixture(),
   ]);
   expect(new Uint8Array(await readFile(saved.artifactPath))).toEqual(validPng);
+});
+
+// Production break caught: writing a completed scan directly can skip DRAFT -> ANALYZING, while separate final writes can leave DNA or ANALYZED metadata without a matching report.
+it("enforces the Learn lifecycle and commits a completed reference scan as one rollback-safe checkpoint", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  await saveReferenceArtifact(rootPath, referenceFixture(), validPng);
+  const persistedReference = await loadReference(
+    rootPath,
+    "project-1",
+    "reference-1",
+  );
+  const draft = sessionFixture();
+  const analyzing = { ...draft, status: "ANALYZING" as const };
+  const completed = { ...draft, status: "RESULT_READY" as const };
+  const analyzedReference = {
+    ...persistedReference,
+    analysisStatus: "ANALYZED" as const,
+  };
+
+  await saveSession(rootPath, draft);
+  await expect(
+    commitReferenceScan(rootPath, {
+      reference: analyzedReference,
+      designDNA: designDNAFixture(),
+      session: completed,
+    }),
+  ).rejects.toThrow(/ANALYZING/i);
+  await expect(
+    loadReferenceDesignDNA(rootPath, "project-1", "reference-1"),
+  ).rejects.toMatchObject({ code: "ENOENT" });
+
+  await transitionLearnSession(rootPath, "DRAFT", analyzing);
+  await expect(loadSession(rootPath, "project-1", draft.id)).resolves.toEqual(
+    analyzing,
+  );
+  await commitReferenceScan(rootPath, {
+    reference: analyzedReference,
+    designDNA: designDNAFixture(),
+    session: completed,
+  });
+
+  await expect(loadSession(rootPath, "project-1", draft.id)).resolves.toEqual(
+    completed,
+  );
+  await expect(
+    loadReferenceDesignDNA(rootPath, "project-1", "reference-1"),
+  ).resolves.toEqual(designDNAFixture());
+  await expect(
+    loadReference(rootPath, "project-1", "reference-1"),
+  ).resolves.toEqual(analyzedReference);
+});
+
+// Production break caught: a late session-write failure previously left the earlier DNA/reference writes visible without a completed Design Session.
+it("rolls back DNA and reference metadata when the final scan checkpoint cannot persist", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  await saveReferenceArtifact(rootPath, referenceFixture(), validPng);
+  const originalReference = await loadReference(
+    rootPath,
+    "project-1",
+    "reference-1",
+  );
+  const draft = sessionFixture();
+  const analyzing = { ...draft, status: "ANALYZING" as const };
+  await saveSession(rootPath, draft);
+  await transitionLearnSession(rootPath, "DRAFT", analyzing);
+
+  const sessionsPath = join(rootPath, ".design-sharingan", "sessions");
+  await chmod(sessionsPath, 0o500);
+  try {
+    await expect(
+      commitReferenceScan(rootPath, {
+        reference: {
+          ...originalReference,
+          analysisStatus: "ANALYZED",
+        },
+        designDNA: designDNAFixture(),
+        session: { ...draft, status: "RESULT_READY" },
+      }),
+    ).rejects.toThrow();
+  } finally {
+    await chmod(sessionsPath, 0o700);
+  }
+
+  await expect(
+    loadReference(rootPath, "project-1", "reference-1"),
+  ).resolves.toEqual(originalReference);
+  await expect(
+    loadReferenceDesignDNA(rootPath, "project-1", "reference-1"),
+  ).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(loadSession(rootPath, "project-1", draft.id)).resolves.toEqual(
+    analyzing,
+  );
 });
 
 // Production break caught: an explicit root alone permits a reference from another project to be written into the active workspace.

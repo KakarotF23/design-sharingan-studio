@@ -565,10 +565,10 @@ textarea:focus-visible {
 }
 
 .reference-card__preview {
+  position: relative;
   min-height: 7rem;
-  display: grid;
-  align-items: end;
-  padding: 0.8rem;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
   color: #a55a5d;
   background:
     linear-gradient(135deg, rgba(198, 75, 80, 0.14), transparent 52%),
@@ -577,6 +577,22 @@ textarea:focus-visible {
   font-family: var(--font-mono);
   font-size: 0.6rem;
   letter-spacing: 0.1em;
+}
+
+.reference-card__preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.reference-card__preview span {
+  position: absolute;
+  right: 0.65rem;
+  bottom: 0.65rem;
+  padding: 0.28rem 0.42rem;
+  color: #e8e6df;
+  background: rgba(11, 13, 16, 0.86);
 }
 
 .reference-card__body {

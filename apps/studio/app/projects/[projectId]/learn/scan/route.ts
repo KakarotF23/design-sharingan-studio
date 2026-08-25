@@ -1,10 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { detectProject, loadReference, loadReferenceImage, saveReferenceDesignDNA, saveSession, updateReference } from "@design-sharingan/project-adapters";
+import {
+  commitReferenceScan,
+  detectProject,
+  loadReference,
+  loadReferenceImage,
+  saveSession,
+  transitionLearnSession,
+} from "@design-sharingan/project-adapters";
 import { scanReference } from "@design-sharingan/sharingan-engine";
 import { createScanAgent } from "../../../../../features/learn/scan-agent";
-import type { ReferenceScanSession } from "../../../../../features/references/reference-types";
+import type {
+  ReferenceScanPendingSession,
+  ReferenceScanResultSession,
+} from "../../../../../features/references/reference-types";
 import { createAnalysisStagingDirectory } from "../../../../../features/projects/project-locator";
 import { resolveProjectRequest } from "../../../../../features/projects/project-access";
 import { readProjectJson } from "../../../../../features/projects/project-request";
@@ -45,14 +55,17 @@ export async function POST(
 
   const { projectId } = await context.params;
   let stagingPath: string | undefined;
+  let activeProjectRoot: string | undefined;
+  let analyzingSession: ReferenceScanPendingSession | undefined;
   try {
     const project = await resolveProjectRequest(projectId);
+    activeProjectRoot = project.rootPath;
     const [reference, image, detection] = await Promise.all([
       loadReference(project.rootPath, project.id, body.referenceId),
       loadReferenceImage(project.rootPath, project.id, body.referenceId),
       detectProject(project.rootPath),
     ]);
-    stagingPath = await createAnalysisStagingDirectory();
+    stagingPath = await createAnalysisStagingDirectory(project.rootPath);
     const extension =
       image.type === "image/png"
         ? ".png"
@@ -65,6 +78,30 @@ export async function POST(
     await writeFile(/* turbopackIgnore: true */ stagedImagePath, image.bytes, {
       mode: 0o600,
     });
+
+    const sessionId = randomUUID();
+    const createdAt = new Date().toISOString();
+    const draftSession: ReferenceScanPendingSession = {
+      id: sessionId,
+      projectId: project.id,
+      type: "REFERENCE_SCAN",
+      status: "DRAFT",
+      createdAt,
+      updatedAt: createdAt,
+      referenceId: reference.id,
+      referenceTitle: reference.title,
+    };
+    await saveSession(project.rootPath, draftSession);
+    analyzingSession = {
+      ...draftSession,
+      status: "ANALYZING",
+      updatedAt: new Date().toISOString(),
+    };
+    await transitionLearnSession(
+      project.rootPath,
+      "DRAFT",
+      analyzingSession,
+    );
 
     const result = await scanReference(
       {
@@ -88,14 +125,7 @@ export async function POST(
       {
         agent: createScanAgent(),
         createId: randomUUID,
-        persist: async (designDNA) => {
-          await saveReferenceDesignDNA(
-            project.rootPath,
-            project.id,
-            reference.id,
-            designDNA,
-          );
-        },
+        persist: async () => undefined,
       },
     );
     const timestamp = new Date().toISOString();
@@ -106,9 +136,8 @@ export async function POST(
       notes: body.notes?.trim() || reference.notes,
       analysisStatus: "ANALYZED" as const,
     };
-    await updateReference(project.rootPath, updatedReference);
-    const session: ReferenceScanSession = {
-      id: randomUUID(),
+    const session: ReferenceScanResultSession = {
+      id: sessionId,
       projectId: project.id,
       type: "REFERENCE_SCAN",
       status: "RESULT_READY",
@@ -119,9 +148,21 @@ export async function POST(
       designDNA: result.designDNA,
       agentThreadId: result.threadId,
     };
-    await saveSession(project.rootPath, session);
+    await commitReferenceScan(project.rootPath, {
+      reference: updatedReference,
+      designDNA: result.designDNA,
+      session,
+    });
     return Response.json({ designDNA: result.designDNA, session });
   } catch {
+    if (activeProjectRoot !== undefined && analyzingSession !== undefined) {
+      const failedSession: ReferenceScanPendingSession = {
+        ...analyzingSession,
+        error: "Reference analysis did not complete.",
+        updatedAt: new Date().toISOString(),
+      };
+      await saveSession(activeProjectRoot, failedSession).catch(() => undefined);
+    }
     return Response.json(
       { error: "Reference analysis could not be completed or persisted." },
       { status: 422 },

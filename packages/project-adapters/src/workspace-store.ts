@@ -14,10 +14,12 @@ import { basename, dirname, extname, join } from "node:path";
 import type {
   DesignDNA,
   DesignSession,
+  LearnSessionStatus,
   Project,
   Reference,
   RenderArtifact,
 } from "@design-sharingan/core";
+import { canTransitionLearnSession } from "@design-sharingan/core";
 import { assertPathInsideWorkspace } from "./path-policy";
 
 const MACHINE_DIRECTORY = ".design-sharingan";
@@ -533,44 +535,48 @@ export function validateReferenceImage(
     throw new Error("Reference image must be no larger than 10 MiB");
   }
 
-  const signatures: Readonly<
-    Record<"image/png" | "image/jpeg" | "image/webp" | "image/gif", boolean>
-  > = {
-    "image/png":
-      bytes.byteLength >= 8 &&
-      [137, 80, 78, 71, 13, 10, 26, 10].every(
-        (value, index) => bytes[index] === value,
-      ),
-    "image/jpeg":
-      bytes.byteLength >= 3 &&
-      bytes[0] === 0xff &&
-      bytes[1] === 0xd8 &&
-      bytes[2] === 0xff,
-    "image/webp":
-      bytes.byteLength >= 12 &&
-      new TextDecoder("ascii").decode(bytes.subarray(0, 4)) === "RIFF" &&
-      new TextDecoder("ascii").decode(bytes.subarray(8, 12)) === "WEBP",
-    "image/gif":
-      bytes.byteLength >= 6 &&
-      ["GIF87a", "GIF89a"].includes(
-        new TextDecoder("ascii").decode(bytes.subarray(0, 6)),
-      ),
-  };
-
-  if (!(declaredMime in signatures)) {
-    throw new Error("Reference image must be PNG, JPEG, WebP, or GIF");
+  let extension: ".png" | ".jpg" | ".webp" | ".gif";
+  let signatureMatches: boolean;
+  switch (declaredMime) {
+    case "image/png":
+      extension = ".png";
+      signatureMatches =
+        bytes.byteLength >= 8 &&
+        [137, 80, 78, 71, 13, 10, 26, 10].every(
+          (value, index) => bytes[index] === value,
+        );
+      break;
+    case "image/jpeg":
+      extension = ".jpg";
+      signatureMatches =
+        bytes.byteLength >= 3 &&
+        bytes[0] === 0xff &&
+        bytes[1] === 0xd8 &&
+        bytes[2] === 0xff;
+      break;
+    case "image/webp":
+      extension = ".webp";
+      signatureMatches =
+        bytes.byteLength >= 12 &&
+        new TextDecoder("ascii").decode(bytes.subarray(0, 4)) === "RIFF" &&
+        new TextDecoder("ascii").decode(bytes.subarray(8, 12)) === "WEBP";
+      break;
+    case "image/gif":
+      extension = ".gif";
+      signatureMatches =
+        bytes.byteLength >= 6 &&
+        ["GIF87a", "GIF89a"].includes(
+          new TextDecoder("ascii").decode(bytes.subarray(0, 6)),
+        );
+      break;
+    default:
+      throw new Error("Reference image must be PNG, JPEG, WebP, or GIF");
   }
-  const mime = declaredMime as keyof typeof signatures;
-  if (!signatures[mime]) {
+
+  if (!signatureMatches) {
     throw new Error("Reference image signature does not match its declared MIME");
   }
-  return mime === "image/png"
-    ? ".png"
-    : mime === "image/jpeg"
-      ? ".jpg"
-      : mime === "image/webp"
-        ? ".webp"
-        : ".gif";
+  return extension;
 }
 
 export async function saveReferenceArtifact(
@@ -879,10 +885,158 @@ export async function saveSession(
   return sessionPath;
 }
 
-export async function listSessions<TSession extends DesignSession = DesignSession>(
+export async function loadSession(
   rootPath: string,
   projectId: string,
-): Promise<TSession[]> {
+  sessionId: string,
+): Promise<DesignSession> {
+  assertSafePathSegment(sessionId, "Session id");
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  const sessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${sessionId}.json`),
+  );
+  const persisted = await readBoundedJsonFile(sessionPath, "Session record");
+  if (
+    !isPersistedSession(persisted) ||
+    persisted.projectId !== projectId ||
+    persisted.id !== sessionId
+  ) {
+    throw new Error("Session record is invalid");
+  }
+  return persisted;
+}
+
+export async function transitionLearnSession(
+  rootPath: string,
+  expectedStatus: LearnSessionStatus,
+  session: DesignSession & { status: LearnSessionStatus },
+): Promise<string> {
+  const existing = await loadSession(rootPath, session.projectId, session.id);
+  if (
+    existing.type !== session.type ||
+    existing.status !== expectedStatus ||
+    !canTransitionLearnSession(expectedStatus, session.status)
+  ) {
+    throw new Error(
+      `Learn session cannot transition from ${existing.status} to ${session.status}`,
+    );
+  }
+  return saveSession(rootPath, session);
+}
+
+export interface ReferenceScanCheckpoint {
+  reference: Reference;
+  designDNA: DesignDNA;
+  session: DesignSession & { status: "RESULT_READY" };
+}
+
+async function readOptionalJsonContents(path: string): Promise<string | undefined> {
+  try {
+    return stableJson(await readBoundedJsonFile(path, "DesignDNA record"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+export async function commitReferenceScan(
+  rootPath: string,
+  checkpoint: ReferenceScanCheckpoint,
+): Promise<void> {
+  const { reference, designDNA, session } = checkpoint;
+  const [existingReference, existingSession] = await Promise.all([
+    loadReference(rootPath, reference.projectId, reference.id),
+    loadSession(rootPath, session.projectId, session.id),
+  ]);
+  if (
+    existingReference.projectId !== session.projectId ||
+    existingSession.type !== "REFERENCE_SCAN" ||
+    session.type !== "REFERENCE_SCAN" ||
+    existingSession.status !== "ANALYZING" ||
+    !canTransitionLearnSession("ANALYZING", session.status) ||
+    reference.analysisStatus !== "ANALYZED" ||
+    reference.imagePath !== existingReference.imagePath ||
+    reference.type !== existingReference.type ||
+    reference.source !== existingReference.source ||
+    reference.createdAt !== existingReference.createdAt ||
+    !designDNA.referenceIds.includes(reference.id)
+  ) {
+    throw new Error(
+      "Reference scan checkpoint requires an ANALYZING session and matching artifacts",
+    );
+  }
+
+  const workspace = await loadValidatedProjectContext(
+    rootPath,
+    reference.projectId,
+  );
+  const referencePath = dirname(existingReference.imagePath as string);
+  const referenceMetadataPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "reference.json"),
+  );
+  const designDNAPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "design-dna.json"),
+  );
+  const sessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${session.id}.json`),
+  );
+  const originalReferenceContents = stableJson(existingReference);
+  const originalDesignDNAContents = await readOptionalJsonContents(designDNAPath);
+  const finalReferenceContents = stableJson(reference);
+  const finalDesignDNAContents = stableJson(designDNA);
+  const finalSessionContents = stableJson(session);
+
+  try {
+    await atomicWrite(referencePath, designDNAPath, finalDesignDNAContents);
+    await atomicWrite(
+      referencePath,
+      referenceMetadataPath,
+      finalReferenceContents,
+    );
+    await atomicWrite(workspace.sessionsPath, sessionPath, finalSessionContents);
+  } catch (error) {
+    const rollbackErrors: unknown[] = [];
+    await (originalDesignDNAContents === undefined
+      ? unlink(designDNAPath).catch((rollbackError: unknown) => {
+          if (
+            !(
+              rollbackError instanceof Error &&
+              "code" in rollbackError &&
+              rollbackError.code === "ENOENT"
+            )
+          ) {
+            rollbackErrors.push(rollbackError);
+          }
+        })
+      : atomicWrite(
+          referencePath,
+          designDNAPath,
+          originalDesignDNAContents,
+        ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError)));
+    await atomicWrite(
+      referencePath,
+      referenceMetadataPath,
+      originalReferenceContents,
+    ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError));
+    if (rollbackErrors.length > 0) {
+      throw new Error("Reference scan checkpoint and rollback both failed", {
+        cause: { commitError: error, rollbackErrors },
+      });
+    }
+    throw error;
+  }
+}
+
+export async function listSessions(
+  rootPath: string,
+  projectId: string,
+): Promise<DesignSession[]> {
   const workspace = await loadValidatedProjectContext(rootPath, projectId);
   const entries = await readdir(workspace.sessionsPath, { withFileTypes: true });
   const sessions = await Promise.all(
@@ -900,7 +1054,7 @@ export async function listSessions<TSession extends DesignSession = DesignSessio
         if (!isPersistedSession(persisted) || persisted.projectId !== projectId) {
           throw new Error("Session record is invalid");
         }
-        return persisted as TSession;
+        return persisted;
       }),
   );
   return sessions.sort((left, right) =>

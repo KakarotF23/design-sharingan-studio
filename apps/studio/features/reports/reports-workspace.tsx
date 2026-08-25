@@ -54,7 +54,11 @@ export function ReportsWorkspace() {
                   </time>
                 </div>
                 <h3>{session.referenceTitle}</h3>
-                <p>{session.designDNA.emotionalTone.join(" ")}</p>
+                <p>
+                  {session.status === "RESULT_READY"
+                    ? session.designDNA.emotionalTone.join(" ")
+                    : session.error ?? "Analysis evidence is still being prepared."}
+                </p>
                 <strong>{session.status}</strong>
               </li>
             ))}

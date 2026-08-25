@@ -3,7 +3,13 @@ import type { ReferenceView } from "./reference-types";
 export function ReferenceCard({ reference }: { reference: ReferenceView }) {
   return (
     <article className="reference-card">
-      <div className="reference-card__preview" aria-hidden="true">
+      <div className="reference-card__preview">
+        <img
+          src={`/projects/${encodeURIComponent(reference.projectId)}/references/image/${encodeURIComponent(reference.id)}`}
+          alt={`Reference image: ${reference.title}`}
+          decoding="async"
+          loading="lazy"
+        />
         <span>VISUAL / {reference.type.replace("image/", "").toUpperCase()}</span>
       </div>
       <div className="reference-card__body">
