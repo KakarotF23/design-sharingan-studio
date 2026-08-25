@@ -65,6 +65,39 @@ For every task:
 
 Do not skip RED → GREEN.
 
+## Phase-Based Autopilot Development Policy
+
+This policy governs Codex development workflow only. It does not remove or
+weaken the product-level Safe Mode, Mangekyō autonomy policy, Human Gate,
+approval engine, or any safety boundary in the approved specification.
+
+Development phases are:
+
+- Phase 1 — Foundation: Tasks 1–6
+- Phase 2 — Design Intelligence: Tasks 7–10
+- Phase 3 — Mangekyō: Task 11
+- Phase 4 — Eternal + Final Verification: Tasks 12–16
+
+Within an approved phase, continue autonomously from one task to the next in
+dependency order. Do not wait for routine human approval between tasks. Every
+task still requires RED → GREEN TDD, task-level verification, spec-compliance
+and code-quality review, a verified checkpoint commit, and automatic
+continuation to the next task in the same phase.
+
+Stop for human direction only when a genuine decision is required: a material
+architecture change; v0.1 scope expansion; a major new dependency or external
+service not implied by the plan; destructive replacement of significant work;
+a new authentication, secrets, security, permissions, or sensitive-data
+decision; an unresolved material UX/product choice; a material spec/plan
+contradiction; repeated verification failure that would require guessing or
+architectural deviation; or an unavoidable platform permission.
+
+At the end of each phase, stop and provide one consolidated review containing
+completed tasks, commands and verification evidence, build/typecheck/E2E
+status, commits, important decisions, deviations, debt, relevant renders,
+remaining risks, and a recommendation. Classify the phase as `PHASE PASS`,
+`PHASE PASS WITH DEBT`, `PHASE NOT VERIFIED`, or `PHASE BLOCKED`.
+
 ---
 
 ## Architecture Boundaries
