@@ -356,6 +356,35 @@
     display: block;
   }
 
+  .ds-workspace-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 1rem;
+  }
+
+  .ds-workspace-header__actions {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .ds-mode-switcher {
+    width: 100%;
+    justify-items: start;
+  }
+
+  .ds-mode-switcher > div {
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .ds-mode-switcher__note {
+    width: 100%;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    text-align: left;
+  }
+
   .ds-sidebar {
     border-right: 0;
     border-bottom: 1px solid #222936;

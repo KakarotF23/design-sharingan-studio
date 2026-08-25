@@ -138,6 +138,69 @@ test("creates a Feature Brief, approves one EVOLVE approach, and hands it to Exe
     page.getByText("Ready for change proposal", { exact: true }),
   ).toBeVisible();
 
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole("button", { name: "Mangekyō" })).toBeVisible();
+  const mobileExecuteLayout = await page.evaluate(() => {
+    const header = document.querySelector<HTMLElement>(".ds-workspace-header");
+    const content = header?.firstElementChild as HTMLElement | null;
+    const actions = document.querySelector<HTMLElement>(
+      ".ds-workspace-header__actions",
+    );
+    const modeSwitcher = document.querySelector<HTMLElement>(
+      ".ds-mode-switcher",
+    );
+    const modeNote = document.querySelector<HTMLElement>(
+      ".ds-mode-switcher__note",
+    );
+    if (!header || !content || !actions || !modeSwitcher || !modeNote) {
+      throw new Error("Execute workspace header is incomplete");
+    }
+    const rect = (element: HTMLElement) => {
+      const bounds = element.getBoundingClientRect();
+      return {
+        top: bounds.top,
+        right: bounds.right,
+        bottom: bounds.bottom,
+        left: bounds.left,
+        width: bounds.width,
+      };
+    };
+    return {
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+      header: rect(header),
+      content: rect(content),
+      actions: rect(actions),
+      modeSwitcher: rect(modeSwitcher),
+      modeNote: rect(modeNote),
+    };
+  });
+
+  expect(mobileExecuteLayout.scrollWidth).toBe(
+    mobileExecuteLayout.clientWidth,
+  );
+  expect(mobileExecuteLayout.content.width).toBeGreaterThanOrEqual(
+    mobileExecuteLayout.header.width * 0.8,
+  );
+  expect(mobileExecuteLayout.actions.top).toBeGreaterThanOrEqual(
+    mobileExecuteLayout.content.bottom,
+  );
+  expect(mobileExecuteLayout.actions.left).toBeGreaterThanOrEqual(
+    mobileExecuteLayout.header.left,
+  );
+  expect(mobileExecuteLayout.actions.right).toBeLessThanOrEqual(
+    mobileExecuteLayout.header.right,
+  );
+  expect(mobileExecuteLayout.modeSwitcher.right).toBeLessThanOrEqual(
+    mobileExecuteLayout.clientWidth,
+  );
+  expect(mobileExecuteLayout.modeNote.left).toBeGreaterThanOrEqual(
+    mobileExecuteLayout.header.left,
+  );
+  expect(mobileExecuteLayout.modeNote.right).toBeLessThanOrEqual(
+    mobileExecuteLayout.header.right,
+  );
+
   expect(await snapshotTargetTree(projectPath)).toEqual(targetTreeBefore);
 
   const records = await Promise.all(
