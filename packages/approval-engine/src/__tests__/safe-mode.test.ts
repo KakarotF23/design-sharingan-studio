@@ -1090,6 +1090,142 @@ describe("controlled mirror mutation", () => {
     expect(headAfter).toBe(headBefore);
   });
 
+  it("synthesizes one authoritative patch for every approved path hidden by Git index flags", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/skip.ts", "skip before\n");
+    await writeWorkspaceFile(workspaceRoot, "src/assume.ts", "assume before\n");
+    await chmod(join(workspaceRoot, "src/skip.ts"), 0o755);
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    await execFile("git", ["add", "."], { cwd: workspaceRoot });
+    await execFile(
+      "git",
+      [
+        "-c",
+        "user.name=Design Sharingan Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+      ],
+      { cwd: workspaceRoot },
+    );
+    await execFile("git", ["update-index", "--skip-worktree", "src/skip.ts"], {
+      cwd: workspaceRoot,
+    });
+    await execFile(
+      "git",
+      ["update-index", "--assume-unchanged", "src/assume.ts"],
+      { cwd: workspaceRoot },
+    );
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/skip.ts", "skip after\n");
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/assume.ts",
+            "assume after\n",
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToModify: ["src/skip.ts", "src/assume.ts"],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(
+      result.git.diffAfter.split("diff --git a/src/skip.ts b/src/skip.ts"),
+    ).toHaveLength(2);
+    expect(
+      result.git.diffAfter.split("diff --git a/src/assume.ts b/src/assume.ts"),
+    ).toHaveLength(2);
+    expect(result.git.diffAfter).toContain("-skip before");
+    expect(result.git.diffAfter).toContain("+skip after");
+    expect(result.git.diffAfter).toContain("-assume before");
+    expect(result.git.diffAfter).toContain("+assume after");
+    expect(result.git.diffAfter).toContain("old mode 100755");
+    expect(result.git.diffAfter).toContain("new mode 100755");
+  });
+
+  it("keeps the authoritative approved delta when Git metadata is unavailable", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    });
+
+    expect(result.git.available).toBe(false);
+    expect(result.git.diffAfter).toContain("-before");
+    expect(result.git.diffAfter).toContain("+after");
+    expect(result.git.note).toContain("authoritative executor-captured approved delta");
+  });
+
+  it("reports truthful modes for executable deletes and binary create/delete evidence", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "scripts/remove.sh", "#!/bin/sh\nexit 0\n");
+    await chmod(join(workspaceRoot, "scripts/remove.sh"), 0o755);
+    await writeFile(
+      join(workspaceRoot, "assets-remove.bin"),
+      Buffer.from([0, 1, 2, 3]),
+    );
+    await chmod(join(workspaceRoot, "assets-remove.bin"), 0o700);
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await rm(join(input.workingDirectory, "scripts/remove.sh"));
+          await rm(join(input.workingDirectory, "assets-remove.bin"));
+          await writeFile(
+            join(input.workingDirectory, "assets-create.bin"),
+            Buffer.from([0, 4, 5, 6]),
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToCreate: ["assets-create.bin"],
+        filesToModify: [],
+        filesToDelete: ["scripts/remove.sh", "assets-remove.bin"],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(result.git.diffAfter).toContain("deleted file mode 100755");
+    expect(result.git.diffAfter).toContain("new file mode 100644");
+    expect(result.git.diffAfter).toContain(
+      "Binary files /dev/null and b/assets-create.bin differ",
+    );
+    expect(result.git.diffAfter).toContain("deleted file mode 100700");
+    expect(result.git.diffAfter).toContain(
+      "Binary files a/assets-remove.bin and /dev/null differ",
+    );
+  });
+
   it("includes exact before/after patches for approved untracked modify and delete operations", async () => {
     const workspaceRoot = await temporaryWorkspace();
     await writeWorkspaceFile(

@@ -409,8 +409,9 @@ export function ExecuteWorkspace() {
             <div><dt>Status before</dt><dd>{git?.statusBefore || "Clean"}</dd></div>
             <div><dt>Status after</dt><dd>{git?.statusAfter || "No Git status evidence"}</dd></div>
           </dl>
+          {git?.note ? <p>{git.note}</p> : null}
           <div className="mutation-evidence__diff">
-            <h3>Diff after</h3>
+            <h3>Authoritative approved delta</h3>
             <pre>{git?.diffAfter || git?.note || "Git diff evidence is unavailable."}</pre>
             {git?.truncation.diffAfter.truncated ? (
               <p>

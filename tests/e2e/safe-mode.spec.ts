@@ -289,6 +289,15 @@ test("keeps the target unchanged until proposal approval, then applies one bound
   ).toBeVisible();
   await expect(page.getByText("safe-mode-fixture", { exact: true })).toBeVisible();
   await expect(page.getByText("M package.json", { exact: false })).toBeVisible();
+  await expect(
+    page.getByText(
+      "Git status is observational filename evidence; diff evidence is the authoritative executor-captured approved delta.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Authoritative approved delta" }),
+  ).toBeVisible();
   await expect(page.getByText("No auto-commit was created.", { exact: true })).toBeVisible();
 
   const packageRecord = JSON.parse(

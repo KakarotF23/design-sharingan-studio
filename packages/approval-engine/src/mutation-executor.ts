@@ -103,7 +103,6 @@ interface GitBefore {
   statusBefore: string;
   branchTruncation: GitEvidenceTruncation;
   statusBeforeTruncation: GitEvidenceTruncation;
-  trackedPaths?: ReadonlySet<string>;
   note?: string;
 }
 
@@ -928,7 +927,6 @@ async function runGit(
 
 async function captureGitBefore(
   rootPath: string,
-  records: readonly TargetRecord[],
 ): Promise<GitBefore> {
   const repository = await runGit(rootPath, [
     "rev-parse",
@@ -953,15 +951,9 @@ async function captureGitBefore(
       note: "Git metadata is unavailable for this project.",
     };
   }
-  const [branch, status, tracked] = await Promise.all([
+  const [branch, status] = await Promise.all([
     runGit(rootPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
     runGit(rootPath, ["status", "--porcelain=v1", "--untracked-files=all", "--", "."]),
-    runGit(rootPath, [
-      "ls-files",
-      "-z",
-      "--",
-      ...records.map((record) => record.relativePath),
-    ]),
   ]);
   return {
     available: true,
@@ -969,17 +961,8 @@ async function captureGitBefore(
     statusBefore: status.ok ? status.output : "Git status before was unavailable.",
     branchTruncation: branch.truncation,
     statusBeforeTruncation: status.truncation,
-    ...(tracked.ok && !tracked.truncation.truncated
-      ? {
-          trackedPaths: new Set(
-            tracked.output.split("\0").filter((path) => path.length > 0),
-          ),
-        }
-      : {}),
     ...(!status.ok ||
-    status.truncation.truncated ||
-    !tracked.ok ||
-    tracked.truncation.truncated
+    status.truncation.truncated
       ? { note: "Some Git before-state evidence was unavailable." }
       : {}),
   };
@@ -990,42 +973,35 @@ async function captureGitAfter(
   before: GitBefore,
   deltas: readonly DeltaRecord[],
 ): Promise<GitMutationEvidence> {
+  const authoritativeDelta = deltas.map(renderApprovedFileDiff).join("\n");
+  const diffAfter = boundedUtf8(
+    redactSensitiveGitOutput(authoritativeDelta),
+    MAX_GIT_OUTPUT_BYTES,
+  );
+  const authorityNote =
+    "Git status is observational filename evidence; diff evidence is the authoritative executor-captured approved delta.";
   if (!before.available) {
     return {
       available: false,
       statusBefore: before.statusBefore,
       statusAfter: "",
-      diffAfter: "",
+      diffAfter: diffAfter.value,
       truncation: {
         branch: { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 },
         statusBefore: { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 },
         statusAfter: { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 },
-        diffAfter: { truncated: false, limitBytes: MAX_GIT_OUTPUT_BYTES, originalBytes: 0, retainedBytes: 0 },
+        diffAfter: diffAfter.truncation,
       },
-      note: before.note,
+      note: `${authorityNote} ${before.note ?? "Git metadata is unavailable for this project."}`,
     };
   }
-  const [status, diff] = await Promise.all([
-    runGit(rootPath, ["status", "--porcelain=v1", "--untracked-files=all", "--", "."]),
-    runGit(rootPath, [
-      "diff",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--",
-      ...deltas.map((delta) => delta.relativePath),
-    ]),
+  const status = await runGit(rootPath, [
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+    "--",
+    ".",
   ]);
-  const untrackedEvidence = deltas
-    .filter(
-      (delta) =>
-        before.trackedPaths !== undefined &&
-        !before.trackedPaths.has(delta.relativePath),
-    )
-    .map(renderUntrackedFileDiff)
-    .join("\n");
-  const exactDiff = [diff.ok ? diff.output : "", untrackedEvidence]
-    .filter((part) => part !== "")
-    .join("\n");
   const branch =
     before.branch === undefined
       ? undefined
@@ -1037,14 +1013,6 @@ async function captureGitAfter(
   const statusAfter = status.ok
     ? boundedUtf8(redactSensitiveGitOutput(status.output), MAX_GIT_OUTPUT_BYTES)
     : boundedUtf8("Git status after was unavailable.", MAX_GIT_OUTPUT_BYTES);
-  const diffAfter = diff.ok
-    ? boundedUtf8(redactSensitiveGitOutput(exactDiff), MAX_GIT_OUTPUT_BYTES)
-    : boundedUtf8("Git diff after was unavailable.", MAX_GIT_OUTPUT_BYTES);
-  const untrackedEvidenceBytes = Buffer.byteLength(untrackedEvidence, "utf8");
-  const exactDiffSourceBytes =
-    diff.truncation.originalBytes +
-    (diff.output !== "" && untrackedEvidence !== "" ? 1 : 0) +
-    untrackedEvidenceBytes;
   return {
     available: true,
     branch: branch?.value,
@@ -1067,21 +1035,16 @@ async function captureGitAfter(
         status.truncation,
         statusAfter.truncation,
       ),
-      diffAfter: mergeTruncation(
-        diff.truncation,
-        diffAfter.truncation,
-        exactDiffSourceBytes,
-      ),
+      diffAfter: diffAfter.truncation,
     },
     ...(!status.ok ||
-    status.truncation.truncated ||
-    !diff.ok ||
-    diff.truncation.truncated ||
-    before.trackedPaths === undefined
-      ? { note: "Some Git after-state evidence was unavailable or exceeded bounds." }
+    status.truncation.truncated
+      ? {
+          note: `${authorityNote} Some Git status evidence was unavailable or exceeded bounds.`,
+        }
       : before.note === undefined
-        ? {}
-        : { note: before.note }),
+        ? { note: authorityNote }
+        : { note: `${authorityNote} ${before.note}` }),
   };
 }
 
@@ -1101,7 +1064,11 @@ function linesForEvidence(contents: string): string[] {
     : contents.split("\n");
 }
 
-function renderUntrackedFileDiff(delta: DeltaRecord): string {
+function gitFileMode(mode: number): string {
+  return `100${(mode & 0o777).toString(8).padStart(3, "0")}`;
+}
+
+function renderApprovedFileDiff(delta: DeltaRecord): string {
   const before =
     delta.operation === "create"
       ? undefined
@@ -1110,12 +1077,28 @@ function renderUntrackedFileDiff(delta: DeltaRecord): string {
     delta.operation === "delete"
       ? undefined
       : decodeText(delta.nextContents as Uint8Array);
+  const beforeMode =
+    delta.operation === "create"
+      ? undefined
+      : gitFileMode(delta.originalMode as number);
+  const afterMode =
+    delta.operation === "delete"
+      ? undefined
+      : gitFileMode(delta.operation === "create" ? 0o644 : delta.originalMode as number);
+  const modeEvidence = [
+    ...(delta.operation === "create" ? [`new file mode ${afterMode}`] : []),
+    ...(delta.operation === "delete" ? [`deleted file mode ${beforeMode}`] : []),
+    ...(delta.operation === "modify"
+      ? [`old mode ${beforeMode}`, `new mode ${afterMode}`]
+      : []),
+  ];
   if (
     (delta.operation !== "create" && before === undefined) ||
     (delta.operation !== "delete" && after === undefined)
   ) {
     return [
       `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
+      ...modeEvidence,
       `Binary files ${
         delta.operation === "create" ? "/dev/null" : `a/${delta.relativePath}`
       } and ${
@@ -1127,8 +1110,7 @@ function renderUntrackedFileDiff(delta: DeltaRecord): string {
   const afterLines = after === undefined ? [] : linesForEvidence(after);
   return [
     `diff --git a/${delta.relativePath} b/${delta.relativePath}`,
-    ...(delta.operation === "create" ? ["new file mode 100644"] : []),
-    ...(delta.operation === "delete" ? ["deleted file mode 100644"] : []),
+    ...modeEvidence,
     delta.operation === "create" ? "--- /dev/null" : `--- a/${delta.relativePath}`,
     delta.operation === "delete" ? "+++ /dev/null" : `+++ b/${delta.relativePath}`,
     `@@ -${beforeLines.length === 0 ? "0,0" : `1,${beforeLines.length}`} +${
@@ -1228,7 +1210,7 @@ export class MutationExecutor {
       const rootPath = await canonicalWorkspaceRoot(this.options.workspaceRoot);
       claim = await acquireExecutionClaim(rootPath, input.proposal.id);
       const targetRecords = await captureTargetRecords(rootPath, requestedRecords);
-      const gitBefore = await captureGitBefore(rootPath, targetRecords);
+      const gitBefore = await captureGitBefore(rootPath);
       mirrorRoot = await mkdtemp(
         join(await realpath(tmpdir()), "design-sharingan-mutation-"),
       );
