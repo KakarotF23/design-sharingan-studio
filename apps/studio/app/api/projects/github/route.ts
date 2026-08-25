@@ -7,7 +7,7 @@ import {
 } from "@design-sharingan/project-adapters";
 import { NextResponse } from "next/server";
 import {
-  encodeProjectLocator,
+  createProjectLocator,
   PROJECT_LOCATOR_COOKIE,
 } from "../../../../features/projects/project-locator";
 import type { StudioProjectState } from "../../../../features/projects/project-state";
@@ -77,7 +77,7 @@ export async function POST(request: Request): Promise<Response> {
     const response = NextResponse.json({ project });
     response.cookies.set(
       PROJECT_LOCATOR_COOKIE,
-      encodeProjectLocator(workspace.rootPath),
+      await createProjectLocator(project.id, workspace.rootPath),
       {
         httpOnly: true,
         sameSite: "strict",

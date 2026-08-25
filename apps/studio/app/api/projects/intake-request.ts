@@ -17,24 +17,70 @@ function hasJsonMediaType(request: Request): boolean {
   return contentType.split(";", 1)[0]?.trim().toLowerCase() === "application/json";
 }
 
-function isSameOrigin(request: Request): boolean {
-  const origin = request.headers.get("origin");
-  const requestUrl = new URL(request.url);
-  const requestOrigins = new Set([requestUrl.origin]);
-  const requestHost = request.headers.get("host");
-  if (requestHost !== null) {
-    requestOrigins.add(`${requestUrl.protocol}//${requestHost}`);
+function localListenerOrigin(request: Request): string | undefined {
+  if (request.headers.get("forwarded") !== null) return undefined;
+
+  const protocol = new URL(request.url).protocol;
+  if (protocol !== "http:" && protocol !== "https:") return undefined;
+
+  const authority = request.headers.get("host");
+  if (
+    authority === null ||
+    authority.length === 0 ||
+    authority.length > 255 ||
+    /[\s\0\r\n,@/?#\\]/.test(authority)
+  ) {
+    return undefined;
   }
+
+  const match = /^(localhost|127\.0\.0\.1|\[::1\])(?::([1-9]\d{0,4}))?$/i.exec(
+    authority,
+  );
+  if (match === null) return undefined;
+
+  const port = match[2];
+  if (port !== undefined && Number(port) > 65_535) return undefined;
+
+  const hostname = (match[1] as string).toLowerCase();
+  const forwardedHost = request.headers.get("x-forwarded-host");
+  const forwardedPort = request.headers.get("x-forwarded-port");
+  const forwardedProtocol = request.headers.get("x-forwarded-proto");
+  if (
+    (forwardedHost !== null &&
+      forwardedHost.toLowerCase() !== authority.toLowerCase()) ||
+    (forwardedPort !== null &&
+      forwardedPort !== (port ?? (protocol === "https:" ? "443" : "80"))) ||
+    (forwardedProtocol !== null &&
+      forwardedProtocol.toLowerCase() !== protocol.slice(0, -1))
+  ) {
+    return undefined;
+  }
+  return `${protocol}//${hostname}${port === undefined ? "" : `:${port}`}`;
+}
+
+function isSameOrigin(request: Request): boolean {
+  const listenerOrigin = localListenerOrigin(request);
+  if (listenerOrigin === undefined) return false;
+
+  const origin = request.headers.get("origin");
   try {
     if (origin !== null) {
       const parsedOrigin = new URL(origin);
       return (
-        origin === parsedOrigin.origin && requestOrigins.has(parsedOrigin.origin)
+        parsedOrigin.username === "" &&
+        parsedOrigin.password === "" &&
+        origin === parsedOrigin.origin && parsedOrigin.origin === listenerOrigin
       );
     }
 
     const referer = request.headers.get("referer");
-    return referer !== null && requestOrigins.has(new URL(referer).origin);
+    if (referer === null) return false;
+    const parsedReferer = new URL(referer);
+    return (
+      parsedReferer.username === "" &&
+      parsedReferer.password === "" &&
+      parsedReferer.origin === listenerOrigin
+    );
   } catch {
     return false;
   }

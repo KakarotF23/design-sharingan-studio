@@ -1,12 +1,9 @@
-import {
-  detectProject,
-  loadProjectMetadata,
-} from "@design-sharingan/project-adapters";
+import { detectProject } from "@design-sharingan/project-adapters";
 import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import {
-  decodeProjectLocator,
   PROJECT_LOCATOR_COOKIE,
+  resolveProjectLocator,
 } from "../../../features/projects/project-locator";
 import { ProjectShell } from "../../../features/projects/project-shell";
 import type { StudioProjectState } from "../../../features/projects/project-state";
@@ -25,16 +22,12 @@ export default async function ProjectLayout({
   const { projectId } = await params;
   if (!validProjectId(projectId)) notFound();
 
-  const encodedLocator = (await cookies()).get(PROJECT_LOCATOR_COOKIE)?.value;
-  const rootPath =
-    encodedLocator === undefined
-      ? undefined
-      : decodeProjectLocator(encodedLocator);
-  if (rootPath === undefined) notFound();
+  const locator = (await cookies()).get(PROJECT_LOCATOR_COOKIE)?.value;
+  if (locator === undefined) notFound();
 
   let project: StudioProjectState;
   try {
-    const persisted = await loadProjectMetadata(rootPath, projectId);
+    const persisted = await resolveProjectLocator(locator, projectId);
     const detection = await detectProject(persisted.rootPath);
     if (detection.rootPath !== persisted.rootPath) {
       throw new Error("Detected project root changed");
@@ -43,10 +36,14 @@ export default async function ProjectLayout({
       id: persisted.id,
       name: persisted.name,
       sourceType: persisted.sourceType,
-      status: persisted.status,
-      framework: persisted.framework,
-      packageManager: persisted.packageManager,
-      devCommand: persisted.devCommand,
+      status:
+        detection.devCommand !== undefined &&
+        detection.renderTarget !== undefined
+          ? "READY"
+          : "NEEDS_CONFIGURATION",
+      framework: detection.framework,
+      packageManager: detection.packageManager,
+      devCommand: detection.devCommand,
       capabilities: detection.capabilities,
     };
   } catch {

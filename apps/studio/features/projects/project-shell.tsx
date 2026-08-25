@@ -51,7 +51,18 @@ export function ProjectShell({
       { label: "Source", value: project.sourceType },
       { label: "Framework", value: project.framework ?? "Unknown" },
       { label: "Mode", value: "Safe" },
-      { label: "Evidence", value: "Not collected" },
+      {
+        label: "Runtime",
+        value: project.capabilities.canRun
+          ? "Runtime available"
+          : "Runtime unavailable",
+      },
+      {
+        label: "Render",
+        value: project.capabilities.canRender
+          ? "Render available"
+          : "Render unavailable",
+      },
     ],
     [definition.title, project],
   );
@@ -62,7 +73,11 @@ export function ProjectShell({
         project={project}
         activePath={pathname}
         context={context}
-        activityStatus="Project ready for a deliberate next action"
+        activityStatus={
+          project.status === "READY"
+            ? "Project ready for a deliberate next action"
+            : "Project configuration required before execution"
+        }
       >
         {children}
       </StudioShell>

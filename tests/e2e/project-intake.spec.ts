@@ -1,16 +1,29 @@
-import { cp, lstat, mkdtemp, rm } from "node:fs/promises";
+import {
+  cp,
+  lstat,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, test } from "@playwright/test";
+import { readIntakeJson } from "../../apps/studio/app/api/projects/intake-request";
 
 let sandboxPath: string;
 let localProjectPath: string;
 let guardedProjectPath: string;
+let refreshProjectPath: string;
+
+const stateRoot = "/private/tmp/design-sharingan-studio-e2e-state";
 
 test.beforeAll(async () => {
   sandboxPath = await mkdtemp(join(tmpdir(), "design-sharingan-intake-e2e-"));
   localProjectPath = join(sandboxPath, "next-basic");
   guardedProjectPath = join(sandboxPath, "guarded-next-basic");
+  refreshProjectPath = join(sandboxPath, "refresh-next-basic");
+  await rm(stateRoot, { force: true, recursive: true });
   await cp(
     resolve(process.cwd(), "tests/fixtures/next-basic"),
     localProjectPath,
@@ -21,10 +34,16 @@ test.beforeAll(async () => {
     guardedProjectPath,
     { recursive: true },
   );
+  await cp(
+    resolve(process.cwd(), "tests/fixtures/next-basic"),
+    refreshProjectPath,
+    { recursive: true },
+  );
 });
 
 test.afterAll(async () => {
   await rm(sandboxPath, { force: true, recursive: true });
+  await rm(stateRoot, { force: true, recursive: true });
 });
 
 test("landing routes both project sources into one intake workspace", async ({
@@ -82,6 +101,33 @@ test("local intake scans a copied fixture and opens its Studio overview", async 
     .getAttribute("href");
   expect(studioPath).toMatch(/^\/projects\/[a-f0-9-]+\/overview$/);
 
+  const projectId = (studioPath as string).split("/")[2] as string;
+  const locatorCookie = (await page.context().cookies()).find(
+    (cookie) => cookie.name === "design-sharingan-project",
+  );
+  expect(locatorCookie).toBeDefined();
+  expect(locatorCookie?.httpOnly).toBe(true);
+  expect(locatorCookie?.sameSite).toBe("Strict");
+  expect(locatorCookie?.path).toBe(`/projects/${projectId}`);
+  expect(locatorCookie?.value).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect(
+    Buffer.from(locatorCookie?.value ?? "", "base64url").toString("utf8"),
+  ).not.toContain(localProjectPath);
+
+  const stateRootEntry = await lstat(stateRoot);
+  expect(stateRootEntry.isDirectory()).toBe(true);
+  expect(stateRootEntry.mode & 0o077).toBe(0);
+  const locatorFiles = await readdir(stateRoot);
+  expect(locatorFiles).toContain(`${locatorCookie?.value}.json`);
+  const locatorPath = join(stateRoot, `${locatorCookie?.value}.json`);
+  const locatorEntry = await lstat(locatorPath);
+  expect(locatorEntry.isFile()).toBe(true);
+  expect(locatorEntry.isSymbolicLink()).toBe(false);
+  expect(locatorEntry.mode & 0o077).toBe(0);
+  const locatorRecord = await readFile(locatorPath, "utf8");
+  expect(locatorRecord).toContain(`\"projectId\":\"${projectId}\"`);
+  expect(locatorRecord).toContain(localProjectPath);
+
   const directPage = await page.context().newPage();
   const directResponse = await directPage.goto(studioPath as string);
   expect(directResponse?.status()).toBe(200);
@@ -104,6 +150,74 @@ test("local intake scans a copied fixture and opens its Studio overview", async 
     "/projects/unknown-project-id/overview",
   );
   expect(unknownResponse?.status()).toBe(404);
+
+  const cookiePath = `/projects/${projectId}`;
+  const locator = locatorCookie?.value as string;
+  const tamperedLocator = `${locator.slice(0, -1)}${
+    locator.endsWith("A") ? "B" : "A"
+  }`;
+  await page.context().addCookies([
+    {
+      name: "design-sharingan-project",
+      value: tamperedLocator,
+      domain: "127.0.0.1",
+      path: cookiePath,
+      httpOnly: true,
+      sameSite: "Strict",
+    },
+  ]);
+  const tamperedResponse = await page.goto(studioPath as string);
+  expect(tamperedResponse?.status()).toBe(404);
+
+  await page.context().addCookies([
+    {
+      name: "design-sharingan-project",
+      value: "A".repeat(43),
+      domain: "127.0.0.1",
+      path: cookiePath,
+      httpOnly: true,
+      sameSite: "Strict",
+    },
+  ]);
+  const unknownLocatorResponse = await page.goto(studioPath as string);
+  expect(unknownLocatorResponse?.status()).toBe(404);
+});
+
+test("Studio derives readiness and execution capabilities from a fresh scan", async ({
+  page,
+}) => {
+  await page.goto("/projects?source=local");
+  await page.getByLabel("Project folder path").fill(refreshProjectPath);
+  await page.getByRole("button", { name: "Scan project" }).click();
+  const studioPath = await page
+    .getByRole("link", { name: "Open Studio" })
+    .getAttribute("href");
+  expect(studioPath).not.toBeNull();
+
+  await rm(join(refreshProjectPath, "package.json"));
+  const response = await page.goto(studioPath as string);
+  expect(response?.status()).toBe(200);
+  await expect(
+    page.locator(".ds-sidebar__project").getByText("Needs configuration"),
+  ).toBeVisible();
+  await expect(
+    page.locator(".ds-context").getByText("Unknown", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".ds-context").getByText("Runtime unavailable", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".ds-context").getByText("Render unavailable", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Project configuration required before execution", {
+      exact: true,
+    }),
+  ).toBeVisible();
 });
 
 test("intake routes reject untrusted request envelopes before project work", async ({
@@ -126,6 +240,26 @@ test("intake routes reject untrusted request envelopes before project work", asy
       },
     });
     expect(crossOrigin.status()).toBe(403);
+
+    const forgedAuthority = await request.post(`/api/projects/${endpoint}`, {
+      data: body,
+      headers: {
+        "content-type": "application/json",
+        host: "attacker.example",
+        origin: "http://attacker.example",
+      },
+    });
+    expect(forgedAuthority.status()).toBe(403);
+
+    const forwardedAuthority = await request.post(`/api/projects/${endpoint}`, {
+      data: body,
+      headers: {
+        "content-type": "application/json",
+        origin: sameOrigin,
+        "x-forwarded-host": "attacker.example",
+      },
+    });
+    expect(forwardedAuthority.status()).toBe(403);
 
     const wrongMedia = await request.post(`/api/projects/${endpoint}`, {
       data: body,
@@ -164,6 +298,119 @@ test("intake routes reject untrusted request envelopes before project work", asy
     },
   });
   expect(parameterizedJson.status()).toBe(200);
+});
+
+test("intake guard rejects malformed authority and bounds a chunked body", async () => {
+  const headers = {
+    "content-type": "application/json",
+    host: "localhost:3000, attacker.example",
+    origin: "http://localhost:3000",
+  };
+  const malformedAuthority = await readIntakeJson(
+    new Request("http://localhost:3000/api/projects/local", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ rootPath: guardedProjectPath }),
+    }),
+  );
+  expect(malformedAuthority.ok).toBe(false);
+  if (!malformedAuthority.ok) {
+    expect(malformedAuthority.response.status).toBe(403);
+  }
+
+  const nonLoopbackAuthority = await readIntakeJson(
+    new Request("http://workspace.example/api/projects/local", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        host: "workspace.example",
+        origin: "http://workspace.example",
+      },
+      body: JSON.stringify({ rootPath: guardedProjectPath }),
+    }),
+  );
+  expect(nonLoopbackAuthority.ok).toBe(false);
+  if (!nonLoopbackAuthority.ok) {
+    expect(nonLoopbackAuthority.response.status).toBe(403);
+  }
+
+  const forwardedAuthority = await readIntakeJson(
+    new Request("http://localhost:3000/api/projects/local", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        host: "localhost:3000",
+        origin: "http://localhost:3000",
+        forwarded: "host=attacker.example;proto=https",
+      },
+      body: JSON.stringify({ rootPath: guardedProjectPath }),
+    }),
+  );
+  expect(forwardedAuthority.ok).toBe(false);
+  if (!forwardedAuthority.ok) {
+    expect(forwardedAuthority.response.status).toBe(403);
+  }
+
+  const refererFallback = await readIntakeJson(
+    new Request("http://localhost:3000/api/projects/local", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        host: "localhost:3000",
+        referer: "http://localhost:3000/projects?source=local",
+      },
+      body: JSON.stringify({ rootPath: guardedProjectPath }),
+    }),
+  );
+  expect(refererFallback.ok).toBe(true);
+
+  const credentialedReferer = await readIntakeJson(
+    new Request("http://localhost:3000/api/projects/local", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        host: "localhost:3000",
+        referer: "http://attacker@localhost:3000/projects",
+      },
+      body: JSON.stringify({ rootPath: guardedProjectPath }),
+    }),
+  );
+  expect(credentialedReferer.ok).toBe(false);
+  if (!credentialedReferer.ok) {
+    expect(credentialedReferer.response.status).toBe(403);
+  }
+
+  const chunk = new TextEncoder().encode("x".repeat(4096));
+  let emitted = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (emitted === 5) {
+        controller.close();
+        return;
+      }
+      emitted += 1;
+      controller.enqueue(chunk);
+    },
+  });
+  const streamedRequest = new Request(
+    "http://localhost:3000/api/projects/local",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        host: "localhost:3000",
+        origin: "http://localhost:3000",
+      },
+      body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" },
+  );
+  expect(streamedRequest.headers.has("content-length")).toBe(false);
+  const streamedResult = await readIntakeJson(streamedRequest);
+  expect(streamedResult.ok).toBe(false);
+  if (!streamedResult.ok) {
+    expect(streamedResult.response.status).toBe(413);
+  }
 });
 
 test("GitHub intake keeps authentication explicitly ephemeral", async ({

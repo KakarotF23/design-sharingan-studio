@@ -2,7 +2,7 @@ import { isAbsolute } from "node:path";
 import { LocalProjectAdapter } from "@design-sharingan/project-adapters";
 import { NextResponse } from "next/server";
 import {
-  encodeProjectLocator,
+  createProjectLocator,
   PROJECT_LOCATOR_COOKIE,
 } from "../../../../features/projects/project-locator";
 import type { StudioProjectState } from "../../../../features/projects/project-state";
@@ -14,17 +14,21 @@ function bodyObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function projectResponse(
+async function projectResponse(
   project: StudioProjectState,
   rootPath: string,
-): Response {
+): Promise<Response> {
   const response = NextResponse.json({ project });
-  response.cookies.set(PROJECT_LOCATOR_COOKIE, encodeProjectLocator(rootPath), {
-    httpOnly: true,
-    sameSite: "strict",
-    path: `/projects/${encodeURIComponent(project.id)}`,
-    priority: "high",
-  });
+  response.cookies.set(
+    PROJECT_LOCATOR_COOKIE,
+    await createProjectLocator(project.id, rootPath),
+    {
+      httpOnly: true,
+      sameSite: "strict",
+      path: `/projects/${encodeURIComponent(project.id)}`,
+      priority: "high",
+    },
+  );
   return response;
 }
 
@@ -55,7 +59,7 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     const workspace = await new LocalProjectAdapter().open(rootPath);
-    return projectResponse(
+    return await projectResponse(
       {
         id: workspace.id,
         name: workspace.name,
