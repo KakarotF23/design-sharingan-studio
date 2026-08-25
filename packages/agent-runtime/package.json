@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit --project tsconfig.json"
   },
   "dependencies": {
-    "@openai/codex-sdk": "latest"
+    "@openai/codex-sdk": "0.149.0"
   },
   "devDependencies": {
     "@types/node": "latest",

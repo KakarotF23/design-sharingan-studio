@@ -130,15 +130,22 @@ export class CodexAgent {
         throw new Error("Codex did not return a thread id.");
       }
 
-      const finalResponse = this.redact(turn.finalResponse);
+      const structured =
+        input.outputSchema === undefined
+          ? null
+          : (redactValue(
+              JSON.parse(turn.finalResponse),
+              this.redact,
+            ) as TStructured);
+      const finalResponse =
+        input.outputSchema === undefined
+          ? this.redact(turn.finalResponse)
+          : JSON.stringify(structured);
 
       return {
         threadId,
         finalResponse,
-        structured:
-          input.outputSchema === undefined
-            ? null
-            : (JSON.parse(finalResponse) as TStructured),
+        structured,
         items: redactValue(turn.items, this.redact) as ThreadItem[],
       };
     } catch (error) {
@@ -161,15 +168,63 @@ function createSecretRedactor(
     ...new Set(
       keys
         .map((key) => environment[key])
-        .filter((value): value is string => Boolean(value)),
+        .filter((value): value is string => value !== undefined && value !== ""),
     ),
-  ].sort((left, right) => right.length - left.length);
+  ];
+  const alternatives = [
+    ...new Set(
+      secrets.flatMap((secret) => {
+        const encoded = JSON.stringify(secret);
+        return [encoded, encoded.slice(1, -1), secret];
+      }),
+    ),
+  ].filter((value) => value !== "");
 
-  return (value) =>
-    secrets.reduce(
-      (redacted, secret) => redacted.split(secret).join("[REDACTED]"),
-      value,
-    );
+  alternatives.sort((left, right) => {
+    const byLength = right.length - left.length;
+    if (byLength !== 0) {
+      return byLength;
+    }
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+
+  if (alternatives.length === 0) {
+    return (value) => value;
+  }
+
+  const marker = selectSafeMarker(alternatives);
+  const matcher = new RegExp(alternatives.map(escapeRegExp).join("|"), "g");
+
+  return (value) => {
+    const redacted = value.replace(matcher, () => marker);
+    return alternatives.some((secret) => redacted.includes(secret))
+      ? ""
+      : redacted;
+  };
+}
+
+function selectSafeMarker(secrets: readonly string[]): string {
+  const separators = ["\u2063", "\u2064", "\u2062", "\u2061"];
+  const labels = ["[REDACTED]", "[FILTERED]", "<hidden>", "***"];
+
+  for (const separator of separators) {
+    if (secrets.some((secret) => secret.includes(separator))) {
+      continue;
+    }
+
+    for (const label of labels) {
+      const candidate = `${separator}${label}${separator}`;
+      if (secrets.every((secret) => !candidate.includes(secret))) {
+        return candidate;
+      }
+    }
+  }
+
+  return "";
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function redactValue(
@@ -185,7 +240,7 @@ function redactValue(
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value).map(([key, entry]) => [
-        key,
+        redact(key),
         redactValue(entry, redact),
       ]),
     );

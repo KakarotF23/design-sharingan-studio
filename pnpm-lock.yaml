@@ -43,7 +43,7 @@ importers:
   packages/agent-runtime:
     dependencies:
       '@openai/codex-sdk':
-        specifier: latest
+        specifier: 0.149.0
         version: 0.149.0
     devDependencies:
       '@types/node':
