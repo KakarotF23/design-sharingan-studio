@@ -58,7 +58,7 @@ function localListenerOrigin(request: Request): string | undefined {
   return `${protocol}//${hostname}${port === undefined ? "" : `:${port}`}`;
 }
 
-function isSameOrigin(request: Request): boolean {
+export function isSameOriginRequest(request: Request): boolean {
   const listenerOrigin = localListenerOrigin(request);
   if (listenerOrigin === undefined) return false;
 
@@ -86,7 +86,10 @@ function isSameOrigin(request: Request): boolean {
   }
 }
 
-async function readBoundedBody(request: Request): Promise<Uint8Array | undefined> {
+export async function readBoundedRequestBody(
+  request: Request,
+  maxBytes: number,
+): Promise<Uint8Array | undefined> {
   if (request.body === null) return new Uint8Array();
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -97,7 +100,7 @@ async function readBoundedBody(request: Request): Promise<Uint8Array | undefined
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_INTAKE_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel().catch(() => undefined);
         return undefined;
       }
@@ -122,7 +125,7 @@ export async function readIntakeJson(
   if (!hasJsonMediaType(request)) {
     return rejected(415, "Project intake requires JSON.");
   }
-  if (!isSameOrigin(request)) {
+  if (!isSameOriginRequest(request)) {
     return rejected(403, "Project intake request was rejected.");
   }
 
@@ -136,7 +139,7 @@ export async function readIntakeJson(
     }
   }
 
-  const bytes = await readBoundedBody(request);
+  const bytes = await readBoundedRequestBody(request, MAX_INTAKE_BYTES);
   if (bytes === undefined) {
     return rejected(413, "Project intake request is too large.");
   }

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize } from "node:path";
 import type { Project } from "@design-sharingan/core";
@@ -62,6 +62,28 @@ async function validateStateDirectory(create: boolean): Promise<string> {
     throw new Error("Project locator state directory is not private");
   }
   return rootPath;
+}
+
+export async function createAnalysisStagingDirectory(): Promise<string> {
+  const stateRoot = await validateStateDirectory(true);
+  const analysisRoot = join(stateRoot, "analysis");
+  await mkdir(/* turbopackIgnore: true */ analysisRoot, {
+    mode: 0o700,
+  }).catch(async (error: unknown) => {
+    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) {
+      throw error;
+    }
+  });
+  const entry = await lstat(/* turbopackIgnore: true */ analysisRoot);
+  if (
+    entry.isSymbolicLink() ||
+    !entry.isDirectory() ||
+    (entry.mode & 0o077) !== 0 ||
+    (await realpath(/* turbopackIgnore: true */ analysisRoot)) !== analysisRoot
+  ) {
+    throw new Error("Analysis state directory is not private");
+  }
+  return mkdtemp(/* turbopackIgnore: true */ join(analysisRoot, "scan-"));
 }
 
 async function canonicalProjectRoot(rootPath: string): Promise<string> {

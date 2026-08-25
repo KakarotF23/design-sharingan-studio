@@ -1,5 +1,5 @@
-import { WorkspacePlaceholder } from "../../../../features/projects/workspace-placeholder";
+import { ScanWorkspace } from "../../../../features/learn/scan-workspace";
 
 export default function LearnPage() {
-  return <WorkspacePlaceholder workspace="learn" />;
+  return <ScanWorkspace />;
 }

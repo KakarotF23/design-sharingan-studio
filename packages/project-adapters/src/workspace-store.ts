@@ -3,6 +3,7 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   unlink,
@@ -11,6 +12,7 @@ import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, extname, join } from "node:path";
 import type {
+  DesignDNA,
   DesignSession,
   Project,
   Reference,
@@ -19,6 +21,8 @@ import type {
 import { assertPathInsideWorkspace } from "./path-policy";
 
 const MACHINE_DIRECTORY = ".design-sharingan";
+const MAX_REFERENCE_BYTES = 10 * 1024 * 1024;
+const MAX_RECORD_BYTES = 1024 * 1024;
 
 export interface DesignWorkspace {
   rootPath: string;
@@ -518,19 +522,55 @@ async function loadValidatedProjectContext(
   return workspace;
 }
 
-function extensionForReference(reference: Reference): string {
-  switch (reference.type.toLowerCase()) {
-    case "image/png":
-      return ".png";
-    case "image/jpeg":
-      return ".jpg";
-    case "image/webp":
-      return ".webp";
-    case "image/gif":
-      return ".gif";
-    default:
-      return ".bin";
+export function validateReferenceImage(
+  declaredMime: string,
+  bytes: Uint8Array,
+): ".png" | ".jpg" | ".webp" | ".gif" {
+  if (bytes.byteLength === 0) {
+    throw new Error("Reference image must not be empty");
   }
+  if (bytes.byteLength > MAX_REFERENCE_BYTES) {
+    throw new Error("Reference image must be no larger than 10 MiB");
+  }
+
+  const signatures: Readonly<
+    Record<"image/png" | "image/jpeg" | "image/webp" | "image/gif", boolean>
+  > = {
+    "image/png":
+      bytes.byteLength >= 8 &&
+      [137, 80, 78, 71, 13, 10, 26, 10].every(
+        (value, index) => bytes[index] === value,
+      ),
+    "image/jpeg":
+      bytes.byteLength >= 3 &&
+      bytes[0] === 0xff &&
+      bytes[1] === 0xd8 &&
+      bytes[2] === 0xff,
+    "image/webp":
+      bytes.byteLength >= 12 &&
+      new TextDecoder("ascii").decode(bytes.subarray(0, 4)) === "RIFF" &&
+      new TextDecoder("ascii").decode(bytes.subarray(8, 12)) === "WEBP",
+    "image/gif":
+      bytes.byteLength >= 6 &&
+      ["GIF87a", "GIF89a"].includes(
+        new TextDecoder("ascii").decode(bytes.subarray(0, 6)),
+      ),
+  };
+
+  if (!(declaredMime in signatures)) {
+    throw new Error("Reference image must be PNG, JPEG, WebP, or GIF");
+  }
+  const mime = declaredMime as keyof typeof signatures;
+  if (!signatures[mime]) {
+    throw new Error("Reference image signature does not match its declared MIME");
+  }
+  return mime === "image/png"
+    ? ".png"
+    : mime === "image/jpeg"
+      ? ".jpg"
+      : mime === "image/webp"
+        ? ".webp"
+        : ".gif";
 }
 
 export async function saveReferenceArtifact(
@@ -543,15 +583,20 @@ export async function saveReferenceArtifact(
     rootPath,
     reference.projectId,
   );
+  const artifactExtension = validateReferenceImage(reference.type, bytes);
   const referencePath = assertPathInsideWorkspace(
     workspace.referencesPath,
     join(workspace.referencesPath, reference.id),
   );
-  await mkdir(referencePath, { recursive: true });
+  await validateFixedDirectory(
+    workspace.referencesPath,
+    referencePath,
+    "Reference directory",
+  );
 
   const artifactPath = assertPathInsideWorkspace(
     referencePath,
-    join(referencePath, `artifact${extensionForReference(reference)}`),
+    join(referencePath, `artifact${artifactExtension}`),
   );
   const metadataPath = assertPathInsideWorkspace(
     referencePath,
@@ -565,6 +610,256 @@ export async function saveReferenceArtifact(
   });
 
   return { artifactPath, metadataPath };
+}
+
+async function readBoundedJsonFile(path: string, label: string): Promise<unknown> {
+  const pathEntry = await lstat(path);
+  if (
+    pathEntry.isSymbolicLink() ||
+    !pathEntry.isFile() ||
+    pathEntry.size > MAX_RECORD_BYTES
+  ) {
+    throw new Error(`${label} is invalid`);
+  }
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const handleEntry = await handle.stat();
+    if (
+      !handleEntry.isFile() ||
+      handleEntry.dev !== pathEntry.dev ||
+      handleEntry.ino !== pathEntry.ino ||
+      handleEntry.size > MAX_RECORD_BYTES
+    ) {
+      throw new Error(`${label} changed while reading`);
+    }
+    return JSON.parse(await handle.readFile({ encoding: "utf8" })) as unknown;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function isPersistedReference(value: unknown): value is Reference {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const reference = value as Partial<Reference>;
+  return (
+    typeof reference.id === "string" &&
+    typeof reference.projectId === "string" &&
+    typeof reference.title === "string" &&
+    typeof reference.type === "string" &&
+    typeof reference.source === "string" &&
+    (reference.imagePath === undefined || typeof reference.imagePath === "string") &&
+    (reference.notes === undefined || typeof reference.notes === "string") &&
+    isStringArray(reference.likes) &&
+    isStringArray(reference.dislikes) &&
+    isStringArray(reference.tags) &&
+    ["UPLOADED", "PROCESSING", "READY", "ANALYZED", "ASSIMILATED"].includes(
+      reference.analysisStatus ?? "",
+    ) &&
+    (reference.compatibility === undefined ||
+      typeof reference.compatibility === "string") &&
+    typeof reference.createdAt === "string"
+  );
+}
+
+function isPersistedSession(value: unknown): value is DesignSession {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const session = value as Partial<DesignSession>;
+  return (
+    typeof session.id === "string" &&
+    typeof session.projectId === "string" &&
+    typeof session.type === "string" &&
+    typeof session.status === "string" &&
+    typeof session.createdAt === "string" &&
+    typeof session.updatedAt === "string"
+  );
+}
+
+function isPersistedDesignDNA(value: unknown): value is DesignDNA {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const designDNA = value as Partial<DesignDNA>;
+  return (
+    typeof designDNA.id === "string" &&
+    [
+      designDNA.referenceIds,
+      designDNA.hierarchy,
+      designDNA.layout,
+      designDNA.spacing,
+      designDNA.typography,
+      designDNA.colorLogic,
+      designDNA.componentGeometry,
+      designDNA.navigation,
+      designDNA.interaction,
+      designDNA.motion,
+      designDNA.density,
+      designDNA.emotionalTone,
+      designDNA.visualWeight,
+      designDNA.keep,
+      designDNA.reject,
+      designDNA.adapt,
+      designDNA.invent,
+    ].every(isStringArray)
+  );
+}
+
+export async function loadReference(
+  rootPath: string,
+  projectId: string,
+  referenceId: string,
+): Promise<Reference> {
+  assertSafePathSegment(referenceId, "Reference id");
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  const referencePath = assertPathInsideWorkspace(
+    workspace.referencesPath,
+    join(workspace.referencesPath, referenceId),
+  );
+  const directoryEntry = await lstat(referencePath);
+  if (directoryEntry.isSymbolicLink() || !directoryEntry.isDirectory()) {
+    throw new Error("Reference directory is invalid");
+  }
+  const metadataPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "reference.json"),
+  );
+  const persisted = await readBoundedJsonFile(metadataPath, "Reference record");
+  if (
+    !isPersistedReference(persisted) ||
+    persisted.projectId !== projectId ||
+    persisted.id !== referenceId ||
+    persisted.imagePath === undefined ||
+    assertPathInsideWorkspace(referencePath, persisted.imagePath) !==
+      persisted.imagePath
+  ) {
+    throw new Error("Reference record is invalid");
+  }
+  return persisted;
+}
+
+export async function loadReferenceImage(
+  rootPath: string,
+  projectId: string,
+  referenceId: string,
+): Promise<{ bytes: Uint8Array; type: Reference["type"] }> {
+  const reference = await loadReference(rootPath, projectId, referenceId);
+  const imagePath = reference.imagePath as string;
+  const pathEntry = await lstat(imagePath);
+  if (
+    pathEntry.isSymbolicLink() ||
+    !pathEntry.isFile() ||
+    pathEntry.size === 0 ||
+    pathEntry.size > MAX_REFERENCE_BYTES
+  ) {
+    throw new Error("Reference image artifact is invalid");
+  }
+  const handle = await open(
+    imagePath,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  try {
+    const handleEntry = await handle.stat();
+    if (
+      !handleEntry.isFile() ||
+      handleEntry.dev !== pathEntry.dev ||
+      handleEntry.ino !== pathEntry.ino ||
+      handleEntry.size !== pathEntry.size
+    ) {
+      throw new Error("Reference image artifact changed while reading");
+    }
+    const bytes = new Uint8Array(await handle.readFile());
+    validateReferenceImage(reference.type, bytes);
+    return { bytes, type: reference.type };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+export async function listReferences(
+  rootPath: string,
+  projectId: string,
+): Promise<Reference[]> {
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  const entries = await readdir(workspace.referencesPath, {
+    withFileTypes: true,
+  });
+  const references = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+      .map((entry) => loadReference(rootPath, projectId, entry.name)),
+  );
+  return references.sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt),
+  );
+}
+
+export async function updateReference(
+  rootPath: string,
+  reference: Reference,
+): Promise<string> {
+  const existing = await loadReference(rootPath, reference.projectId, reference.id);
+  if (
+    reference.imagePath !== existing.imagePath ||
+    reference.type !== existing.type ||
+    reference.source !== existing.source ||
+    reference.createdAt !== existing.createdAt
+  ) {
+    throw new Error("Reference artifact identity cannot be changed");
+  }
+  const referencePath = dirname(existing.imagePath as string);
+  const metadataPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "reference.json"),
+  );
+  await atomicWriteJson(referencePath, metadataPath, reference);
+  return metadataPath;
+}
+
+export async function saveReferenceDesignDNA(
+  rootPath: string,
+  projectId: string,
+  referenceId: string,
+  designDNA: DesignDNA,
+): Promise<string> {
+  const reference = await loadReference(rootPath, projectId, referenceId);
+  if (!designDNA.referenceIds.includes(reference.id)) {
+    throw new Error("DesignDNA does not include the active reference");
+  }
+  const referencePath = dirname(reference.imagePath as string);
+  const designDNAPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "design-dna.json"),
+  );
+  await atomicWriteJson(referencePath, designDNAPath, designDNA);
+  return designDNAPath;
+}
+
+export async function loadReferenceDesignDNA(
+  rootPath: string,
+  projectId: string,
+  referenceId: string,
+): Promise<DesignDNA> {
+  const reference = await loadReference(rootPath, projectId, referenceId);
+  const referencePath = dirname(reference.imagePath as string);
+  const designDNAPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "design-dna.json"),
+  );
+  const persisted = await readBoundedJsonFile(designDNAPath, "DesignDNA record");
+  if (
+    !isPersistedDesignDNA(persisted) ||
+    !persisted.referenceIds.includes(referenceId)
+  ) {
+    throw new Error("DesignDNA record is invalid");
+  }
+  return persisted;
 }
 
 export async function saveSession(
@@ -582,6 +877,35 @@ export async function saveSession(
   );
   await atomicWriteJson(workspace.sessionsPath, sessionPath, session);
   return sessionPath;
+}
+
+export async function listSessions<TSession extends DesignSession = DesignSession>(
+  rootPath: string,
+  projectId: string,
+): Promise<TSession[]> {
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  const entries = await readdir(workspace.sessionsPath, { withFileTypes: true });
+  const sessions = await Promise.all(
+    entries
+      .filter(
+        (entry) =>
+          entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"),
+      )
+      .map(async (entry) => {
+        const sessionPath = assertPathInsideWorkspace(
+          workspace.sessionsPath,
+          join(workspace.sessionsPath, entry.name),
+        );
+        const persisted = await readBoundedJsonFile(sessionPath, "Session record");
+        if (!isPersistedSession(persisted) || persisted.projectId !== projectId) {
+          throw new Error("Session record is invalid");
+        }
+        return persisted as TSession;
+      }),
+  );
+  return sessions.sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt),
+  );
 }
 
 export async function saveRenderArtifact(

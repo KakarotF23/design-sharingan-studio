@@ -1,5 +1,5 @@
-import { WorkspacePlaceholder } from "../../../../features/projects/workspace-placeholder";
+import { ReferenceUploader } from "../../../../features/references/reference-uploader";
 
 export default function ReferencesPage() {
-  return <WorkspacePlaceholder workspace="references" />;
+  return <ReferenceUploader />;
 }

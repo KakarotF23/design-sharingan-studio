@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
+  DesignDNA,
   DesignSession,
   Project,
   Reference,
@@ -21,12 +22,20 @@ import type {
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ensureDesignWorkspace,
+  listReferences,
+  listSessions,
+  loadReference,
+  loadReferenceImage,
+  loadReferenceDesignDNA,
   loadProjectMetadata,
+  saveReferenceDesignDNA,
   saveGuardedProjectMetadata,
   saveProjectMetadata,
   saveReferenceArtifact,
   saveRenderArtifact,
   saveSession,
+  updateReference,
+  validateReferenceImage,
 } from "../workspace-store";
 
 const temporaryRoots: string[] = [];
@@ -161,6 +170,31 @@ function sessionFixture(id = "session-1"): DesignSession {
   };
 }
 
+const validPng = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0]);
+
+function designDNAFixture(): DesignDNA {
+  return {
+    id: "dna-1",
+    referenceIds: ["reference-1"],
+    hierarchy: ["Clear hierarchy"],
+    layout: ["Split evidence and interpretation"],
+    spacing: ["Wide sections"],
+    typography: ["Condensed display"],
+    colorLogic: ["Neutral with a restrained accent"],
+    componentGeometry: ["Square technical panels"],
+    navigation: ["Stable project rail"],
+    interaction: ["Explicit primary action"],
+    motion: ["Reserved for progress"],
+    density: ["Dense evidence, spacious summary"],
+    emotionalTone: ["Calm and technical"],
+    visualWeight: ["Reference balanced by decisions"],
+    keep: ["Clear hierarchy"],
+    reject: ["Branded artwork"],
+    adapt: ["Use the product accent"],
+    invent: ["Add a product-fit trail"],
+  };
+}
+
 // Production break caught: omitting a runtime directory or creating governance makes machine state incomplete or falsely authoritative.
 it("creates only the machine workspace layout and no governance truth", async () => {
   const rootPath = await temporaryProject();
@@ -276,7 +310,7 @@ it("persists a reference record and bytes under its reference directory", async 
   const saved = await saveReferenceArtifact(
     rootPath,
     referenceFixture(),
-    new Uint8Array([137, 80, 78, 71]),
+    validPng,
   );
   const canonicalRoot = await realpath(rootPath);
 
@@ -290,12 +324,95 @@ it("persists a reference record and bytes under its reference directory", async 
     ),
   );
   expect(new Uint8Array(await readFile(saved.artifactPath))).toEqual(
-    new Uint8Array([137, 80, 78, 71]),
+    validPng,
   );
   expect(JSON.parse(await readFile(saved.metadataPath, "utf8"))).toMatchObject({
     id: "reference-1",
     imagePath: saved.artifactPath,
   });
+});
+
+// Production break caught: trusting an extension or browser-declared media type lets SVG, empty, oversized, or disguised content enter the visual-analysis boundary.
+it("accepts only bounded raster references whose signature matches the declared MIME", () => {
+  expect(validateReferenceImage("image/png", validPng)).toBe(".png");
+  expect(
+    validateReferenceImage(
+      "image/jpeg",
+      new Uint8Array([0xff, 0xd8, 0xff, 0xe0]),
+    ),
+  ).toBe(".jpg");
+  expect(
+    validateReferenceImage(
+      "image/webp",
+      new Uint8Array([
+        0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+      ]),
+    ),
+  ).toBe(".webp");
+  expect(
+    validateReferenceImage(
+      "image/gif",
+      new TextEncoder().encode("GIF89a"),
+    ),
+  ).toBe(".gif");
+
+  expect(() => validateReferenceImage("image/png", new Uint8Array())).toThrow(
+    /empty/i,
+  );
+  expect(() => validateReferenceImage("image/jpeg", validPng)).toThrow(
+    /signature/i,
+  );
+  expect(() =>
+    validateReferenceImage(
+      "image/svg+xml",
+      new TextEncoder().encode("<svg></svg>"),
+    ),
+  ).toThrow(/PNG, JPEG, WebP, or GIF/i);
+  expect(() =>
+    validateReferenceImage("image/png", new Uint8Array(10 * 1024 * 1024 + 1)),
+  ).toThrow(/10 MiB/i);
+});
+
+// Production break caught: write-only reference/session helpers make the References, Learn, and Reports workspaces lose durable state after navigation or reload.
+it("reads, lists, updates, and attaches DesignDNA to durable reference and session records", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const saved = await saveReferenceArtifact(
+    rootPath,
+    referenceFixture(),
+    validPng,
+  );
+  const updated = {
+    ...(await loadReference(rootPath, "project-1", "reference-1")),
+    imagePath: saved.artifactPath,
+    notes: "Preserve the hierarchy.",
+    likes: ["Clear hierarchy"],
+    dislikes: ["Decoration"],
+    analysisStatus: "ANALYZED" as const,
+  };
+
+  await updateReference(rootPath, updated);
+  await saveReferenceDesignDNA(
+    rootPath,
+    "project-1",
+    "reference-1",
+    designDNAFixture(),
+  );
+  await saveSession(rootPath, sessionFixture());
+
+  await expect(listReferences(rootPath, "project-1")).resolves.toEqual([
+    updated,
+  ]);
+  await expect(
+    loadReferenceImage(rootPath, "project-1", "reference-1"),
+  ).resolves.toEqual({ bytes: validPng, type: "image/png" });
+  await expect(
+    loadReferenceDesignDNA(rootPath, "project-1", "reference-1"),
+  ).resolves.toEqual(designDNAFixture());
+  await expect(listSessions(rootPath, "project-1")).resolves.toEqual([
+    sessionFixture(),
+  ]);
+  expect(new Uint8Array(await readFile(saved.artifactPath))).toEqual(validPng);
 });
 
 // Production break caught: an explicit root alone permits a reference from another project to be written into the active workspace.

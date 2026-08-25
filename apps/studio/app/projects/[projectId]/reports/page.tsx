@@ -1,5 +1,5 @@
-import { WorkspacePlaceholder } from "../../../../features/projects/workspace-placeholder";
+import { ReportsWorkspace } from "../../../../features/reports/reports-workspace";
 
 export default function ReportsPage() {
-  return <WorkspacePlaceholder workspace="reports" />;
+  return <ReportsWorkspace />;
 }
