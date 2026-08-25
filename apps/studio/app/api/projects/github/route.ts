@@ -1,8 +1,17 @@
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GitHubProjectAdapter } from "@design-sharingan/project-adapters";
+import {
+  GitHubProjectAdapter,
+  isValidGitHubRepositoryUrl,
+} from "@design-sharingan/project-adapters";
+import { NextResponse } from "next/server";
+import {
+  encodeProjectLocator,
+  PROJECT_LOCATOR_COOKIE,
+} from "../../../../features/projects/project-locator";
 import type { StudioProjectState } from "../../../../features/projects/project-state";
+import { readIntakeJson } from "../intake-request";
 
 export const runtime = "nodejs";
 
@@ -10,29 +19,10 @@ function bodyObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function validGitHubUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return (
-      url.protocol === "https:" &&
-      url.hostname.toLowerCase() === "github.com" &&
-      url.username === "" &&
-      url.password === "" &&
-      url.search === "" &&
-      url.hash === ""
-    );
-  } catch {
-    return false;
-  }
-}
-
 export async function POST(request: Request): Promise<Response> {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return Response.json({ error: "Send a valid JSON request." }, { status: 400 });
-  }
+  const intake = await readIntakeJson(request);
+  if (!intake.ok) return intake.response;
+  const body = intake.body;
 
   if (
     !bodyObject(body) ||
@@ -50,7 +40,7 @@ export async function POST(request: Request): Promise<Response> {
   const branch = body.branch.trim();
   const token = typeof body.token === "string" ? body.token : undefined;
   if (
-    !validGitHubUrl(repositoryUrl) ||
+    !isValidGitHubRepositoryUrl(repositoryUrl) ||
     repositoryUrl.length > 2048 ||
     branch.length === 0 ||
     branch.length > 255 ||
@@ -84,7 +74,18 @@ export async function POST(request: Request): Promise<Response> {
       devCommand: workspace.devCommand,
       capabilities: workspace.capabilities,
     };
-    return Response.json({ project });
+    const response = NextResponse.json({ project });
+    response.cookies.set(
+      PROJECT_LOCATOR_COOKIE,
+      encodeProjectLocator(workspace.rootPath),
+      {
+        httpOnly: true,
+        sameSite: "strict",
+        path: `/projects/${encodeURIComponent(project.id)}`,
+        priority: "high",
+      },
+    );
+    return response;
   } catch {
     return Response.json(
       {

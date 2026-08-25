@@ -148,6 +148,34 @@ class LocalRepositoryGitRunner implements GitRunner {
 }
 
 describe("GitHubProjectAdapter", () => {
+  // Production break caught: URL normalization can hide an explicit default
+  // port or encoded/path-expanded repository target before Git is invoked.
+  it.each([
+    "https://github.com:443/example/private.git",
+    "https://github.com/example/private/extra",
+    "https://github.com/example%2Fescape/private.git",
+    "https://github.com/example/private%2Fescape.git",
+    "https://github.com/example/",
+    "https://github.com/example/private.git/",
+  ])("rejects non-canonical GitHub repository URL %s before invoking Git", async (repositoryUrl) => {
+    const parentPath = await cloneParent();
+    let gitCalls = 0;
+    const gitRunner: GitRunner = {
+      run: async () => {
+        gitCalls += 1;
+      },
+    };
+
+    await expect(
+      new GitHubProjectAdapter({ gitRunner }).open({
+        repositoryUrl,
+        branch: "main",
+        destinationPath: join(parentPath, "checkout"),
+      }),
+    ).rejects.toThrow(/repository url/i);
+    expect(gitCalls).toBe(0);
+  });
+
   // Production break caught: a clone that also checks out can execute a
   // repository-provided hook selected by inherited relative core.hooksPath.
   it("fetches without checkout and materializes with closed Git configuration", async () => {

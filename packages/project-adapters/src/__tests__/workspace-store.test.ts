@@ -21,6 +21,7 @@ import type {
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ensureDesignWorkspace,
+  loadProjectMetadata,
   saveGuardedProjectMetadata,
   saveProjectMetadata,
   saveReferenceArtifact,
@@ -56,6 +57,61 @@ function projectFixture(rootPath: string): Project {
     createdAt: "2026-08-24T09:00:00.000Z",
   };
 }
+
+// Production break caught: a route reload must be able to recover the
+// persisted project without creating missing runtime directories as a side
+// effect of a read.
+it("loads validated project metadata without creating workspace state", async () => {
+  const rootPath = await realpath(await temporaryProject());
+  const machinePath = join(rootPath, ".design-sharingan");
+  await mkdir(machinePath);
+  await writeFile(
+    join(machinePath, "project.json"),
+    `${JSON.stringify(projectFixture(rootPath))}\n`,
+  );
+
+  await expect(loadProjectMetadata(rootPath, "project-1")).resolves.toEqual(
+    projectFixture(rootPath),
+  );
+  await expect(lstat(join(machinePath, "references"))).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+});
+
+// Production break caught: a cookie locator is only a locator; persisted
+// metadata still has to bind the requested id and canonical root exactly.
+it.each([
+  ["a mismatched project id", { id: "another-project" }],
+  ["a mismatched canonical root", { rootPath: "/private/tmp/not-this-project" }],
+] as const)("rejects %s while loading project metadata", async (_label, change) => {
+  const rootPath = await realpath(await temporaryProject());
+  const machinePath = join(rootPath, ".design-sharingan");
+  await mkdir(machinePath);
+  await writeFile(
+    join(machinePath, "project.json"),
+    `${JSON.stringify({ ...projectFixture(rootPath), ...change })}\n`,
+  );
+
+  await expect(loadProjectMetadata(rootPath, "project-1")).rejects.toThrow(
+    /active project identity/i,
+  );
+});
+
+// Production break caught: reading through a project.json symlink makes the
+// active project identity depend on another filesystem location.
+it("rejects symlinked project metadata without creating workspace state", async () => {
+  const rootPath = await realpath(await temporaryProject());
+  const machinePath = join(rootPath, ".design-sharingan");
+  const sourcePath = join(rootPath, "source-project.json");
+  await mkdir(machinePath);
+  await writeFile(sourcePath, `${JSON.stringify(projectFixture(rootPath))}\n`);
+  await symlink(sourcePath, join(machinePath, "project.json"));
+
+  await expect(loadProjectMetadata(rootPath, "project-1")).rejects.toThrow(
+    /symbolic link|active project identity/i,
+  );
+  expect(await readFile(sourcePath, "utf8")).toContain('"project-1"');
+});
 
 // Production break caught: an ownership token bound only to an ancestor can
 // authorize a workspace outside the adapter's exact allocation parent.

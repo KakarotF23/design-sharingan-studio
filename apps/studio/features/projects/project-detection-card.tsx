@@ -1,10 +1,7 @@
 import Link from "next/link";
 import { StatusBadge } from "@design-sharingan/ui";
 import { ProjectStatus } from "./project-status";
-import {
-  projectSessionKey,
-  type StudioProjectState,
-} from "./project-state";
+import type { StudioProjectState } from "./project-state";
 
 function frameworkName(framework: string | undefined): string {
   if (framework === "nextjs") return "Next.js";
@@ -18,10 +15,6 @@ export function ProjectDetectionCard({
 }: {
   project: StudioProjectState;
 }) {
-  const rememberProject = () => {
-    window.sessionStorage.setItem(projectSessionKey(project.id), JSON.stringify(project));
-  };
-
   return (
     <section className="detection" aria-label="Detected configuration">
       <div className="detection__header">
@@ -77,7 +70,6 @@ export function ProjectDetectionCard({
       <Link
         className="primary-action detection__open"
         href={`/projects/${encodeURIComponent(project.id)}/overview`}
-        onClick={rememberProject}
       >
         <span>Open Studio</span>
         <span aria-hidden="true">↗</span>

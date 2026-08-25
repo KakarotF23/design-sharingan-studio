@@ -33,25 +33,69 @@ const defaultRuntime: AdapterRuntime = {
   now: () => new Date(),
 };
 
-function validateRepositoryUrl(repositoryUrl: string): void {
+export function isValidGitHubRepositoryUrl(repositoryUrl: string): boolean {
   let parsed: URL;
   try {
     parsed = new URL(repositoryUrl);
   } catch {
-    throw new Error("A valid GitHub repository URL is required");
+    return false;
   }
 
   if (
     parsed.protocol !== "https:" ||
-    parsed.hostname.toLowerCase() !== "github.com"
+    parsed.hostname.toLowerCase() !== "github.com" ||
+    parsed.port !== "" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    /[%\\\s\0\r\n]/.test(repositoryUrl)
   ) {
-    throw new Error("A valid GitHub HTTPS repository URL is required");
+    return false;
   }
-  if (parsed.username !== "" || parsed.password !== "") {
-    throw new Error("Repository URL must not include credentials");
+
+  const authority = repositoryUrl.slice("https://".length).split("/", 1)[0];
+  if (authority?.toLowerCase() !== "github.com") {
+    return false;
   }
-  if (parsed.search !== "" || parsed.hash !== "") {
-    throw new Error("Repository URL must not include query parameters or fragments");
+
+  const segments = parsed.pathname.split("/");
+  if (segments.length !== 3 || segments[0] !== "") {
+    return false;
+  }
+  const owner = segments[1] ?? "";
+  const repositoryWithSuffix = segments[2] ?? "";
+  const repository = repositoryWithSuffix.endsWith(".git")
+    ? repositoryWithSuffix.slice(0, -4)
+    : repositoryWithSuffix;
+  return (
+    owner.length >= 1 &&
+    owner.length <= 39 &&
+    /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(owner) &&
+    !owner.includes("--") &&
+    repository.length >= 1 &&
+    repository.length <= 100 &&
+    repository !== "." &&
+    repository !== ".." &&
+    /^[A-Za-z0-9._-]+$/.test(repository)
+  );
+}
+
+function validateRepositoryUrl(repositoryUrl: string): void {
+  try {
+    const parsed = new URL(repositoryUrl);
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.hostname.toLowerCase() !== "github.com"
+    ) {
+      throw new Error("A valid GitHub HTTPS repository URL is required");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("HTTPS")) throw error;
+    throw new Error("A valid GitHub repository URL is required");
+  }
+  if (!isValidGitHubRepositoryUrl(repositoryUrl)) {
+    throw new Error("A valid GitHub repository URL is required");
   }
 }
 

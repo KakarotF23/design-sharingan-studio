@@ -3,16 +3,12 @@
 import {
   createContext,
   useContext,
-  useEffect,
   useMemo,
-  useState,
   type ReactNode,
 } from "react";
 import { usePathname } from "next/navigation";
 import { StudioShell } from "@design-sharingan/ui";
 import {
-  fallbackProjectState,
-  projectSessionKey,
   workspaceDefinitions,
   type StudioProjectState,
   type WorkspaceKind,
@@ -21,22 +17,6 @@ import {
 const ProjectStateContext = createContext<StudioProjectState | undefined>(
   undefined,
 );
-
-function isProjectState(value: unknown, projectId: string): value is StudioProjectState {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const candidate = value as Partial<StudioProjectState>;
-  return (
-    candidate.id === projectId &&
-    typeof candidate.name === "string" &&
-    (candidate.sourceType === "LOCAL" || candidate.sourceType === "GITHUB") &&
-    (candidate.status === "READY" ||
-      candidate.status === "NEEDS_CONFIGURATION") &&
-    candidate.capabilities !== null &&
-    typeof candidate.capabilities === "object"
-  );
-}
 
 function activeWorkspace(pathname: string): WorkspaceKind {
   const segment = pathname.split("/").filter(Boolean).at(-1);
@@ -54,29 +34,15 @@ export function useStudioProject(): StudioProjectState {
 }
 
 export function ProjectShell({
-  projectId,
+  project,
   children,
 }: {
-  projectId: string;
+  project: StudioProjectState;
   children: ReactNode;
 }) {
   const pathname = usePathname();
-  const [project, setProject] = useState<StudioProjectState>(() =>
-    fallbackProjectState(projectId),
-  );
   const workspace = activeWorkspace(pathname);
   const definition = workspaceDefinitions[workspace];
-
-  useEffect(() => {
-    const serialized = window.sessionStorage.getItem(projectSessionKey(projectId));
-    if (serialized === null) return;
-    try {
-      const parsed: unknown = JSON.parse(serialized);
-      if (isProjectState(parsed, projectId)) setProject(parsed);
-    } catch {
-      window.sessionStorage.removeItem(projectSessionKey(projectId));
-    }
-  }, [projectId]);
 
   const context = useMemo(
     () => [

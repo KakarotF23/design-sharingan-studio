@@ -127,25 +127,3 @@ export const workspaceDefinitions: Record<
     ],
   },
 };
-
-export function fallbackProjectState(projectId: string): StudioProjectState {
-  return {
-    id: projectId,
-    name: `Project ${projectId.slice(0, 8)}`,
-    sourceType: "LOCAL",
-    status: "NEEDS_CONFIGURATION",
-    capabilities: {
-      canReadFiles: false,
-      canWriteFiles: false,
-      canRun: false,
-      canRender: false,
-      canCapture: false,
-      canUseGit: false,
-      canAudit: false,
-    },
-  };
-}
-
-export function projectSessionKey(projectId: string): string {
-  return `design-sharingan:project:${projectId}`;
-}

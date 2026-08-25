@@ -67,7 +67,7 @@
 .ds-nav-label,
 .ds-eyebrow {
   margin: 0;
-  color: #717a86;
+  color: #7b8491;
   font-family: var(--font-mono);
   font-size: 0.64rem;
   letter-spacing: 0.13em;
@@ -103,7 +103,7 @@
 
 .ds-sidebar nav a span {
   width: 1rem;
-  color: #717a86;
+  color: #7b8491;
   text-align: center;
 }
 
@@ -124,7 +124,7 @@
 
 .ds-sidebar__health dt,
 .ds-context dt {
-  color: #717a86;
+  color: #7b8491;
   font-size: 0.7rem;
 }
 
@@ -172,7 +172,7 @@
   margin-top: auto;
   padding-top: 1rem;
   border-top: 1px solid #222936;
-  color: #717a86;
+  color: #7b8491;
   font-size: 0.7rem;
   line-height: 1.55;
 }
@@ -203,14 +203,14 @@
   padding: 0 1.1rem;
   border: 0;
   border-bottom: 2px solid transparent;
-  color: #717a86;
+  color: #7b8491;
   background: transparent;
   font-family: var(--font-mono);
   font-size: 0.61rem;
   letter-spacing: 0.11em;
 }
 
-.ds-activity button[aria-selected="true"] {
+.ds-activity button[aria-pressed="true"] {
   color: #e8e6df;
   border-bottom-color: #c64b50;
 }
@@ -295,6 +295,12 @@
 }
 
 .ds-mode-switcher {
+  display: grid;
+  justify-items: end;
+  gap: 0.4rem;
+}
+
+.ds-mode-switcher > div {
   display: flex;
   padding: 0.2rem;
   border: 1px solid #222936;
@@ -304,7 +310,7 @@
 .ds-mode-switcher button {
   padding: 0.45rem 0.7rem;
   border: 0;
-  color: #717a86;
+  color: #7b8491;
   background: transparent;
   font-family: var(--font-mono);
   font-size: 0.64rem;
@@ -314,6 +320,19 @@
 .ds-mode-switcher button[aria-pressed="true"] {
   color: #e8e6df;
   background: #222936;
+}
+
+.ds-mode-switcher button:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.ds-mode-switcher__note {
+  max-width: 20rem;
+  color: #7b8491;
+  font-size: 0.67rem;
+  line-height: 1.45;
+  text-align: right;
 }
 
 @media (max-width: 68rem) {

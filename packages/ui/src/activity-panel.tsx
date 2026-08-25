@@ -14,20 +14,19 @@ export function ActivityPanel({ currentStatus }: ActivityPanelProps) {
 
   return (
     <aside className="ds-activity" aria-label="Workspace activity">
-      <div className="ds-activity__tabs" role="tablist" aria-label="Evidence channels">
+      <div className="ds-activity__tabs" role="group" aria-label="Evidence channels">
         {tabs.map((tab) => (
           <button
             key={tab}
             type="button"
-            role="tab"
-            aria-selected={activeTab === tab}
+            aria-pressed={activeTab === tab}
             onClick={() => setActiveTab(tab)}
           >
             {tab}
           </button>
         ))}
       </div>
-      <div className="ds-activity__state" role="tabpanel">
+      <div className="ds-activity__state" aria-live="polite">
         <span className="ds-pulse" aria-hidden="true" />
         <span>{activeTab === "ACTIVITY" ? currentStatus : `${activeTab} channel ready`}</span>
       </div>

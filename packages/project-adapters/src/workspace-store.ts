@@ -371,6 +371,111 @@ function invalidProjectIdentity(cause?: unknown): Error {
   return error;
 }
 
+function isPersistedProject(value: unknown): value is Project {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const project = value as Partial<Project>;
+  const optionalStrings = [
+    project.repositoryUrl,
+    project.branch,
+    project.framework,
+    project.packageManager,
+    project.devCommand,
+  ];
+  return (
+    typeof project.id === "string" &&
+    project.id.length > 0 &&
+    typeof project.name === "string" &&
+    project.name.length > 0 &&
+    (project.sourceType === "LOCAL" || project.sourceType === "GITHUB") &&
+    typeof project.rootPath === "string" &&
+    (project.status === "UNINITIALIZED" ||
+      project.status === "SCANNING" ||
+      project.status === "NEEDS_CONFIGURATION" ||
+      project.status === "READY") &&
+    typeof project.createdAt === "string" &&
+    typeof project.updatedAt === "string" &&
+    optionalStrings.every(
+      (field) => field === undefined || typeof field === "string",
+    )
+  );
+}
+
+/**
+ * Reads an existing project identity without creating or repairing runtime
+ * state. A locator is accepted only when the canonical root, fixed metadata
+ * inode, persisted root, and requested project id all agree.
+ */
+export async function loadProjectMetadata(
+  rootPath: string,
+  expectedProjectId: string,
+): Promise<Project> {
+  let metadataHandle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    assertSafePathSegment(expectedProjectId, "Project id");
+    const canonicalRoot = await realpath(rootPath);
+    if (canonicalRoot !== rootPath) throw invalidProjectIdentity();
+
+    const rootEntry = await lstat(rootPath);
+    if (rootEntry.isSymbolicLink() || !rootEntry.isDirectory()) {
+      throw invalidProjectIdentity();
+    }
+
+    const workspace = expectedWorkspacePaths(canonicalRoot);
+    const machineEntry = await lstat(workspace.machinePath);
+    if (machineEntry.isSymbolicLink() || !machineEntry.isDirectory()) {
+      throw invalidProjectIdentity();
+    }
+    if (
+      (await realpath(/* turbopackIgnore: true */ workspace.machinePath)) !==
+      workspace.machinePath
+    ) {
+      throw invalidProjectIdentity();
+    }
+
+    const pathEntry = await lstat(workspace.projectMetadataPath);
+    if (pathEntry.isSymbolicLink() || !pathEntry.isFile()) {
+      throw invalidProjectIdentity();
+    }
+    metadataHandle = await open(
+      /* turbopackIgnore: true */ workspace.projectMetadataPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    const handleEntry = await metadataHandle.stat();
+    if (
+      !handleEntry.isFile() ||
+      handleEntry.dev !== pathEntry.dev ||
+      handleEntry.ino !== pathEntry.ino
+    ) {
+      throw invalidProjectIdentity();
+    }
+
+    const persisted: unknown = JSON.parse(
+      await metadataHandle.readFile({ encoding: "utf8" }),
+    );
+    if (
+      !isPersistedProject(persisted) ||
+      persisted.id !== expectedProjectId ||
+      persisted.rootPath !== canonicalRoot
+    ) {
+      throw invalidProjectIdentity();
+    }
+    return persisted;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith("Cannot validate active project identity")
+    ) {
+      throw error;
+    }
+    throw invalidProjectIdentity(error);
+  } finally {
+    await metadataHandle?.close().catch(() => undefined);
+  }
+}
+
 async function loadValidatedProjectContext(
   rootPath: string,
   expectedProjectId: string,

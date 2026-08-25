@@ -6,23 +6,23 @@ import type { IntakeSource, StudioProjectState } from "./project-state";
 
 interface IntakeResponse {
   project?: StudioProjectState;
-  error?: string;
 }
 
 async function submitIntake(
   endpoint: string,
   body: Record<string, string>,
+  failureMessage: string,
 ): Promise<StudioProjectState> {
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
+    referrer: window.location.href,
+    referrerPolicy: "same-origin",
     body: JSON.stringify(body),
   });
   const result = (await response.json()) as IntakeResponse;
   if (!response.ok || result.project === undefined) {
-    throw new Error(
-      result.error ?? "Project intake failed. Review the values and try again.",
-    );
+    throw new Error(failureMessage);
   }
   return result.project;
 }
@@ -53,9 +53,11 @@ export function ProjectIntake({
 
     try {
       setProject(
-        await submitIntake("/api/projects/local", {
-          rootPath: String(form.get("rootPath") ?? ""),
-        }),
+        await submitIntake(
+          "/api/projects/local",
+          { rootPath: String(form.get("rootPath") ?? "") },
+          "Project intake failed. Review the folder path and try again.",
+        ),
       );
     } catch (failure) {
       setError(
@@ -75,14 +77,20 @@ export function ProjectIntake({
     setProject(undefined);
     const intakeForm = event.currentTarget;
     const form = new FormData(intakeForm);
+    const tokenField = intakeForm.elements.namedItem("token");
+    if (tokenField instanceof HTMLInputElement) tokenField.value = "";
 
     try {
       setProject(
-        await submitIntake("/api/projects/github", {
-          repositoryUrl: String(form.get("repositoryUrl") ?? ""),
-          branch: String(form.get("branch") ?? ""),
-          token: String(form.get("token") ?? ""),
-        }),
+        await submitIntake(
+          "/api/projects/github",
+          {
+            repositoryUrl: String(form.get("repositoryUrl") ?? ""),
+            branch: String(form.get("branch") ?? ""),
+            token: String(form.get("token") ?? ""),
+          },
+          "GitHub import failed. Review the repository details and try again.",
+        ),
       );
       intakeForm.reset();
     } catch (failure) {
@@ -98,19 +106,17 @@ export function ProjectIntake({
 
   return (
     <div>
-      <div className="source-switcher" role="tablist" aria-label="Project source">
+      <div className="source-switcher" role="group" aria-label="Project source">
         <button
           type="button"
-          role="tab"
-          aria-selected={source === "local"}
+          aria-pressed={source === "local"}
           onClick={() => chooseSource("local")}
         >
           Local folder
         </button>
         <button
           type="button"
-          role="tab"
-          aria-selected={source === "github"}
+          aria-pressed={source === "github"}
           onClick={() => chooseSource("github")}
         >
           GitHub repository

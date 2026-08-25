@@ -9,21 +9,27 @@ export interface ModeSwitcherProps {
 
 export function ModeSwitcher({ mode, onChange }: ModeSwitcherProps) {
   return (
-    <div className="ds-mode-switcher" role="group" aria-label="Execution mode">
-      <button
-        type="button"
-        aria-pressed={mode === "SAFE"}
-        onClick={() => onChange?.("SAFE")}
-      >
-        Safe
-      </button>
-      <button
-        type="button"
-        aria-pressed={mode === "MANGEKYO"}
-        onClick={() => onChange?.("MANGEKYO")}
-      >
-        Mangekyō
-      </button>
+    <div className="ds-mode-switcher">
+      <div role="group" aria-label="Execution mode">
+        <button
+          type="button"
+          aria-pressed={mode === "SAFE"}
+          onClick={() => onChange?.("SAFE")}
+        >
+          Safe
+        </button>
+        <button
+          type="button"
+          aria-pressed={false}
+          aria-describedby="ds-mangekyo-unavailable"
+          disabled
+        >
+          Mangekyō
+        </button>
+      </div>
+      <span id="ds-mangekyo-unavailable" className="ds-mode-switcher__note">
+        Mangekyō becomes available after its policy engine is implemented.
+      </span>
     </div>
   );
 }

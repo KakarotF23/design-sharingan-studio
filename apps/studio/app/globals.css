@@ -5,7 +5,7 @@
   --steel: #222936;
   --bone: #e8e6df;
   --muted: #98a0aa;
-  --dimmed: #717a86;
+  --dimmed: #7b8491;
   --crimson: #c64b50;
   --font-display: "Avenir Next Condensed", "DIN Condensed", "Arial Narrow", sans-serif;
   --font-body: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -281,7 +281,7 @@ input:focus-visible {
   text-transform: uppercase;
 }
 
-.source-switcher button[aria-selected="true"] {
+.source-switcher button[aria-pressed="true"] {
   color: var(--bone);
   border-bottom-color: var(--crimson);
 }
