@@ -9,12 +9,10 @@ import {
   saveSession,
   transitionLearnSession,
 } from "@design-sharingan/project-adapters";
+import type { ReferenceScanResultSession } from "@design-sharingan/project-adapters";
 import { scanReference } from "@design-sharingan/sharingan-engine";
 import { createScanAgent } from "../../../../../features/learn/scan-agent";
-import type {
-  ReferenceScanPendingSession,
-  ReferenceScanResultSession,
-} from "../../../../../features/references/reference-types";
+import type { ReferenceScanPendingSession } from "../../../../../features/references/reference-types";
 import { createAnalysisStagingDirectory } from "../../../../../features/projects/project-locator";
 import { resolveProjectRequest } from "../../../../../features/projects/project-access";
 import { readProjectJson } from "../../../../../features/projects/project-request";
@@ -141,7 +139,7 @@ export async function POST(
       projectId: project.id,
       type: "REFERENCE_SCAN",
       status: "RESULT_READY",
-      createdAt: timestamp,
+      createdAt: draftSession.createdAt,
       updatedAt: timestamp,
       referenceId: reference.id,
       referenceTitle: reference.title,

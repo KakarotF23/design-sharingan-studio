@@ -916,19 +916,47 @@ export async function transitionLearnSession(
   if (
     existing.type !== session.type ||
     existing.status !== expectedStatus ||
+    existing.createdAt !== session.createdAt ||
     !canTransitionLearnSession(expectedStatus, session.status)
   ) {
     throw new Error(
-      `Learn session cannot transition from ${existing.status} to ${session.status}`,
+      `Learn session identity or transition from ${existing.status} to ${session.status} is invalid`,
     );
   }
   return saveSession(rootPath, session);
 }
 
+export interface ReferenceScanResultSession extends DesignSession {
+  type: "REFERENCE_SCAN";
+  status: "RESULT_READY";
+  referenceId: string;
+  referenceTitle: string;
+  designDNA: DesignDNA;
+  agentThreadId: string;
+}
+
+export function isReferenceScanResultSession(
+  value: unknown,
+): value is ReferenceScanResultSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<ReferenceScanResultSession>;
+  return (
+    session.type === "REFERENCE_SCAN" &&
+    session.status === "RESULT_READY" &&
+    typeof session.referenceId === "string" &&
+    session.referenceId.length > 0 &&
+    typeof session.referenceTitle === "string" &&
+    session.referenceTitle.length > 0 &&
+    isPersistedDesignDNA(session.designDNA) &&
+    typeof session.agentThreadId === "string" &&
+    session.agentThreadId.trim().length > 0
+  );
+}
+
 export interface ReferenceScanCheckpoint {
   reference: Reference;
   designDNA: DesignDNA;
-  session: DesignSession & { status: "RESULT_READY" };
+  session: ReferenceScanResultSession;
 }
 
 async function readOptionalJsonContents(path: string): Promise<string | undefined> {
@@ -947,15 +975,28 @@ export async function commitReferenceScan(
   checkpoint: ReferenceScanCheckpoint,
 ): Promise<void> {
   const { reference, designDNA, session } = checkpoint;
+  if (
+    !isPersistedReference(reference) ||
+    !isPersistedDesignDNA(designDNA) ||
+    !isReferenceScanResultSession(session)
+  ) {
+    throw new Error("Reference scan checkpoint evidence is incomplete");
+  }
+  const finalDesignDNAContents = stableJson(designDNA);
+  if (stableJson(session.designDNA) !== finalDesignDNAContents) {
+    throw new Error("Reference scan checkpoint evidence does not match");
+  }
   const [existingReference, existingSession] = await Promise.all([
     loadReference(rootPath, reference.projectId, reference.id),
     loadSession(rootPath, session.projectId, session.id),
   ]);
   if (
     existingReference.projectId !== session.projectId ||
+    session.referenceId !== reference.id ||
+    session.referenceTitle !== reference.title ||
     existingSession.type !== "REFERENCE_SCAN" ||
-    session.type !== "REFERENCE_SCAN" ||
     existingSession.status !== "ANALYZING" ||
+    existingSession.createdAt !== session.createdAt ||
     !canTransitionLearnSession("ANALYZING", session.status) ||
     reference.analysisStatus !== "ANALYZED" ||
     reference.imagePath !== existingReference.imagePath ||
@@ -989,7 +1030,6 @@ export async function commitReferenceScan(
   const originalReferenceContents = stableJson(existingReference);
   const originalDesignDNAContents = await readOptionalJsonContents(designDNAPath);
   const finalReferenceContents = stableJson(reference);
-  const finalDesignDNAContents = stableJson(designDNA);
   const finalSessionContents = stableJson(session);
 
   try {
