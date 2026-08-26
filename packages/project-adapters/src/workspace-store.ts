@@ -1809,10 +1809,12 @@ export async function saveRenderArtifact(
       source.truncated === false &&
       /^[0-9a-f]{64}$/.test(source.worktreeFingerprint) &&
       Number.isSafeInteger(source.fileCount) &&
-      source.fileCount >= 0 &&
+      source.fileCount >= 1 &&
       source.fileCount <= 512 &&
       Array.isArray(source.entries) &&
       source.entries.length <= 512 &&
+      source.fileCount >= source.entries.length &&
+      new Set(source.entries.map((entry) => entry.path)).size === source.entries.length &&
       source.entries.every((entry) => {
         const renamed = entry.index === "R" || entry.index === "C" ||
           entry.workingTree === "R" || entry.workingTree === "C";
@@ -1836,6 +1838,9 @@ export async function saveRenderArtifact(
         : source.entries.length > 0);
   if (
     !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(metadata.id) ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(metadata.sessionId) ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(metadata.roundId) ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(metadata.viewport) ||
     !isCanonicalRoute(metadata.route) ||
     !Number.isSafeInteger(metadata.viewportWidth) ||
     metadata.viewportWidth < 240 ||

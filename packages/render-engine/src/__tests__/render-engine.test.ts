@@ -453,6 +453,51 @@ it("aborts promptly while the readiness fetch never settles", async () => {
   expect(Date.now() - startedAt).toBeLessThan(250);
 });
 
+it("cancels a readiness response that arrives after external abort", async () => {
+  const controller = new AbortController();
+  let resolveFetch!: (response: Response) => void;
+  let cancellations = 0;
+  const waiting = waitForReadiness({
+    url: "http://127.0.0.1:4310",
+    timeoutMs: 1_000,
+    pollIntervalMs: 1,
+    signal: controller.signal,
+    fetchImpl: async () => new Promise<Response>((resolve) => { resolveFetch = resolve; }),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1));
+  controller.abort();
+  await expect(waiting).rejects.toThrow(/aborted/i);
+  resolveFetch(new Response(new ReadableStream({ cancel() { cancellations += 1; } })));
+  await new Promise((resolve) => setTimeout(resolve, 1));
+  expect(cancellations).toBe(1);
+});
+
+it("removes polling-delay abort listeners after normal timer resolution", async () => {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const originalAdd = signal.addEventListener.bind(signal);
+  const originalRemove = signal.removeEventListener.bind(signal);
+  let additions = 0;
+  let removals = 0;
+  signal.addEventListener = ((...args: Parameters<AbortSignal["addEventListener"]>) => {
+    if (args[0] === "abort") additions += 1;
+    return originalAdd(...args);
+  }) as AbortSignal["addEventListener"];
+  signal.removeEventListener = ((...args: Parameters<AbortSignal["removeEventListener"]>) => {
+    if (args[0] === "abort") removals += 1;
+    return originalRemove(...args);
+  }) as AbortSignal["removeEventListener"];
+  let calls = 0;
+  await waitForReadiness({
+    url: "http://127.0.0.1:4310",
+    timeoutMs: 100,
+    pollIntervalMs: 1,
+    signal,
+    fetchImpl: async () => new Response(null, { status: ++calls === 1 ? 503 : 200 }),
+  });
+  expect(additions).toBe(removals);
+});
+
 // Production break caught: a response body whose cancel promise ignores cancellation can hang the polling loop forever.
 it("bounds non-cooperative readiness body cancellation to the remaining deadline", async () => {
   const body = { cancel: () => new Promise<void>(() => undefined) };
@@ -606,6 +651,99 @@ it("rejects a render when dirty tracked content changes without changing Git sta
     roundId: "round-1",
     browserLauncher: browser.launcher,
   })).rejects.toThrow(/source changed|fingerprint/i);
+});
+
+it("rejects a render when ignored .env.local bytes change during screenshot capture", async () => {
+  const active = await workspace();
+  await execFileAsync("git", ["init"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.name", "Render Test"], { cwd: active.rootPath });
+  await writeFile(join(active.rootPath, ".gitignore"), ".env*\n");
+  await writeFile(join(active.rootPath, "tracked.txt"), "committed\n");
+  await execFileAsync("git", ["add", ".gitignore", "tracked.txt"], { cwd: active.rootPath });
+  await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: active.rootPath });
+  await writeFile(join(active.rootPath, ".env.local"), "SECRET=before\n");
+  const browser = fakeBrowser(
+    "http://127.0.0.1:4310/",
+    PNG,
+    async () => writeFile(join(active.rootPath, ".env.local"), "SECRET=after\n"),
+  );
+  await expect(captureRender({
+    workspace: { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: true } },
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: browser.launcher,
+  })).rejects.toThrow(/source changed|fingerprint/i);
+});
+
+it("includes nested ignored .env files but excludes node_modules .env files from render inputs", async () => {
+  const active = await workspace();
+  await execFileAsync("git", ["init"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.name", "Render Test"], { cwd: active.rootPath });
+  await writeFile(join(active.rootPath, ".gitignore"), "ignored/\nnode_modules/\n");
+  await writeFile(join(active.rootPath, "tracked.txt"), "committed\n");
+  await execFileAsync("git", ["add", ".gitignore", "tracked.txt"], { cwd: active.rootPath });
+  await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: active.rootPath });
+  await mkdir(join(active.rootPath, "ignored"), { recursive: true });
+  await mkdir(join(active.rootPath, "node_modules", "pkg"), { recursive: true });
+  await writeFile(join(active.rootPath, "ignored", ".env.local"), "NESTED=before\n");
+  await writeFile(join(active.rootPath, "node_modules", "pkg", ".env.local"), "VENDOR=before\n");
+  const gitWorkspace = { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: true } };
+  await expect(captureRender({
+    workspace: gitWorkspace,
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: fakeBrowser("http://127.0.0.1:4310/", PNG, async () => {
+      await writeFile(join(active.rootPath, "ignored", ".env.local"), "NESTED=after\n");
+      await writeFile(join(active.rootPath, "node_modules", "pkg", ".env.local"), "VENDOR=after\n");
+    }).launcher,
+  })).rejects.toThrow(/source changed|fingerprint/i);
+
+  const clean = await captureRender({
+    workspace: gitWorkspace,
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-2",
+    browserLauncher: fakeBrowser("http://127.0.0.1:4310/", PNG, async () => {
+      await writeFile(join(active.rootPath, "node_modules", "pkg", ".env.local"), "VENDOR=again\n");
+    }).launcher,
+  });
+  expect(clean.artifact.sourceRevision).toMatchObject({ fileCount: 3 });
+});
+
+it("fails closed on a source symlink whose target is outside the project", async () => {
+  const active = await workspace();
+  const outside = await mkdtemp(join(tmpdir(), "render-source-outside-"));
+  try {
+    await execFileAsync("git", ["init"], { cwd: active.rootPath });
+    await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
+    await execFileAsync("git", ["config", "user.name", "Render Test"], { cwd: active.rootPath });
+    await writeFile(join(active.rootPath, "tracked.txt"), "committed\n");
+    await writeFile(join(outside, "secret.env"), "SECRET=outside\n");
+    await symlink(join(outside, "secret.env"), join(active.rootPath, "linked.env"));
+    await execFileAsync("git", ["add", "tracked.txt", "linked.env"], { cwd: active.rootPath });
+    await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: active.rootPath });
+    await expect(captureRender({
+      workspace: { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: true } },
+      baseUrl: "http://127.0.0.1:4310",
+      route: "/",
+      viewport: { name: "desktop", width: 1440, height: 800 },
+      sessionId: "session-1",
+      roundId: "round-1",
+      browserLauncher: fakeBrowser("http://127.0.0.1:4310/").launcher,
+    })).rejects.toThrow(/source.*symlink|symlink.*source/i);
+  } finally {
+    await rm(outside, { recursive: true, force: true });
+  }
 });
 
 // Production break caught: assume-unchanged/skip-worktree flags can hide modified tracked content behind a false CLEAN status.

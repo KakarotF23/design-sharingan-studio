@@ -1708,6 +1708,76 @@ it("validates complete render evidence at the persistence boundary", async () =>
   } as RenderArtifact, png)).rejects.toThrow(/source revision/i);
 });
 
+it("rejects duplicate or undersized represented Git status evidence", async () => {
+  const revisions: RenderArtifact["sourceRevision"][] = [
+    {
+      kind: "GIT", available: true, head: "a".repeat(40), branch: "main", status: "CLEAN",
+      entries: [], truncated: false, worktreeFingerprint: "b".repeat(64), fileCount: 0,
+    },
+    {
+      kind: "GIT", available: true, head: "a".repeat(40), branch: "main", status: "DIRTY",
+      entries: [
+        { index: "?", workingTree: "?", path: "duplicate.txt" },
+        { index: "?", workingTree: "?", path: "duplicate.txt" },
+      ],
+      truncated: false, worktreeFingerprint: "b".repeat(64), fileCount: 2,
+    },
+    {
+      kind: "GIT", available: true, head: "a".repeat(40), branch: "main", status: "DIRTY",
+      entries: [
+        { index: "?", workingTree: "?", path: "one.txt" },
+        { index: "?", workingTree: "?", path: "two.txt" },
+      ],
+      truncated: false, worktreeFingerprint: "b".repeat(64), fileCount: 1,
+    },
+  ];
+  for (const [index, sourceRevision] of revisions.entries()) {
+    const rootPath = await temporaryProject();
+    await ensureDesignWorkspace(rootPath);
+    const metadata: RenderArtifact = {
+      id: `render-${index + 1}`,
+      sessionId: "session-1",
+      roundId: "round-1",
+      route: "/",
+      viewport: "desktop",
+      viewportWidth: 1440,
+      viewportHeight: 800,
+      imagePath: join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "desktop.png"),
+      capturedAt: "2026-08-25T09:00:00.000Z",
+      sourceRevision,
+    };
+    await expect(saveRenderArtifact(rootPath, metadata, pngBytes())).rejects.toThrow(/source revision/i);
+  }
+});
+
+it("enforces producer identifier grammar at the render persistence boundary", async () => {
+  const cases = [
+    { field: "sessionId" as const, value: "session\nforged" },
+    { field: "roundId" as const, value: "r".repeat(65) },
+    { field: "viewport" as const, value: "-desktop" },
+  ];
+  for (const [index, invalid] of cases.entries()) {
+    const rootPath = await temporaryProject();
+    await ensureDesignWorkspace(rootPath);
+    const sessionId = invalid.field === "sessionId" ? invalid.value : "session-1";
+    const roundId = invalid.field === "roundId" ? invalid.value : "round-1";
+    const viewport = invalid.field === "viewport" ? invalid.value : "desktop";
+    const metadata: RenderArtifact = {
+      id: `render-${index + 1}`,
+      sessionId,
+      roundId,
+      route: "/",
+      viewport,
+      viewportWidth: 1440,
+      viewportHeight: 800,
+      imagePath: join(rootPath, ".design-sharingan", "renders", sessionId, roundId, `${viewport}.png`),
+      capturedAt: "2026-08-25T09:00:00.000Z",
+      sourceRevision: { kind: "UNVERSIONED", available: false, reason: "NOT_A_GIT_WORKSPACE" },
+    };
+    await expect(saveRenderArtifact(rootPath, metadata, pngBytes())).rejects.toThrow(/identifier|safe|metadata/i);
+  }
+});
+
 // Production break caught: evidence overwrite or a metadata-write failure can replace history or leave an unbound screenshot orphan.
 it("creates an immutable render pair and rolls back the image if metadata creation fails", async () => {
   const rootPath = await temporaryProject();

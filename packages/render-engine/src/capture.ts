@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, readlink, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { devNull } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { chromium } from "@playwright/test";
@@ -299,15 +299,7 @@ async function fingerprintWorktree(rootPath: string, paths: readonly string[]): 
     }
     if (before.nlink > 1) throw new Error("Git source evidence refused a hard-linked path");
     hashField(hash, "mode", String(before.mode));
-    if (before.isSymbolicLink()) {
-      const target = await readlink(absolute, { encoding: "buffer" });
-      totalBytes += target.byteLength;
-      if (target.byteLength > MAX_SOURCE_FILE_BYTES || totalBytes > MAX_SOURCE_TOTAL_BYTES) {
-        throw new Error("Git source evidence exceeded its content byte bound");
-      }
-      hashField(hash, "symlink", target);
-      continue;
-    }
+    if (before.isSymbolicLink()) throw new Error("Git render source evidence refused a source symlink");
     if (!before.isFile()) throw new Error("Git source evidence contained an unsupported file type");
     if (before.size > MAX_SOURCE_FILE_BYTES || totalBytes + before.size > MAX_SOURCE_TOTAL_BYTES) {
       throw new Error("Git source evidence exceeded its content byte bound");
@@ -357,6 +349,18 @@ async function requireGit(cwd: string, args: readonly string[], label: string): 
 }
 
 const SOURCE_PATHSPECS = [".", ":(exclude).design-sharingan", ":(exclude).design-sharingan/**"] as const;
+const IGNORED_RENDER_INPUT_PATHSPECS = [
+  ".env*",
+  ":(glob)**/.env*",
+  ":(exclude,glob)**/node_modules/**",
+  ":(exclude,glob)**/.next/**",
+  ":(exclude,glob)**/dist/**",
+  ":(exclude,glob)**/build/**",
+  ":(exclude,glob)**/coverage/**",
+  ":(exclude,glob)**/.turbo/**",
+  ":(exclude,glob)**/.cache/**",
+  ":(exclude,glob).design-sharingan/**",
+] as const;
 
 async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSourceRevision> {
   const inside = await requireGit(workspace.rootPath, ["rev-parse", "--is-inside-work-tree"], "Git worktree evidence");
@@ -390,7 +394,7 @@ async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSo
     assertSafeSourcePath(workspace.rootPath, field.slice(2));
   }
 
-  const paths = parseNulPaths(
+  const ordinaryPaths = parseNulPaths(
     await requireGit(
       workspace.rootPath,
       ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...SOURCE_PATHSPECS],
@@ -398,6 +402,18 @@ async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSo
     ),
     "Git worktree path evidence",
   );
+  const ignoredRenderInputs = parseNulPaths(
+    await requireGit(
+      workspace.rootPath,
+      ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ...IGNORED_RENDER_INPUT_PATHSPECS],
+      "Ignored render-input evidence",
+    ),
+    "Ignored render-input evidence",
+  );
+  const paths = [...new Set([...ordinaryPaths, ...ignoredRenderInputs])];
+  if (paths.length > MAX_GIT_ENTRIES) {
+    throw new Error("Git source evidence exceeded the complete render-input file bound");
+  }
   const statusOutput = await requireGit(
     workspace.rootPath,
     ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...SOURCE_PATHSPECS],

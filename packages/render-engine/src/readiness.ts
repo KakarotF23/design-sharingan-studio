@@ -48,11 +48,18 @@ async function delay(milliseconds: number, signal?: AbortSignal): Promise<void> 
       reject(new Error("Readiness wait was aborted"));
       return;
     }
-    const timer = setTimeout(resolve, milliseconds);
-    signal?.addEventListener("abort", () => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      reject(new Error("Readiness wait was aborted"));
-    }, { once: true });
+      signal?.removeEventListener("abort", abortListener);
+      if (error === undefined) resolve();
+      else reject(error);
+    };
+    const abortListener = () => finish(new Error("Readiness wait was aborted"));
+    const timer = setTimeout(() => finish(), milliseconds);
+    signal?.addEventListener("abort", abortListener, { once: true });
   });
 }
 
@@ -94,12 +101,19 @@ async function probeOnce(
   try {
     let current = url;
     for (let redirects = 0; redirects <= 3; redirects += 1) {
-      const responsePromise = Promise.resolve(fetchImpl(current, {
-        method: "GET",
-        redirect: "manual",
-        signal: controller.signal,
-      }));
-      const response = await beforeDeadline(responsePromise);
+      const responsePromise = Promise.resolve().then(() => fetchImpl(current, {
+          method: "GET",
+          redirect: "manual",
+          signal: controller.signal,
+        }));
+      let response: Response | typeof timed;
+      try {
+        response = await beforeDeadline(responsePromise);
+      } catch (error) {
+        controller.abort();
+        cancelLate(responsePromise);
+        throw error;
+      }
       if (response === timed) {
         controller.abort();
         cancelLate(responsePromise);
