@@ -274,14 +274,36 @@ test("keeps the target unchanged until proposal approval, then applies one bound
   await writeFile(waitingRecordPath, waitingRecordContents, "utf8");
   await page.reload();
 
+  let finishDelayedDataRequest!: () => void;
+  const delayedDataRequest = new Promise<void>((resolve) => {
+    finishDelayedDataRequest = resolve;
+  });
+  await page.route("**/execute/data", async (route) => {
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const response = await route.fetch();
+      await route.fulfill({ response });
+    } finally {
+      finishDelayedDataRequest();
+    }
+  });
   await page.getByRole("button", { name: "Approve & Execute" }).click();
+  // Delay polling past the deliberately short fake mutation so this E2E proves
+  // the final response and durable reload without requiring observation of the
+  // transient APPROVED window. The adapter test directly proves APPROVED is
+  // persisted before its mutation callback runs.
   await expect(page.locator(".safe-activity")).toContainText(
-    "Approval persisted; controlled mutation is running",
+    "Approved mutation applied; render verification is next",
   );
   await expect(page.locator(".execute-workspace")).toHaveAttribute(
     "aria-busy",
-    "true",
+    "false",
   );
+  await expect(
+    page.getByRole("heading", { name: "Approved mutation applied" }),
+  ).toBeVisible();
+  await delayedDataRequest;
+  await page.unroute("**/execute/data");
   await page.reload();
 
   await expect(
