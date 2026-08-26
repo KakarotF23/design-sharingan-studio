@@ -251,6 +251,8 @@ export type RenderSourceRevision =
       status: "CLEAN" | "DIRTY";
       entries: GitStatusEntry[];
       truncated: boolean;
+      worktreeFingerprint: string;
+      fileCount: number;
     }
   | {
       kind: "UNVERSIONED";

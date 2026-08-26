@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { devNull } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { chromium } from "@playwright/test";
 import type {
   GitStatusEntry,
@@ -16,6 +18,8 @@ import { assertLoopbackBaseUrl } from "./readiness";
 
 const MAX_GIT_OUTPUT_BYTES = 65_536;
 const MAX_GIT_ENTRIES = 512;
+const MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_SOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 5_000;
 const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -51,6 +55,8 @@ export interface CaptureRenderOptions {
   browserLauncher?: BrowserLauncher;
   now?: () => Date;
   createId?: () => string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface CaptureRenderResult {
@@ -204,6 +210,9 @@ function safeEvidenceText(value: string, maxBytes: number, trimWhitespace = true
 }
 
 function parseGitStatus(output: Buffer): { entries: GitStatusEntry[]; truncated: boolean } {
+  if (output.length > 0 && output.at(-1) !== 0) {
+    throw new Error("Git status evidence was truncated or malformed");
+  }
   const fields = output.toString("utf8").split("\0");
   if (fields.at(-1) === "") fields.pop();
   const entries: GitStatusEntry[] = [];
@@ -233,38 +242,201 @@ function parseGitStatus(output: Buffer): { entries: GitStatusEntry[]; truncated:
   return { entries, truncated };
 }
 
-async function captureSourceRevision(workspace: ProjectWorkspace): Promise<RenderSourceRevision> {
-  if (!workspace.hasGit || !workspace.capabilities.canUseGit) {
-    return { kind: "UNVERSIONED", available: false, reason: "NOT_A_GIT_WORKSPACE" };
+function parseNulPaths(output: Buffer, label: string): string[] {
+  if (output.length > 0 && output.at(-1) !== 0) {
+    throw new Error(`${label} was truncated or malformed`);
   }
-  const [inside, head, branch, status] = await Promise.all([
-    runGit(workspace.rootPath, ["rev-parse", "--is-inside-work-tree"]),
-    runGit(workspace.rootPath, ["rev-parse", "--verify", "HEAD"]),
-    runGit(workspace.rootPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
-    runGit(workspace.rootPath, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."]),
-  ]);
+  if (!output.equals(Buffer.from(output.toString("utf8"), "utf8"))) {
+    throw new Error(`${label} contained invalid UTF-8`);
+  }
+  const fields = output.toString("utf8").split("\0");
+  if (fields.at(-1) === "") fields.pop();
+  if (fields.length > MAX_GIT_ENTRIES) {
+    throw new Error("Git source evidence exceeded the complete worktree file bound");
+  }
+  return fields.map((field) => safeEvidenceText(field, 1024, false));
+}
+
+function assertSafeSourcePath(rootPath: string, path: string): string {
   if (
-    !inside.ok || inside.output.toString("utf8").trim() !== "true" ||
-    !head.ok || head.truncated || !status.ok || status.truncated
+    isAbsolute(path) || path === "" || path === "." || path === ".." ||
+    path.startsWith("../") || path.includes("\0") || path.includes("\r") || path.includes("\n") ||
+    path === ".git" || path.startsWith(".git/") ||
+    path === ".design-sharingan" || path.startsWith(".design-sharingan/")
   ) {
-    return { kind: "UNVERSIONED", available: false, reason: "GIT_EVIDENCE_UNAVAILABLE" };
+    throw new Error("Git source evidence contained an unsafe path");
   }
-  const headValue = safeEvidenceText(head.output.toString("utf8"), 64);
-  if (!/^[0-9a-f]{40,64}$/i.test(headValue)) {
-    return { kind: "UNVERSIONED", available: false, reason: "GIT_EVIDENCE_UNAVAILABLE" };
+  const absolute = resolve(rootPath, path);
+  const fromRoot = relative(rootPath, absolute);
+  if (fromRoot.startsWith("..") || isAbsolute(fromRoot)) {
+    throw new Error("Git source evidence escaped the project root");
   }
-  const parsed = parseGitStatus(status.output);
+  return absolute;
+}
+
+function hashField(hash: ReturnType<typeof createHash>, label: string, value: string | Buffer): void {
+  const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+  hash.update(`${label}:${bytes.length}:`, "utf8");
+  hash.update(bytes);
+  hash.update("\0", "utf8");
+}
+
+async function fingerprintWorktree(rootPath: string, paths: readonly string[]): Promise<string> {
+  const hash = createHash("sha256");
+  let totalBytes = 0;
+  for (const path of [...paths].sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))) {
+    const absolute = assertSafeSourcePath(rootPath, path);
+    hashField(hash, "path", path);
+    let before;
+    try {
+      before = await lstat(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        hashField(hash, "type", "missing");
+        continue;
+      }
+      throw error;
+    }
+    if (before.nlink > 1) throw new Error("Git source evidence refused a hard-linked path");
+    hashField(hash, "mode", String(before.mode));
+    if (before.isSymbolicLink()) {
+      const target = await readlink(absolute, { encoding: "buffer" });
+      totalBytes += target.byteLength;
+      if (target.byteLength > MAX_SOURCE_FILE_BYTES || totalBytes > MAX_SOURCE_TOTAL_BYTES) {
+        throw new Error("Git source evidence exceeded its content byte bound");
+      }
+      hashField(hash, "symlink", target);
+      continue;
+    }
+    if (!before.isFile()) throw new Error("Git source evidence contained an unsupported file type");
+    if (before.size > MAX_SOURCE_FILE_BYTES || totalBytes + before.size > MAX_SOURCE_TOTAL_BYTES) {
+      throw new Error("Git source evidence exceeded its content byte bound");
+    }
+    const handle = await open(absolute, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      const opened = await handle.stat();
+      if (opened.dev !== before.dev || opened.ino !== before.ino || opened.nlink > 1 || !opened.isFile()) {
+        throw new Error("Git source path changed while evidence was captured");
+      }
+      if (
+        !Number.isSafeInteger(opened.size) || opened.size < 0 ||
+        opened.size > MAX_SOURCE_FILE_BYTES || totalBytes + opened.size > MAX_SOURCE_TOTAL_BYTES
+      ) {
+        throw new Error("Git source evidence exceeded its content byte bound");
+      }
+      const content = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < content.length) {
+        const read = await handle.read(content, offset, content.length - offset, offset);
+        if (read.bytesRead === 0) throw new Error("Git source content changed while evidence was captured");
+        offset += read.bytesRead;
+      }
+      const overflow = Buffer.alloc(1);
+      if ((await handle.read(overflow, 0, 1, content.length)).bytesRead !== 0) {
+        throw new Error("Git source content exceeded its bounded snapshot while evidence was captured");
+      }
+      const after = await handle.stat();
+      if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ino !== opened.ino || content.length !== opened.size) {
+        throw new Error("Git source content changed while evidence was captured");
+      }
+      totalBytes += content.length;
+      hashField(hash, "file", content);
+    } finally {
+      await handle.close();
+    }
+  }
+  return hash.digest("hex");
+}
+
+async function requireGit(cwd: string, args: readonly string[], label: string): Promise<Buffer> {
+  const result = await runGit(cwd, args);
+  if (!result.ok || result.truncated) {
+    throw new Error(`${label} was unavailable, truncated, or exceeded its bounded source evidence`);
+  }
+  return result.output;
+}
+
+const SOURCE_PATHSPECS = [".", ":(exclude).design-sharingan", ":(exclude).design-sharingan/**"] as const;
+
+async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSourceRevision> {
+  const inside = await requireGit(workspace.rootPath, ["rev-parse", "--is-inside-work-tree"], "Git worktree evidence");
+  if (safeEvidenceText(inside.toString("utf8"), 8) !== "true") throw new Error("Project root is not a Git worktree");
+  const topLevel = safeEvidenceText(
+    (await requireGit(workspace.rootPath, ["rev-parse", "--show-toplevel"], "Git top-level evidence")).toString("utf8"),
+    4096,
+  );
+  if (await realpath(topLevel) !== await realpath(workspace.rootPath)) {
+    throw new Error("Git top-level does not match the canonical project root");
+  }
+  const headBefore = safeEvidenceText(
+    (await requireGit(workspace.rootPath, ["rev-parse", "--verify", "HEAD"], "Git HEAD evidence")).toString("utf8"),
+    64,
+  );
+  if (!/^[0-9a-f]{40,64}$/i.test(headBefore)) throw new Error("Git HEAD evidence was malformed");
+  const branchResult = await runGit(workspace.rootPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (branchResult.truncated) throw new Error("Git branch evidence exceeded its bound");
+  const branch = branchResult.ok ? safeEvidenceText(branchResult.output.toString("utf8"), 255) : "DETACHED";
+
+  const flags = parseNulPaths(
+    await requireGit(workspace.rootPath, ["ls-files", "-v", "-z", "--", ...SOURCE_PATHSPECS], "Git index flag evidence"),
+    "Git index flag evidence",
+  );
+  for (const field of flags) {
+    if (field.length < 3 || field[1] !== " ") throw new Error("Git index flag evidence was malformed");
+    const tag = field[0] ?? "";
+    if (tag === "S" || tag.toLowerCase() === tag) {
+      throw new Error("Git source evidence refused assume-unchanged or skip-worktree index flags");
+    }
+    assertSafeSourcePath(workspace.rootPath, field.slice(2));
+  }
+
+  const paths = parseNulPaths(
+    await requireGit(
+      workspace.rootPath,
+      ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...SOURCE_PATHSPECS],
+      "Git worktree path evidence",
+    ),
+    "Git worktree path evidence",
+  );
+  const statusOutput = await requireGit(
+    workspace.rootPath,
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...SOURCE_PATHSPECS],
+    "Git status evidence",
+  );
+  const parsed = parseGitStatus(statusOutput);
+  if (parsed.truncated) throw new Error("Git status evidence exceeded its complete entry bound");
+  const worktreeFingerprint = await fingerprintWorktree(workspace.rootPath, paths);
+  const headAfter = safeEvidenceText(
+    (await requireGit(workspace.rootPath, ["rev-parse", "--verify", "HEAD"], "Git HEAD recheck")).toString("utf8"),
+    64,
+  );
+  if (headBefore !== headAfter) throw new Error("Git HEAD changed while source evidence was captured");
   return {
     kind: "GIT",
     available: true,
-    head: headValue,
-    branch: branch.ok && !branch.truncated
-      ? safeEvidenceText(branch.output.toString("utf8"), 255)
-      : "DETACHED",
-    status: parsed.entries.length === 0 && !status.truncated ? "CLEAN" : "DIRTY",
+    head: headAfter,
+    branch,
+    status: parsed.entries.length === 0 ? "CLEAN" : "DIRTY",
     entries: parsed.entries,
-    truncated: status.truncated || parsed.truncated,
+    truncated: false,
+    worktreeFingerprint,
+    fileCount: paths.length,
   };
+}
+
+async function captureSourceRevision(workspace: ProjectWorkspace): Promise<RenderSourceRevision> {
+  if (!workspace.hasGit) {
+    return { kind: "UNVERSIONED", available: false, reason: "NOT_A_GIT_WORKSPACE" };
+  }
+  if (!workspace.capabilities.canUseGit) {
+    throw new Error("Complete Git evidence is not authorized for this declared Git workspace");
+  }
+  const first = await captureGitSnapshot(workspace);
+  const second = await captureGitSnapshot(workspace);
+  if (JSON.stringify(first) !== JSON.stringify(second)) {
+    throw new Error("Git source evidence changed while its coherent snapshot was captured");
+  }
+  return second;
 }
 
 export async function captureRender(options: CaptureRenderOptions): Promise<CaptureRenderResult> {
@@ -279,16 +451,82 @@ export async function captureRender(options: CaptureRenderOptions): Promise<Capt
   assertSafeIdentifier(options.sessionId, "Session id");
   assertSafeIdentifier(options.roundId, "Round id");
   assertViewport(options.viewport);
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 120_000) {
+    throw new Error("Capture timeout is outside the supported range");
+  }
+  if (options.signal?.aborted) throw new Error("Render capture was aborted");
+  const deadline = Date.now() + timeoutMs;
+  const stage = async <T>(
+    promise: Promise<T>,
+    label: string,
+    onLateResolve?: (value: T) => void | Promise<void>,
+  ): Promise<T> => {
+    if (options.signal?.aborted) {
+      if (onLateResolve !== undefined) void promise.then(onLateResolve, () => undefined);
+      throw new Error(`Render capture was aborted during ${label}`);
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      if (onLateResolve !== undefined) void promise.then(onLateResolve, () => undefined);
+      throw new Error(`Render capture timed out during ${label}`);
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+    const interruption = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Render capture timed out during ${label}`)), remaining);
+      abortListener = () => reject(new Error(`Render capture was aborted during ${label}`));
+      options.signal?.addEventListener("abort", abortListener, { once: true });
+    });
+    try {
+      return await Promise.race([promise, interruption]);
+    } catch (error) {
+      if (onLateResolve !== undefined) void promise.then(onLateResolve, () => undefined);
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (abortListener !== undefined) options.signal?.removeEventListener("abort", abortListener);
+    }
+  };
+  const cleanupBoundMs = Math.max(1, Math.min(1_000, timeoutMs));
+  const cleanup = async (
+    operation: Promise<void>,
+    label: string,
+    cleanupDeadline = Date.now() + cleanupBoundMs,
+  ): Promise<void> => {
+    const remaining = cleanupDeadline - Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (remaining <= 0) throw new Error(`Render capture cleanup timed out while closing ${label}`);
+      await Promise.race([
+        operation,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`Render capture cleanup timed out while closing ${label}`)), remaining);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      void operation.catch(() => undefined);
+    }
+  };
   const target = captureUrl(options.baseUrl, options.route);
-  const beforeRevision = await captureSourceRevision(options.workspace);
-  const browser = await (options.browserLauncher ?? defaultBrowserLauncher).launch();
+  const beforeRevision = await stage(captureSourceRevision(options.workspace), "source revision");
+  const browserPromise = (options.browserLauncher ?? defaultBrowserLauncher).launch();
+  const browser = await stage(browserPromise, "browser launch", async (lateBrowser) => {
+    await cleanup(lateBrowser.close(), "late browser").catch(() => undefined);
+  });
   let page: PageHandle | undefined;
-  let screenshot: Uint8Array;
+  let screenshot: Uint8Array | undefined;
+  let captureError: unknown;
+  let cleanupError: unknown;
   try {
-    page = await browser.newPage({
+    const pagePromise = browser.newPage({
       viewport: { width: options.viewport.width, height: options.viewport.height },
     });
-    await page.goto(target.href);
+    page = await stage(pagePromise, "page creation", async (latePage) => {
+      await cleanup(latePage.close(), "late page").catch(() => undefined);
+    });
+    await stage(page.goto(target.href), "page navigation");
     const finalUrl = new URL(page.url());
     if (finalUrl.origin !== target.origin) {
       throw new Error("Captured page did not remain on the same origin");
@@ -300,13 +538,21 @@ export async function captureRender(options: CaptureRenderOptions): Promise<Capt
     ) {
       throw new Error("Captured page did not remain on the requested route");
     }
-    screenshot = await page.screenshot();
+    screenshot = await stage(page.screenshot(), "screenshot");
     assertPng(screenshot, options.viewport);
+  } catch (error) {
+    captureError = error;
   } finally {
-    await page?.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    const ownedCleanupDeadline = Date.now() + cleanupBoundMs;
+    if (page !== undefined) {
+      try { await cleanup(page.close(), "page", ownedCleanupDeadline); } catch (error) { cleanupError ??= error; }
+    }
+    try { await cleanup(browser.close(), "browser", ownedCleanupDeadline); } catch (error) { cleanupError ??= error; }
   }
-  const afterRevision = await captureSourceRevision(options.workspace);
+  if (cleanupError !== undefined) throw cleanupError;
+  if (captureError !== undefined) throw captureError;
+  if (screenshot === undefined) throw new Error("Render capture did not produce screenshot bytes");
+  const afterRevision = await stage(captureSourceRevision(options.workspace), "source revision recheck");
   if (JSON.stringify(beforeRevision) !== JSON.stringify(afterRevision)) {
     throw new Error("Project source changed during capture; refusing stale render evidence");
   }
@@ -331,6 +577,8 @@ export async function captureRender(options: CaptureRenderOptions): Promise<Capt
     capturedAt,
     sourceRevision: afterRevision,
   };
+  if (options.signal?.aborted) throw new Error("Render capture was aborted before evidence persistence");
+  if (Date.now() >= deadline) throw new Error("Render capture timed out before evidence persistence");
   const saved = await saveRenderArtifact(options.workspace.rootPath, artifact, screenshot);
   return {
     artifact: { ...artifact, imagePath: saved.artifactPath },

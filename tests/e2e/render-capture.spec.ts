@@ -99,6 +99,8 @@ test("starts a real web fixture and persists PNG-header-verified screenshot evid
         status: "CLEAN",
         entries: [],
         truncated: false,
+        worktreeFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+        fileCount: 2,
       },
     });
     expect(JSON.parse(await readFile(result.metadataPath, "utf8"))).toEqual(result.artifact);

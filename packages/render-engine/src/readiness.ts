@@ -60,17 +60,52 @@ async function probeOnce(
   url: URL,
   fetchImpl: typeof fetch,
   remainingMs: number,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), remainingMs);
+  const deadline = Date.now() + remainingMs;
+  const timed = Symbol("timed-out");
+  const beforeDeadline = async <T>(promise: Promise<T>): Promise<T | typeof timed> => {
+    if (signal?.aborted) throw new Error("Readiness wait was aborted");
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return timed;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<typeof timed>((resolve) => { timer = setTimeout(() => resolve(timed), remaining); }),
+        new Promise<never>((_resolve, reject) => {
+          abortListener = () => reject(new Error("Readiness wait was aborted"));
+          signal?.addEventListener("abort", abortListener, { once: true });
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (abortListener !== undefined) signal?.removeEventListener("abort", abortListener);
+    }
+  };
+  const cancelLate = (responsePromise: Promise<Response>): void => {
+    void responsePromise.then((response) => {
+      const cancellation = response.body?.cancel();
+      if (cancellation !== undefined) void cancellation.catch(() => undefined);
+    }).catch(() => undefined);
+  };
   try {
     let current = url;
     for (let redirects = 0; redirects <= 3; redirects += 1) {
-      const response = await fetchImpl(current, {
+      const responsePromise = Promise.resolve(fetchImpl(current, {
         method: "GET",
         redirect: "manual",
         signal: controller.signal,
-      });
+      }));
+      const response = await beforeDeadline(responsePromise);
+      if (response === timed) {
+        controller.abort();
+        cancelLate(responsePromise);
+        return false;
+      }
+      let result: boolean | undefined;
       try {
         if (response.status >= 300 && response.status < 400) {
           const location = response.headers.get("location");
@@ -80,24 +115,33 @@ async function probeOnce(
             throw new Error("Readiness redirect left the configured origin");
           }
           current = redirected;
-          continue;
+        } else {
+          result = response.status >= 200 && response.status < 500;
         }
-        return response.status >= 200 && response.status < 500;
       } finally {
-        await response.body?.cancel().catch(() => undefined);
+        const cancellation = response.body?.cancel();
+        if (cancellation !== undefined) {
+          const cancelled = await beforeDeadline(cancellation.then(() => true, () => true));
+          if (cancelled === timed) {
+            controller.abort();
+            void cancellation.catch(() => undefined);
+            return false;
+          }
+        }
       }
+      if (result !== undefined) return result;
     }
     throw new Error("Readiness exceeded the redirect limit");
   } catch (error) {
     if (
       error instanceof Error &&
-      (/redirect/i.test(error.message) || /loopback/i.test(error.message))
+      (/redirect/i.test(error.message) || /loopback/i.test(error.message) || /aborted/i.test(error.message))
     ) {
       throw error;
     }
     return false;
   } finally {
-    clearTimeout(timer);
+    controller.abort();
   }
 }
 
@@ -119,7 +163,7 @@ export async function waitForReadiness(options: ReadinessOptions): Promise<void>
 
   while (Date.now() < deadline) {
     if (options.signal?.aborted) throw new Error("Readiness wait was aborted");
-    if (await probeOnce(url, fetchImpl, Math.max(1, deadline - Date.now()))) return;
+    if (await probeOnce(url, fetchImpl, Math.max(1, deadline - Date.now()), options.signal)) return;
     const remaining = deadline - Date.now();
     if (remaining > 0) await delay(Math.min(pollIntervalMs, remaining), options.signal);
   }

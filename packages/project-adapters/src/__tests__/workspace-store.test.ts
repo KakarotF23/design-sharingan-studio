@@ -1572,6 +1572,8 @@ it("validates complete render evidence at the persistence boundary", async () =>
       status: "CLEAN",
       entries: [],
       truncated: false,
+      worktreeFingerprint: "b".repeat(64),
+      fileCount: 1,
     },
   };
   const png = pngBytes();
@@ -1593,6 +1595,8 @@ it("validates complete render evidence at the persistence boundary", async () =>
       status: "CLEAN",
       entries: [{ index: "?", workingTree: "?", path: "secret.txt" }],
       truncated: false,
+      worktreeFingerprint: "b".repeat(64),
+      fileCount: 1,
     },
   }, png)).rejects.toThrow(/source revision/i);
   await expect(saveRenderArtifact(rootPath, metadata, new Uint8Array([1, 2, 3]))).rejects.toThrow(/PNG/i);
@@ -1607,6 +1611,8 @@ it("validates complete render evidence at the persistence boundary", async () =>
       status: "DIRTY",
       entries: [{ index: "X", workingTree: "M", path: "tracked.txt" }],
       truncated: false,
+      worktreeFingerprint: "b".repeat(64),
+      fileCount: 1,
     },
   }, png)).rejects.toThrow(/source revision/i);
 
@@ -1620,8 +1626,71 @@ it("validates complete render evidence at the persistence boundary", async () =>
       status: "DIRTY",
       entries: [{ index: "?", workingTree: "?", path: "untracked.txt" }],
       truncated: false,
+      worktreeFingerprint: "b".repeat(64),
+      fileCount: 1,
     },
   }, png)).rejects.toThrow(/source revision/i);
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: { ...metadata.sourceRevision, worktreeFingerprint: "not-a-fingerprint" },
+  } as RenderArtifact, png)).rejects.toThrow(/source revision/i);
+
+  for (const path of [
+    "a/../../outside.txt",
+    "nested/../.git/config",
+    "nested/../.design-sharingan/runtime.json",
+    "nested\\windows-path.txt",
+  ]) {
+    await expect(saveRenderArtifact(rootPath, {
+      ...metadata,
+      sourceRevision: {
+        kind: "GIT",
+        available: true,
+        head: "a".repeat(40),
+        branch: "main",
+        status: "DIRTY",
+        entries: [{ index: "?", workingTree: "?", path }],
+        truncated: false,
+        worktreeFingerprint: "b".repeat(64),
+        fileCount: 1,
+      },
+    }, png)).rejects.toThrow(/source revision/i);
+  }
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: { ...metadata.sourceRevision, fileCount: 513 },
+  } as RenderArtifact, png)).rejects.toThrow(/source revision/i);
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: {
+      kind: "GIT",
+      available: true,
+      head: "a".repeat(40),
+      branch: "main",
+      status: "DIRTY",
+      entries: [{ index: "?", workingTree: "?", path: "partial.txt" }],
+      truncated: true,
+      worktreeFingerprint: "b".repeat(64),
+      fileCount: 2,
+    },
+  }, png)).rejects.toThrow(/source revision/i);
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: { ...metadata.sourceRevision, unexpected: true } as unknown as RenderArtifact["sourceRevision"],
+  } as RenderArtifact, png)).rejects.toThrow(/source revision/i);
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: {
+      ...metadata.sourceRevision,
+      status: "DIRTY",
+      entries: [{ index: "?", workingTree: "?", path: ".design-sharingan/runtime.json" }],
+    },
+  } as RenderArtifact, png)).rejects.toThrow(/source revision/i);
 
   await expect(saveRenderArtifact(rootPath, {
     ...metadata,

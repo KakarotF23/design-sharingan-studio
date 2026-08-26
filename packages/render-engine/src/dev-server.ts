@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { ProjectWorkspace } from "@design-sharingan/project-adapters";
 import { assertLoopbackBaseUrl, probeReadiness, waitForReadiness } from "./readiness";
 
@@ -63,14 +64,80 @@ function redact(value: string, extraSecrets: readonly string[]): string {
     .filter((entry): entry is string => typeof entry === "string" && entry.length >= 8)
     .sort((left, right) => right.length - left.length);
   for (const secret of secrets) result = result.split(secret).join("[REDACTED]");
-  return result.replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,})\b/g, "[REDACTED]");
+  return result.replace(/(?:gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,})/g, "[REDACTED]");
 }
 
-function appendBounded(current: string, chunk: Buffer | string, extraSecrets: readonly string[]): string {
-  const combined = `${current}${redact(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk, extraSecrets)}`;
-  const bytes = Buffer.from(combined, "utf8");
-  if (bytes.length <= MAX_OUTPUT_BYTES) return combined;
-  return bytes.subarray(0, MAX_OUTPUT_BYTES).toString("utf8");
+function truncateUtf8(value: string, byteLimit: number): string {
+  let retained = "";
+  let bytes = 0;
+  for (const codePoint of value) {
+    const size = Buffer.byteLength(codePoint, "utf8");
+    if (bytes + size > byteLimit) break;
+    retained += codePoint;
+    bytes += size;
+  }
+  return retained;
+}
+
+class StreamingRedactor {
+  readonly #decoders = {
+    stdout: new StringDecoder("utf8"),
+    stderr: new StringDecoder("utf8"),
+  };
+  readonly #secrets: string[];
+  #raw = "";
+  #flushed = false;
+
+  constructor(extraSecrets: readonly string[]) {
+    this.#secrets = [...Object.values(process.env), ...extraSecrets]
+      .filter((entry): entry is string =>
+        typeof entry === "string" && entry.length >= 8 && Buffer.byteLength(entry, "utf8") <= 4_096)
+      .sort((left, right) => right.length - left.length);
+  }
+
+  append(source: "stdout" | "stderr", chunk: Buffer | string): void {
+    if (this.#flushed || Buffer.byteLength(this.output, "utf8") >= MAX_OUTPUT_BYTES) return;
+    this.#raw += typeof chunk === "string" ? chunk : this.#decoders[source].write(chunk);
+    const retentionBytes = MAX_OUTPUT_BYTES + Math.max(512, ...this.#secrets.map((secret) => Buffer.byteLength(secret))) + 256;
+    this.#raw = truncateUtf8(this.#raw, retentionBytes);
+  }
+
+  flush(): void {
+    if (this.#flushed) return;
+    this.#raw += this.#decoders.stdout.end();
+    this.#raw += this.#decoders.stderr.end();
+    this.#flushed = true;
+  }
+
+  #pendingLength(): number {
+    let longest = 0;
+    for (const secret of this.#secrets) {
+      const upperBound = Math.min(secret.length - 1, this.#raw.length);
+      for (let length = upperBound; length > longest; length -= 1) {
+        if (this.#raw.endsWith(secret.slice(0, length))) {
+          longest = length;
+          break;
+        }
+      }
+    }
+    const github = this.#raw.match(/(?:g|gh|gh[pousr]|gh[pousr]_([A-Za-z0-9_]*))$/);
+    if (github !== null && (github[1] === undefined || github[1].length < 20)) {
+      longest = Math.max(longest, github[0].length);
+    }
+    const openAi = this.#raw.match(/(?:s|sk|sk-([A-Za-z0-9_-]*))$/);
+    if (openAi !== null && (openAi[1] === undefined || openAi[1].length < 16)) {
+      longest = Math.max(longest, openAi[0].length);
+    }
+    return longest;
+  }
+
+  get output(): string {
+    const pending = this.#pendingLength();
+    const safeRaw = pending === 0
+      ? this.#raw
+      : `${this.#raw.slice(0, -pending)}${this.#flushed ? "[REDACTED]" : ""}`;
+    return truncateUtf8(redact(safeRaw, this.#secrets), MAX_OUTPUT_BYTES);
+  }
 }
 
 function projectEnvironment(
@@ -93,6 +160,9 @@ function projectEnvironment(
     if (process.env[key] !== undefined) environment[key] = process.env[key];
   }
   for (const [key, value] of Object.entries(explicit ?? {})) {
+    if (Buffer.byteLength(value, "utf8") > 4_096) {
+      throw new Error(`Dev server environment value is too large: ${key}`);
+    }
     if (
       !/^[A-Z_][A-Z0-9_]*$/.test(key) ||
       /^(?:PATH|HOME|NODE_OPTIONS|BASH_ENV|ENV|SHELLOPTS|PNPM_HOME|INIT_CWD)$/i.test(key) ||
@@ -119,34 +189,54 @@ export const defaultProcessRunner: ProcessRunner = {
       child.once("error", () => reject(new Error("Dev server process could not be started")));
       child.once("close", resolve);
     });
+    const ownedProcessGroup = process.platform !== "win32" ? child.pid : undefined;
     let stopped = false;
     return {
       stdout: child.stdout,
       stderr: child.stderr,
       exited,
       async stop() {
-        if (stopped || child.exitCode !== null) return;
+        if (stopped) return;
         stopped = true;
+        const groupAlive = (): boolean => {
+          if (ownedProcessGroup === undefined) return child.exitCode === null;
+          try {
+            process.kill(-ownedProcessGroup, 0);
+            return true;
+          } catch (error) {
+            return (error as NodeJS.ErrnoException).code === "EPERM";
+          }
+        };
         const signalOwnedTree = (signal: NodeJS.Signals) => {
-          if (process.platform !== "win32" && child.pid !== undefined) {
+          if (ownedProcessGroup !== undefined) {
             try {
-              process.kill(-child.pid, signal);
+              process.kill(-ownedProcessGroup, signal);
               return;
             } catch {
-              // Fall back to the direct child if its process group already exited.
+              // The owned group may already be gone; only signal a still-running leader.
             }
           }
-          child.kill(signal);
+          if (child.exitCode === null) child.kill(signal);
+        };
+        const waitForOwnedTree = async (milliseconds: number): Promise<boolean> => {
+          const deadline = Date.now() + milliseconds;
+          while (groupAlive() && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          return !groupAlive();
         };
         signalOwnedTree("SIGTERM");
-        const graceful = await Promise.race([
-          exited.then(() => true, () => true),
-          new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
-        ]);
-        if (!graceful && child.exitCode === null) {
+        const graceful = await waitForOwnedTree(2_000);
+        if (!graceful) {
           signalOwnedTree("SIGKILL");
-          await exited.catch(() => undefined);
+          if (!await waitForOwnedTree(2_000)) {
+            throw new Error("Owned dev server process group did not terminate");
+          }
         }
+        await Promise.race([
+          exited.catch(() => undefined),
+          new Promise<void>((resolve) => setTimeout(resolve, 100)),
+        ]);
       },
     };
   },
@@ -228,9 +318,10 @@ export async function startDevServer(options: StartDevServerOptions): Promise<De
     await rm(isolatedHome, { recursive: true, force: true });
     throw error;
   }
-  let output = "";
-  child.stdout?.on("data", (chunk) => { output = appendBounded(output, chunk, explicitSecrets); });
-  child.stderr?.on("data", (chunk) => { output = appendBounded(output, chunk, explicitSecrets); });
+  const output = new StreamingRedactor(explicitSecrets);
+  child.stdout?.on("data", (chunk) => { output.append("stdout", chunk); });
+  child.stderr?.on("data", (chunk) => { output.append("stderr", chunk); });
+  void child.exited.finally(() => output.flush()).catch(() => undefined);
   let stopped = false;
   const stop = async () => {
     if (stopped) return;
@@ -238,6 +329,7 @@ export async function startDevServer(options: StartDevServerOptions): Promise<De
     try {
       await child.stop();
     } finally {
+      output.flush();
       await rm(isolatedHome, { recursive: true, force: true });
     }
   };
@@ -278,7 +370,7 @@ export async function startDevServer(options: StartDevServerOptions): Promise<De
   }
   return {
     baseUrl: options.baseUrl,
-    get output() { return output; },
+    get output() { return output.output; },
     stop,
   };
 }

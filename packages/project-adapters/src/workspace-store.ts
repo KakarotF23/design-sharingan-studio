@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { basename, dirname, extname, join } from "node:path";
+import { basename, dirname, extname, join, posix } from "node:path";
 import type {
   Approval,
   DesignApproach,
@@ -1782,6 +1782,12 @@ export async function saveRenderArtifact(
     !value.startsWith("/") &&
     value !== ".." &&
     !value.startsWith("../") &&
+    !value.includes("\\") &&
+    posix.normalize(value) === value &&
+    value !== ".git" &&
+    !value.startsWith(".git/") &&
+    value !== ".design-sharingan" &&
+    !value.startsWith(".design-sharingan/") &&
     !value.includes("\0") &&
     !value.includes("\n") &&
     !value.includes("\r");
@@ -1793,14 +1799,18 @@ export async function saveRenderArtifact(
       source.available === false &&
       (source.reason === "NOT_A_GIT_WORKSPACE" || source.reason === "GIT_EVIDENCE_UNAVAILABLE")
     : source.kind === "GIT" &&
-      hasExactKeys(source, ["kind", "available", "head", "branch", "status", "entries", "truncated"]) &&
+      hasExactKeys(source, ["kind", "available", "head", "branch", "status", "entries", "truncated", "worktreeFingerprint", "fileCount"]) &&
       source.available === true &&
       /^[0-9a-f]{40,64}$/i.test(source.head) &&
       Buffer.byteLength(source.branch, "utf8") > 0 &&
       Buffer.byteLength(source.branch, "utf8") <= 255 &&
       !/[\0\r\n]/.test(source.branch) &&
       (source.status === "CLEAN" || source.status === "DIRTY") &&
-      typeof source.truncated === "boolean" &&
+      source.truncated === false &&
+      /^[0-9a-f]{64}$/.test(source.worktreeFingerprint) &&
+      Number.isSafeInteger(source.fileCount) &&
+      source.fileCount >= 0 &&
+      source.fileCount <= 512 &&
       Array.isArray(source.entries) &&
       source.entries.length <= 512 &&
       source.entries.every((entry) => {
@@ -1823,7 +1833,7 @@ export async function saveRenderArtifact(
       }) &&
       (source.status === "CLEAN"
         ? source.entries.length === 0 && source.truncated === false
-        : source.entries.length > 0 || source.truncated === true);
+        : source.entries.length > 0);
   if (
     !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(metadata.id) ||
     !isCanonicalRoute(metadata.route) ||

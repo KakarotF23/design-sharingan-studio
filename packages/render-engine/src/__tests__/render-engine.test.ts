@@ -1,13 +1,14 @@
 import { EventEmitter } from "node:events";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProjectWorkspace } from "@design-sharingan/project-adapters";
 import { describe, expect, it } from "vitest";
 import {
   captureRender,
+  defaultProcessRunner,
   startDevServer,
   waitForReadiness,
   type BrowserHandle,
@@ -156,6 +157,71 @@ it("redacts explicit dev-server environment values from captured output", async 
   await server.stop();
 });
 
+// Production break caught: per-chunk redaction exposes a secret assembled across adjacent stdout chunks.
+it("statefully redacts split exact secrets without exposing an unsafe pending tail", async () => {
+  const active = await workspace();
+  const child = new FakeProcess();
+  let readinessCalls = 0;
+  const server = await startDevServer({
+    workspace: active,
+    baseUrl: "http://127.0.0.1:4310",
+    env: { SPLIT_SECRET: "split-secret-value" },
+    processRunner: { start: () => child },
+    readinessProbe: async () => ++readinessCalls > 1,
+  });
+
+  child.stdout.emit("data", Buffer.from("prefix split-sec"));
+  expect(server.output).not.toContain("split-sec");
+  child.stdout.emit("data", Buffer.from("ret-value suffix"));
+  expect(server.output).toContain("[REDACTED]");
+  expect(server.output).not.toContain("split-secret-value");
+  await server.stop();
+  expect(server.output).not.toContain("split-secret-value");
+});
+
+// Production break caught: token-pattern redaction misses credentials whose prefix/body cross chunk boundaries.
+it("statefully redacts split GitHub and OpenAI-style token patterns", async () => {
+  const active = await workspace();
+  const child = new FakeProcess();
+  let readinessCalls = 0;
+  const server = await startDevServer({
+    workspace: active,
+    baseUrl: "http://127.0.0.1:4310",
+    processRunner: { start: () => child },
+    readinessProbe: async () => {
+      readinessCalls += 1;
+      if (readinessCalls === 1) return false;
+      child.stdout.emit("data", "ghp_AAAAAAAAAA");
+      child.stdout.emit("data", "AAAAAAAAAA sk-BBBBBBBB");
+      child.stdout.emit("data", "BBBBBBBB");
+      return true;
+    },
+  });
+
+  expect(server.output).not.toMatch(/ghp_|sk-/);
+  expect(server.output.match(/\[REDACTED\]/g)).toHaveLength(2);
+  child.stdout.emit("data", `prefixxghp_${"C".repeat(20)}`);
+  expect(server.output).not.toContain("ghp_");
+  await server.stop();
+});
+
+// Production break caught: byte slicing through a multibyte code point can add U+FFFD and exceed the advertised output byte cap.
+it("truncates multibyte output on code-point boundaries within 65,536 encoded bytes", async () => {
+  const active = await workspace();
+  const child = new FakeProcess();
+  let readinessCalls = 0;
+  const server = await startDevServer({
+    workspace: active,
+    baseUrl: "http://127.0.0.1:4310",
+    processRunner: { start: () => child },
+    readinessProbe: async () => ++readinessCalls > 1,
+  });
+  child.stdout.emit("data", Buffer.from("界".repeat(30_000)));
+  expect(Buffer.byteLength(server.output, "utf8")).toBeLessThanOrEqual(65_536);
+  expect(server.output).not.toContain("�");
+  await server.stop();
+});
+
 // Production break caught: inherited host credentials become readable by arbitrary scripts in an imported repository.
 it("starts project code with a minimal environment plus explicit caller values", async () => {
   const active = await workspace();
@@ -188,6 +254,19 @@ it("starts project code with a minimal environment plus explicit caller values",
   await server.stop();
   await expect(stat(isolatedHome)).rejects.toThrow();
   delete process.env.CODEX_RENDER_TEST_TOKEN;
+});
+
+it("rejects oversized explicit environment values before starting untrusted project code", async () => {
+  const active = await workspace();
+  let started = false;
+  await expect(startDevServer({
+    workspace: active,
+    baseUrl: "http://127.0.0.1:4310",
+    env: { OVERSIZED_VALUE: "x".repeat(4_097) },
+    processRunner: { start() { started = true; return new FakeProcess(); } },
+    readinessProbe: async () => false,
+  })).rejects.toThrow(/environment.*value|too large/i);
+  expect(started).toBe(false);
 });
 
 // Production break caught: aborting a workflow cannot clean its server while an injected/network readiness probe ignores AbortSignal.
@@ -346,15 +425,57 @@ it("cancels every readiness response body, including contained redirects", async
   expect(cancellations).toBe(2);
 });
 
+// Production break caught: an injected fetch that ignores AbortSignal can hold readiness beyond its exact deadline.
+it("bounds a readiness fetch that never settles to the remaining 5 ms deadline", async () => {
+  const startedAt = Date.now();
+  await expect(waitForReadiness({
+    url: "http://127.0.0.1:4310",
+    timeoutMs: 5,
+    pollIntervalMs: 1,
+    fetchImpl: async () => new Promise<Response>(() => undefined),
+  })).rejects.toThrow(/not ready.*5 ms/i);
+  expect(Date.now() - startedAt).toBeLessThan(250);
+});
+
+// Production break caught: aborting readiness must not wait for an injected fetch that ignores its signal.
+it("aborts promptly while the readiness fetch never settles", async () => {
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const waiting = waitForReadiness({
+    url: "http://127.0.0.1:4310",
+    timeoutMs: 1_000,
+    pollIntervalMs: 1,
+    signal: controller.signal,
+    fetchImpl: async () => new Promise<Response>(() => undefined),
+  });
+  setTimeout(() => controller.abort(), 5);
+  await expect(waiting).rejects.toThrow(/aborted/i);
+  expect(Date.now() - startedAt).toBeLessThan(250);
+});
+
+// Production break caught: a response body whose cancel promise ignores cancellation can hang the polling loop forever.
+it("bounds non-cooperative readiness body cancellation to the remaining deadline", async () => {
+  const body = { cancel: () => new Promise<void>(() => undefined) };
+  const startedAt = Date.now();
+  await expect(waitForReadiness({
+    url: "http://127.0.0.1:4310",
+    timeoutMs: 5,
+    pollIntervalMs: 1,
+    fetchImpl: async () => ({ status: 503, headers: new Headers(), body }) as unknown as Response,
+  })).rejects.toThrow(/not ready.*5 ms/i);
+  expect(Date.now() - startedAt).toBeLessThan(250);
+});
+
 function fakeBrowser(
   finalUrl: string,
   bytes = PNG,
+  onScreenshot?: () => void | Promise<void>,
 ): { launcher: BrowserLauncher; browser: BrowserHandle; calls: string[] } {
   const calls: string[] = [];
   const page = {
     async goto(url: string) { calls.push(`goto:${url}`); },
     url() { return finalUrl; },
-    async screenshot() { calls.push("screenshot"); return bytes; },
+    async screenshot() { calls.push("screenshot"); await onScreenshot?.(); return bytes; },
     async close() { calls.push("page-close"); },
   };
   const browser: BrowserHandle = {
@@ -455,6 +576,124 @@ it("binds Git renders to a bounded structured HEAD and dirty status snapshot", a
       { index: "?", workingTree: "?", path: "untracked.txt" },
     ],
     truncated: false,
+    worktreeFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+    fileCount: 3,
+  });
+});
+
+// Production break caught: status labels remain ` M` while dirty tracked bytes change during screenshot capture.
+it("rejects a render when dirty tracked content changes without changing Git status labels", async () => {
+  const active = await workspace();
+  await execFileAsync("git", ["init"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.name", "Render Test"], { cwd: active.rootPath });
+  await writeFile(join(active.rootPath, "tracked.txt"), "committed\n");
+  await execFileAsync("git", ["add", "tracked.txt"], { cwd: active.rootPath });
+  await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: active.rootPath });
+  await writeFile(join(active.rootPath, "tracked.txt"), "dirty-before\n");
+  const browser = fakeBrowser(
+    "http://127.0.0.1:4310/",
+    PNG,
+    async () => writeFile(join(active.rootPath, "tracked.txt"), "dirty-after\n"),
+  );
+
+  await expect(captureRender({
+    workspace: { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: true } },
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: browser.launcher,
+  })).rejects.toThrow(/source changed|fingerprint/i);
+});
+
+// Production break caught: assume-unchanged/skip-worktree flags can hide modified tracked content behind a false CLEAN status.
+it.each(["--assume-unchanged", "--skip-worktree"])(
+  "refuses tracked paths carrying %s index flags",
+  async (flag) => {
+    const active = await workspace();
+    await execFileAsync("git", ["init"], { cwd: active.rootPath });
+    await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
+    await execFileAsync("git", ["config", "user.name", "Render Test"], { cwd: active.rootPath });
+    await writeFile(join(active.rootPath, "tracked.txt"), "committed\n");
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd: active.rootPath });
+    await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: active.rootPath });
+    await execFileAsync("git", ["update-index", flag, "tracked.txt"], { cwd: active.rootPath });
+    await writeFile(join(active.rootPath, "tracked.txt"), "hidden-dirty\n");
+    const browser = fakeBrowser("http://127.0.0.1:4310/");
+
+    await expect(captureRender({
+      workspace: { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: true } },
+      baseUrl: "http://127.0.0.1:4310",
+      route: "/",
+      viewport: { name: "desktop", width: 1440, height: 800 },
+      sessionId: "session-1",
+      roundId: "round-1",
+      browserLauncher: browser.launcher,
+    })).rejects.toThrow(/assume-unchanged|skip-worktree|index flags/i);
+  },
+);
+
+// Production break caught: a 513-path worktree used to persist only the first 512 status entries and call the evidence truthful.
+it("refuses Git source evidence above the complete worktree file bound", async () => {
+  const active = await workspace();
+  await execFileAsync("git", ["init"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.name", "Render Test"], { cwd: active.rootPath });
+  await writeFile(join(active.rootPath, "tracked.txt"), "committed\n");
+  await execFileAsync("git", ["add", "tracked.txt"], { cwd: active.rootPath });
+  await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: active.rootPath });
+  for (let index = 0; index < 512; index += 1) {
+    await writeFile(join(active.rootPath, `untracked-${String(index).padStart(3, "0")}.txt`), "x");
+  }
+  const browser = fakeBrowser("http://127.0.0.1:4310/");
+  await expect(captureRender({
+    workspace: { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: true } },
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: browser.launcher,
+  })).rejects.toThrow(/file bound|too many/i);
+});
+
+// Production break caught: prior runtime renders can make unchanged product source look dirty and alter its fingerprint.
+it("excludes .design-sharingan runtime artifacts from Git status and source fingerprints", async () => {
+  const active = await workspace();
+  await execFileAsync("git", ["init"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.name", "Render Test"], { cwd: active.rootPath });
+  await writeFile(join(active.rootPath, "tracked.txt"), "committed\n");
+  await execFileAsync("git", ["add", "tracked.txt"], { cwd: active.rootPath });
+  await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: active.rootPath });
+  const gitWorkspace = { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: true } };
+  const first = await captureRender({
+    workspace: gitWorkspace,
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: fakeBrowser("http://127.0.0.1:4310/").launcher,
+  });
+  const second = await captureRender({
+    workspace: gitWorkspace,
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-2",
+    browserLauncher: fakeBrowser("http://127.0.0.1:4310/").launcher,
+  });
+  expect(first.artifact.sourceRevision).toMatchObject({ status: "CLEAN", entries: [] });
+  expect(second.artifact.sourceRevision).toMatchObject({
+    status: "CLEAN",
+    entries: [],
+    worktreeFingerprint: first.artifact.sourceRevision.kind === "GIT"
+      ? first.artifact.sourceRevision.worktreeFingerprint
+      : "unreachable",
   });
 });
 
@@ -471,7 +710,7 @@ it("fails closed when bounded Git status evidence is truncated", async () => {
     await writeFile(join(active.rootPath, `${String(index).padStart(3, "0")}-${"x".repeat(220)}.txt`), "x");
   }
   const browser = fakeBrowser("http://127.0.0.1:4310/");
-  const result = await captureRender({
+  await expect(captureRender({
     workspace: {
       ...active,
       hasGit: true,
@@ -483,13 +722,7 @@ it("fails closed when bounded Git status evidence is truncated", async () => {
     sessionId: "session-1",
     roundId: "round-1",
     browserLauncher: browser.launcher,
-  });
-
-  expect(result.artifact.sourceRevision).toEqual({
-    kind: "UNVERSIONED",
-    available: false,
-    reason: "GIT_EVIDENCE_UNAVAILABLE",
-  });
+  })).rejects.toThrow(/truncated|bounded|source evidence/i);
 });
 
 // Production break caught: a browser redirect, malformed route/identifier, or non-PNG response could mint false local render evidence.
@@ -577,6 +810,21 @@ it("requires ready render, capture, and runtime-write capabilities before openin
   }
 });
 
+it("refuses a declared Git workspace when complete Git evidence is not authorized", async () => {
+  const active = await workspace();
+  let launched = false;
+  await expect(captureRender({
+    workspace: { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: false } },
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: { async launch() { launched = true; return fakeBrowser("http://127.0.0.1:4310/").browser; } },
+  })).rejects.toThrow(/Git evidence.*authorized|complete Git evidence/i);
+  expect(launched).toBe(false);
+});
+
 // Production break caught: an artifact directory symlink can redirect screenshot writes outside runtime state.
 it("refuses symlink traversal in the exact render artifact hierarchy", async () => {
   const active = await workspace();
@@ -595,4 +843,159 @@ it("refuses symlink traversal in the exact render artifact hierarchy", async () 
     browserLauncher: browser.launcher,
   })).rejects.toThrow(/outside active project|render artifact hierarchy/i);
   await expect(readFile(join(outside, "round-1", "desktop.png"))).rejects.toThrow();
+});
+
+// Production break caught: capture stages that ignore cancellation can outlive the workflow and later mint stale evidence.
+it("bounds non-cooperative browser navigation and cleans both resources without persisting", async () => {
+  const active = await workspace();
+  const calls: string[] = [];
+  const page = {
+    async goto() { return new Promise<never>(() => undefined); },
+    url() { return "http://127.0.0.1:4310/"; },
+    async screenshot() { return PNG; },
+    async close() { calls.push("page-close"); },
+  };
+  const browser: BrowserHandle = {
+    async newPage() { return page; },
+    async close() { calls.push("browser-close"); },
+  };
+  await expect(Promise.race([
+    captureRender({
+      workspace: active,
+      baseUrl: "http://127.0.0.1:4310",
+      route: "/",
+      viewport: { name: "desktop", width: 1440, height: 800 },
+      sessionId: "session-1",
+      roundId: "round-1",
+      browserLauncher: { async launch() { return browser; } },
+      timeoutMs: 5,
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("test guard expired")), 250)),
+  ])).rejects.toThrow(/capture.*timeout|timed out/i);
+  expect(calls).toEqual(["page-close", "browser-close"]);
+  await expect(readFile(join(active.rootPath, ".design-sharingan/renders/session-1/round-1/desktop.png"))).rejects.toThrow();
+});
+
+// Production break caught: a browser launched after the deadline can leak unless its late settlement is explicitly closed.
+it("closes a browser that resolves after the overall capture deadline", async () => {
+  const active = await workspace();
+  let closeCalls = 0;
+  const browser: BrowserHandle = {
+    async newPage() { throw new Error("must not create a page"); },
+    async close() { closeCalls += 1; },
+  };
+  await expect(captureRender({
+    workspace: active,
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: { async launch() { await new Promise((resolve) => setTimeout(resolve, 30)); return browser; } },
+    timeoutMs: 5,
+  })).rejects.toThrow(/capture.*timeout|timed out/i);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(closeCalls).toBe(1);
+});
+
+// Production break caught: successful bytes are not persistable when owned browser cleanup cannot be proven within the deadline.
+it("refuses persistence when page cleanup never settles", async () => {
+  const active = await workspace();
+  let browserCloses = 0;
+  const page = {
+    async goto() {},
+    url() { return "http://127.0.0.1:4310/"; },
+    async screenshot() { return PNG; },
+    async close() { return new Promise<void>(() => undefined); },
+  };
+  await expect(Promise.race([
+    captureRender({
+      workspace: active,
+      baseUrl: "http://127.0.0.1:4310",
+      route: "/",
+      viewport: { name: "desktop", width: 1440, height: 800 },
+      sessionId: "session-1",
+      roundId: "round-1",
+      browserLauncher: { async launch() { return { async newPage() { return page; }, async close() { browserCloses += 1; } }; } },
+      timeoutMs: 5,
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("test guard expired")), 250)),
+  ])).rejects.toThrow(/cleanup|capture.*timeout|timed out/i);
+  expect(browserCloses).toBe(1);
+  await expect(readFile(join(active.rootPath, ".design-sharingan/renders/session-1/round-1/desktop.png"))).rejects.toThrow();
+});
+
+it("uses one bounded cleanup budget across page and browser closure", async () => {
+  const active = await workspace();
+  const page = {
+    async goto() {},
+    url() { return "http://127.0.0.1:4310/"; },
+    async screenshot() { return PNG; },
+    async close() { return new Promise<void>(() => undefined); },
+  };
+  const startedAt = Date.now();
+  await expect(captureRender({
+    workspace: active,
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: { async launch() { return { async newPage() { return page; }, async close() { return new Promise<void>(() => undefined); } }; } },
+    timeoutMs: 50,
+  })).rejects.toThrow(/cleanup.*timed out/i);
+  expect(Date.now() - startedAt).toBeLessThan(90);
+});
+
+it("does not cross the persistence commit point when aborted by the timestamp provider", async () => {
+  const active = await workspace();
+  const controller = new AbortController();
+  await expect(captureRender({
+    workspace: active,
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: fakeBrowser("http://127.0.0.1:4310/").launcher,
+    signal: controller.signal,
+    now() { controller.abort(); return new Date("2026-08-25T09:00:00.000Z"); },
+  })).rejects.toThrow(/aborted.*persistence/i);
+  await expect(readFile(join(active.rootPath, ".design-sharingan/renders/session-1/round-1/desktop.png"))).rejects.toThrow();
+});
+
+// Production break caught: npm can exit while a server grandchild remains alive in the process group owned by the renderer.
+it("terminates the owned process group even after its launcher has already exited", async () => {
+  if (process.platform === "win32") return;
+  const rootPath = await realpath(await mkdtemp(join(tmpdir(), "render-process-tree-")));
+  const script = "const{spawn}=require('node:child_process'),fs=require('node:fs');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('descendant.pid',String(c.pid));c.unref();";
+  await writeFile(join(rootPath, "package.json"), JSON.stringify({ scripts: { start: `node -e \"${script}\"` } }));
+  const owned = defaultProcessRunner.start({
+    executable: "npm",
+    args: ["run", "start"],
+    cwd: rootPath,
+    env: { PATH: process.env.PATH },
+    shell: false,
+  });
+  let descendantPid = 0;
+  try {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        descendantPid = Number(await readFile(join(rootPath, "descendant.pid"), "utf8"));
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    expect(descendantPid).toBeGreaterThan(0);
+    await owned.exited;
+    expect(() => process.kill(descendantPid, 0)).not.toThrow();
+    await owned.stop();
+    expect(() => process.kill(descendantPid, 0)).toThrow();
+  } finally {
+    if (descendantPid > 0) {
+      try { process.kill(descendantPid, "SIGKILL"); } catch { /* already stopped */ }
+    }
+    await rm(rootPath, { recursive: true, force: true });
+  }
 });
