@@ -225,11 +225,38 @@ export interface SafeMutationFailureEvidence {
 export interface RenderArtifact {
   id: string;
   sessionId: string;
+  roundId: string;
   route: string;
   viewport: string;
+  viewportWidth: number;
+  viewportHeight: number;
   imagePath: string;
   capturedAt: ISODateTime;
+  sourceRevision: RenderSourceRevision;
 }
+
+export interface GitStatusEntry {
+  index: string;
+  workingTree: string;
+  path: string;
+  originalPath?: string;
+}
+
+export type RenderSourceRevision =
+  | {
+      kind: "GIT";
+      available: true;
+      head: string;
+      branch: string;
+      status: "CLEAN" | "DIRTY";
+      entries: GitStatusEntry[];
+      truncated: boolean;
+    }
+  | {
+      kind: "UNVERSIONED";
+      available: false;
+      reason: "NOT_A_GIT_WORKSPACE" | "GIT_EVIDENCE_UNAVAILABLE";
+    };
 
 export interface VisualRound {
   roundNumber: number;

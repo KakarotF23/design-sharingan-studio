@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "paths": {
+      "@design-sharingan/core": ["../core/src/index.ts"],
+      "@design-sharingan/project-adapters": ["../project-adapters/src/index.ts"]
+    },
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

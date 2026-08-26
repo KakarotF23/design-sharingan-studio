@@ -6,6 +6,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
@@ -50,6 +51,16 @@ import {
 } from "../workspace-store";
 
 const temporaryRoots: string[] = [];
+const PNG_LIMIT_BYTES = 25 * 1024 * 1024;
+
+function pngBytes(width = 1440, height = 800, totalBytes = 24): Uint8Array {
+  const bytes = new Uint8Array(totalBytes);
+  bytes.set([137, 80, 78, 71, 13, 10, 26, 10], 0);
+  bytes.set([0, 0, 0, 13, 73, 72, 68, 82], 8);
+  new DataView(bytes.buffer).setUint32(16, width);
+  new DataView(bytes.buffer).setUint32(20, height);
+  return bytes;
+}
 
 async function temporaryProject(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "design-sharingan-store-"));
@@ -1470,8 +1481,11 @@ it("persists render bytes only inside the runtime renders directory", async () =
   const validMetadata: RenderArtifact = {
     id: "render-1",
     sessionId: "session-1",
+    roundId: "round-1",
     route: "/",
     viewport: "desktop",
+    viewportWidth: 1440,
+    viewportHeight: 800,
     imagePath: join(
       rootPath,
       ".design-sharingan",
@@ -1481,15 +1495,20 @@ it("persists render bytes only inside the runtime renders directory", async () =
       "desktop.png",
     ),
     capturedAt: "2026-08-24T10:00:00.000Z",
+    sourceRevision: {
+      kind: "UNVERSIONED",
+      available: false,
+      reason: "NOT_A_GIT_WORKSPACE",
+    },
   };
 
   const saved = await saveRenderArtifact(
     rootPath,
     validMetadata,
-    new Uint8Array([137, 80, 78, 71]),
+    pngBytes(),
   );
   expect(new Uint8Array(await readFile(saved.artifactPath))).toEqual(
-    new Uint8Array([137, 80, 78, 71]),
+    pngBytes(),
   );
   expect(JSON.parse(await readFile(saved.metadataPath, "utf8"))).toEqual({
     ...validMetadata,
@@ -1507,7 +1526,191 @@ it("persists render bytes only inside the runtime renders directory", async () =
     saveRenderArtifact(
       rootPath,
       { ...validMetadata, imagePath: join(rootPath, "src", "overwritten.png") },
-      new Uint8Array([1]),
+      pngBytes(),
     ),
   ).rejects.toThrow(/outside active project/i);
+
+  await expect(
+    saveRenderArtifact(
+      rootPath,
+      {
+        ...validMetadata,
+        imagePath: join(
+          rootPath,
+          ".design-sharingan",
+          "renders",
+          "session-1",
+          "different-round",
+          "desktop.png",
+        ),
+      },
+      pngBytes(),
+    ),
+  ).rejects.toThrow(/exact render artifact path/i);
+});
+
+// Production break caught: callers outside render-engine could persist malformed or non-PNG evidence under a trusted RenderArtifact shape.
+it("validates complete render evidence at the persistence boundary", async () => {
+  const rootPath = await temporaryProject();
+  await ensureDesignWorkspace(rootPath);
+  const imagePath = join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "desktop.png");
+  const metadata: RenderArtifact = {
+    id: "render-1",
+    sessionId: "session-1",
+    roundId: "round-1",
+    route: "/account",
+    viewport: "desktop",
+    viewportWidth: 1440,
+    viewportHeight: 800,
+    imagePath,
+    capturedAt: "2026-08-25T09:00:00.000Z",
+    sourceRevision: {
+      kind: "GIT",
+      available: true,
+      head: "a".repeat(40),
+      branch: "main",
+      status: "CLEAN",
+      entries: [],
+      truncated: false,
+    },
+  };
+  const png = pngBytes();
+
+  await expect(saveRenderArtifact(rootPath, { ...metadata, capturedAt: "yesterday" }, png)).rejects.toThrow(/timestamp/i);
+  await expect(saveRenderArtifact(rootPath, { ...metadata, route: "https://example.com" }, png)).rejects.toThrow(/route/i);
+  for (const route of ["/a/../account", "/account\r\nforged", "/account?next=%0d%0a"]) {
+    await expect(saveRenderArtifact(rootPath, { ...metadata, route }, png)).rejects.toThrow(/route/i);
+  }
+  await expect(saveRenderArtifact(rootPath, { ...metadata, viewportWidth: 1280 }, png)).rejects.toThrow(/dimensions/i);
+  await expect(saveRenderArtifact(rootPath, metadata, pngBytes(1440, 800, PNG_LIMIT_BYTES + 1))).rejects.toThrow(/too large/i);
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: {
+      kind: "GIT",
+      available: true,
+      head: "a".repeat(40),
+      branch: "main",
+      status: "CLEAN",
+      entries: [{ index: "?", workingTree: "?", path: "secret.txt" }],
+      truncated: false,
+    },
+  }, png)).rejects.toThrow(/source revision/i);
+  await expect(saveRenderArtifact(rootPath, metadata, new Uint8Array([1, 2, 3]))).rejects.toThrow(/PNG/i);
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: {
+      kind: "GIT",
+      available: true,
+      head: "a".repeat(40),
+      branch: "main",
+      status: "DIRTY",
+      entries: [{ index: "X", workingTree: "M", path: "tracked.txt" }],
+      truncated: false,
+    },
+  }, png)).rejects.toThrow(/source revision/i);
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: {
+      kind: "GIT",
+      available: true,
+      head: "a".repeat(40),
+      branch: "界".repeat(100),
+      status: "DIRTY",
+      entries: [{ index: "?", workingTree: "?", path: "untracked.txt" }],
+      truncated: false,
+    },
+  }, png)).rejects.toThrow(/source revision/i);
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    unexpected: true,
+  } as RenderArtifact, png)).rejects.toThrow(/metadata/i);
+
+  await expect(saveRenderArtifact(rootPath, {
+    ...metadata,
+    sourceRevision: {
+      kind: "UNVERSIONED",
+      available: false,
+      reason: "NOT_A_GIT_WORKSPACE",
+      unexpected: true,
+    },
+  } as RenderArtifact, png)).rejects.toThrow(/source revision/i);
+});
+
+// Production break caught: evidence overwrite or a metadata-write failure can replace history or leave an unbound screenshot orphan.
+it("creates an immutable render pair and rolls back the image if metadata creation fails", async () => {
+  const rootPath = await temporaryProject();
+  const workspacePaths = await ensureDesignWorkspace(rootPath);
+  const metadata: RenderArtifact = {
+    id: "render-1",
+    sessionId: "session-1",
+    roundId: "round-1",
+    route: "/",
+    viewport: "desktop",
+    viewportWidth: 1440,
+    viewportHeight: 800,
+    imagePath: join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "desktop.png"),
+    capturedAt: "2026-08-25T09:00:00.000Z",
+    sourceRevision: { kind: "UNVERSIONED", available: false, reason: "NOT_A_GIT_WORKSPACE" },
+  };
+  const png = pngBytes();
+  await saveRenderArtifact(rootPath, metadata, png);
+  await expect(saveRenderArtifact(rootPath, metadata, png)).rejects.toThrow(/already exists/i);
+
+  const second = {
+    ...metadata,
+    id: "render-2",
+    viewport: "tablet",
+    imagePath: join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "tablet.png"),
+  };
+  const metadataDirectory = join(workspacePaths.rendersPath, "session-1", "round-1", "tablet.json");
+  await mkdir(metadataDirectory);
+  await expect(saveRenderArtifact(rootPath, second, png)).rejects.toThrow();
+  await expect(readFile(second.imagePath)).rejects.toThrow();
+});
+
+// Production break caught: rollback must not unlink a replacement another process installed after the owned image was created.
+it("leaves a concurrently replaced image intact when metadata creation fails", async () => {
+  const rootPath = await temporaryProject();
+  await ensureDesignWorkspace(rootPath);
+  const imagePath = join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "desktop.png");
+  const artifactDirectory = dirname(imagePath);
+  const metadata: RenderArtifact = {
+    id: "render-race",
+    sessionId: "session-1",
+    roundId: "round-1",
+    route: "/",
+    viewport: "desktop",
+    viewportWidth: 1440,
+    viewportHeight: 800,
+    imagePath,
+    capturedAt: "2026-08-25T09:00:00.000Z",
+    sourceRevision: { kind: "UNVERSIONED", available: false, reason: "NOT_A_GIT_WORKSPACE" },
+  };
+  await mkdir(artifactDirectory, { recursive: true });
+  await mkdir(join(artifactDirectory, "desktop.json"));
+  const replacement = pngBytes(1440, 800, 25);
+  replacement[24] = 99;
+
+  const replacer = (async () => {
+    for (;;) {
+      try {
+        await lstat(imagePath);
+        break;
+      } catch {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    }
+    await rename(imagePath, join(artifactDirectory, "owned-original.png"));
+    await writeFile(imagePath, replacement);
+  })();
+
+  await expect(Promise.all([
+    saveRenderArtifact(rootPath, metadata, pngBytes()),
+    replacer,
+  ])).rejects.toThrow();
+  expect(new Uint8Array(await readFile(imagePath))).toEqual(replacement);
+  expect((await lstat(join(artifactDirectory, "owned-original.png"))).isFile()).toBe(true);
 });

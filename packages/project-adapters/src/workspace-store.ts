@@ -30,6 +30,7 @@ import { assertPathInsideWorkspace } from "./path-policy";
 const MACHINE_DIRECTORY = ".design-sharingan";
 const MAX_REFERENCE_BYTES = 10 * 1024 * 1024;
 const MAX_RECORD_BYTES = 1024 * 1024;
+const MAX_RENDER_BYTES = 25 * 1024 * 1024;
 
 export interface DesignWorkspace {
   rootPath: string;
@@ -156,7 +157,7 @@ async function atomicCreate(
   allowedRoot: string,
   destinationPath: string,
   contents: string | Uint8Array,
-): Promise<void> {
+): Promise<{ dev: number; ino: number }> {
   const canonicalDestination = assertPathInsideWorkspace(
     allowedRoot,
     destinationPath,
@@ -169,15 +170,19 @@ async function atomicCreate(
     ),
   );
   let temporaryFile: Awaited<ReturnType<typeof open>> | undefined;
+  let ownership: { dev: number; ino: number } | undefined;
 
   try {
     temporaryFile = await open(temporaryPath, "wx", 0o600);
     await temporaryFile.writeFile(contents);
     await temporaryFile.sync();
+    const entry = await temporaryFile.stat();
+    ownership = { dev: entry.dev, ino: entry.ino };
     await temporaryFile.close();
     temporaryFile = undefined;
     await link(temporaryPath, canonicalDestination);
     await unlink(temporaryPath).catch(() => undefined);
+    return ownership;
   } catch (error) {
     if (temporaryFile !== undefined) {
       await temporaryFile.close().catch(() => undefined);
@@ -185,6 +190,23 @@ async function atomicCreate(
     await unlink(temporaryPath).catch(() => undefined);
     throw error;
   }
+}
+
+async function unlinkCreatedFileIfOwned(
+  path: string,
+  ownership: { dev: number; ino: number },
+): Promise<void> {
+  let entry: Awaited<ReturnType<typeof lstat>>;
+  try {
+    entry = await lstat(path);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+  if (entry.dev !== ownership.dev || entry.ino !== ownership.ino) {
+    throw new Error("Render artifact ownership changed during rollback; replacement was preserved");
+  }
+  await unlink(path);
 }
 
 function boundedSessionContents(session: DesignSession): string {
@@ -1711,11 +1733,145 @@ export async function saveRenderArtifact(
   metadata: RenderArtifact,
   bytes: Uint8Array,
 ): Promise<SavedArtifact> {
+  const hasExactKeys = (value: object, expected: readonly string[]): boolean => {
+    const actual = Object.keys(value).sort();
+    const wanted = [...expected].sort();
+    return actual.length === wanted.length &&
+      actual.every((key, index) => key === wanted[index]);
+  };
+  if (!hasExactKeys(metadata, [
+    "id",
+    "sessionId",
+    "roundId",
+    "route",
+    "viewport",
+    "viewportWidth",
+    "viewportHeight",
+    "imagePath",
+    "capturedAt",
+    "sourceRevision",
+  ])) {
+    throw new Error("Render artifact metadata contains missing or undeclared fields");
+  }
+  const isIsoTimestamp = (value: string): boolean => {
+    const milliseconds = Date.parse(value);
+    return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+  };
+  const isCanonicalRoute = (value: string): boolean => {
+    try {
+      if (
+        !value.startsWith("/") ||
+        value.startsWith("//") ||
+        value.length > 2048 ||
+        value.includes("\\") ||
+        /[\u0000-\u001f\u007f]/.test(value) ||
+        /[\u0000-\u001f\u007f]/.test(decodeURIComponent(value))
+      ) {
+        return false;
+      }
+      const parsed = new URL(value, "http://render.invalid");
+      return `${parsed.pathname}${parsed.search}${parsed.hash}` === value;
+    } catch {
+      return false;
+    }
+  };
+  const isSafeGitPath = (value: unknown): value is string =>
+    typeof value === "string" &&
+    Buffer.byteLength(value, "utf8") > 0 &&
+    Buffer.byteLength(value, "utf8") <= 1024 &&
+    !value.startsWith("/") &&
+    value !== ".." &&
+    !value.startsWith("../") &&
+    !value.includes("\0") &&
+    !value.includes("\n") &&
+    !value.includes("\r");
+  const source = metadata.sourceRevision;
+  const allowedIndexStatusCodes = new Set([" ", "M", "T", "A", "D", "R", "C", "U"]);
+  const allowedWorktreeStatusCodes = new Set([" ", "M", "T", "D", "R", "C", "U"]);
+  const validSourceRevision = source.kind === "UNVERSIONED"
+    ? hasExactKeys(source, ["kind", "available", "reason"]) &&
+      source.available === false &&
+      (source.reason === "NOT_A_GIT_WORKSPACE" || source.reason === "GIT_EVIDENCE_UNAVAILABLE")
+    : source.kind === "GIT" &&
+      hasExactKeys(source, ["kind", "available", "head", "branch", "status", "entries", "truncated"]) &&
+      source.available === true &&
+      /^[0-9a-f]{40,64}$/i.test(source.head) &&
+      Buffer.byteLength(source.branch, "utf8") > 0 &&
+      Buffer.byteLength(source.branch, "utf8") <= 255 &&
+      !/[\0\r\n]/.test(source.branch) &&
+      (source.status === "CLEAN" || source.status === "DIRTY") &&
+      typeof source.truncated === "boolean" &&
+      Array.isArray(source.entries) &&
+      source.entries.length <= 512 &&
+      source.entries.every((entry) => {
+        const renamed = entry.index === "R" || entry.index === "C" ||
+          entry.workingTree === "R" || entry.workingTree === "C";
+        return (
+        (entry.originalPath === undefined
+          ? hasExactKeys(entry, ["index", "workingTree", "path"])
+          : hasExactKeys(entry, ["index", "workingTree", "path", "originalPath"])) &&
+        typeof entry.index === "string" && entry.index.length === 1 &&
+        typeof entry.workingTree === "string" && entry.workingTree.length === 1 &&
+        (((entry.index === "?" && entry.workingTree === "?") ||
+          (entry.index === "!" && entry.workingTree === "!")) ||
+          (allowedIndexStatusCodes.has(entry.index) &&
+            allowedWorktreeStatusCodes.has(entry.workingTree) &&
+            !(entry.index === " " && entry.workingTree === " "))) &&
+        renamed === (entry.originalPath !== undefined) &&
+        isSafeGitPath(entry.path) &&
+        (entry.originalPath === undefined || isSafeGitPath(entry.originalPath)));
+      }) &&
+      (source.status === "CLEAN"
+        ? source.entries.length === 0 && source.truncated === false
+        : source.entries.length > 0 || source.truncated === true);
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(metadata.id) ||
+    !isCanonicalRoute(metadata.route) ||
+    !Number.isSafeInteger(metadata.viewportWidth) ||
+    metadata.viewportWidth < 240 ||
+    metadata.viewportWidth > 7680 ||
+    !Number.isSafeInteger(metadata.viewportHeight) ||
+    metadata.viewportHeight < 240 ||
+    metadata.viewportHeight > 7680 ||
+    !isIsoTimestamp(metadata.capturedAt) ||
+    !validSourceRevision
+  ) {
+    throw new Error("Render artifact metadata, timestamp, route, or source revision is invalid");
+  }
+  if (
+    bytes.byteLength < 24 ||
+    ![137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte) ||
+    bytes[12] !== 73 || bytes[13] !== 72 || bytes[14] !== 68 || bytes[15] !== 82
+  ) {
+    throw new Error("Render artifact bytes must be a non-empty PNG");
+  }
+  if (bytes.byteLength > MAX_RENDER_BYTES) {
+    throw new Error("Render artifact PNG is too large; maximum size is 25 MiB");
+  }
+  const pngHeader = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (
+    pngHeader.getUint32(16) !== metadata.viewportWidth ||
+    pngHeader.getUint32(20) !== metadata.viewportHeight
+  ) {
+    throw new Error("Render artifact PNG dimensions do not match metadata dimensions");
+  }
   const workspace = await ensureDesignWorkspace(rootPath);
+  assertSafePathSegment(metadata.sessionId, "Render session id");
+  assertSafePathSegment(metadata.roundId, "Render round id");
+  assertSafePathSegment(metadata.viewport, "Render viewport");
+  const expectedArtifactPath = assertPathInsideWorkspace(workspace.rendersPath, join(
+    workspace.rendersPath,
+    metadata.sessionId,
+    metadata.roundId,
+    `${metadata.viewport}.png`,
+  ));
   const artifactPath = assertPathInsideWorkspace(
     workspace.rendersPath,
     metadata.imagePath,
   );
+  if (artifactPath !== expectedArtifactPath) {
+    throw new Error("Render artifact must use the exact render artifact path");
+  }
   const artifactDirectory = dirname(artifactPath);
   await mkdir(artifactDirectory, { recursive: true });
 
@@ -1730,11 +1886,38 @@ export async function saveRenderArtifact(
     ),
   );
 
-  await atomicWrite(workspace.rendersPath, artifactPath, bytes);
-  await atomicWriteJson(workspace.rendersPath, metadataPath, {
+  const persistedMetadata = {
     ...metadata,
     imagePath: artifactPath,
-  });
+  };
+  const metadataContents = stableJson(persistedMetadata);
+  if (Buffer.byteLength(metadataContents, "utf8") > MAX_RECORD_BYTES) {
+    throw new Error("Render artifact metadata is too large; maximum size is 1 MiB");
+  }
+
+  let artifactOwnership: { dev: number; ino: number } | undefined;
+  try {
+    artifactOwnership = await atomicCreate(workspace.rendersPath, artifactPath, bytes);
+    await atomicCreate(workspace.rendersPath, metadataPath, metadataContents);
+  } catch (error) {
+    if (artifactOwnership !== undefined) {
+      try {
+        await unlinkCreatedFileIfOwned(artifactPath, artifactOwnership);
+      } catch (rollbackError) {
+        throw new Error("Render artifact metadata creation failed and owned-image rollback could not safely complete", {
+          cause: { persistenceError: error, rollbackError },
+        });
+      }
+    }
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error.code === "EEXIST" || error.code === "EISDIR")
+    ) {
+      throw new Error("Render artifact already exists; evidence is immutable", { cause: error });
+    }
+    throw error;
+  }
 
   return { artifactPath, metadataPath };
 }
