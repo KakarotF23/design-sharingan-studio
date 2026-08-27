@@ -8,9 +8,13 @@ import type {
 } from "@design-sharingan/core";
 import { ModeSwitcher, WorkspaceHeader } from "@design-sharingan/ui";
 import { useCallback, useEffect, useState } from "react";
-import { useStudioProject } from "../projects/project-shell";
+import {
+  useStudioExecutionMode,
+  useStudioProject,
+} from "../projects/project-shell";
 import { ApprovalActions } from "./approval-actions";
 import { ChangeProposalView } from "./change-proposal-view";
+import { MangekyoWorkspace } from "./mangekyo-workspace";
 
 interface GitEvidence {
   available: boolean;
@@ -126,6 +130,7 @@ export function ExecuteWorkspace() {
   const [activeAction, setActiveAction] = useState<SafeAction>();
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
+  const { mode, setMode } = useStudioExecutionMode();
 
   const fetchDurableSession = useCallback(async (): Promise<ExecuteSession | undefined> => {
     const response = await fetch(`/projects/${encodeURIComponent(project.id)}/execute/data`, {
@@ -233,6 +238,10 @@ export function ExecuteWorkspace() {
     session?.status === "APPROVED" && session.executionFailure === undefined;
   const git = session?.mutationEvidence?.git;
 
+  if (mode === "MANGEKYO" && session?.status === "EDITING") {
+    return <MangekyoWorkspace safeSessionId={session.id} onModeChange={setMode} />;
+  }
+
   return (
     <div
       className="execute-workspace"
@@ -242,7 +251,13 @@ export function ExecuteWorkspace() {
         eyebrow={`BOUNDED CHANGE / ${project.name.toUpperCase()}`}
         title="Execute"
         description="Safe Mode separates an approved design direction from a new, proposal-specific mutation approval. No source changes occur before that second human gate."
-        actions={<ModeSwitcher mode="SAFE" />}
+        actions={
+          <ModeSwitcher
+            mode="SAFE"
+            onChange={setMode}
+            mangekyoDisabled={session?.status !== "EDITING"}
+          />
+        }
       />
       <p className="safe-activity" role="status" aria-live="polite">
         <span aria-hidden="true" />

@@ -5,9 +5,14 @@ export type StudioMode = "SAFE" | "MANGEKYO";
 export interface ModeSwitcherProps {
   mode: StudioMode;
   onChange?: (mode: StudioMode) => void;
+  mangekyoDisabled?: boolean;
 }
 
-export function ModeSwitcher({ mode, onChange }: ModeSwitcherProps) {
+export function ModeSwitcher({
+  mode,
+  onChange,
+  mangekyoDisabled = onChange === undefined,
+}: ModeSwitcherProps) {
   return (
     <div className="ds-mode-switcher">
       <div role="group" aria-label="Execution mode">
@@ -20,16 +25,19 @@ export function ModeSwitcher({ mode, onChange }: ModeSwitcherProps) {
         </button>
         <button
           type="button"
-          aria-pressed={false}
-          aria-describedby="ds-mangekyo-unavailable"
-          disabled
+          aria-pressed={mode === "MANGEKYO"}
+          aria-describedby={mangekyoDisabled ? "ds-mangekyo-unavailable" : undefined}
+          disabled={mangekyoDisabled}
+          onClick={() => onChange?.("MANGEKYO")}
         >
           Mangekyō
         </button>
       </div>
-      <span id="ds-mangekyo-unavailable" className="ds-mode-switcher__note">
-        Mangekyō becomes available after its policy engine is implemented.
-      </span>
+      {mangekyoDisabled ? (
+        <span id="ds-mangekyo-unavailable" className="ds-mode-switcher__note">
+          Mangekyō becomes available after its policy engine and an approved Safe Mode mutation are ready.
+        </span>
+      ) : null}
     </div>
   );
 }

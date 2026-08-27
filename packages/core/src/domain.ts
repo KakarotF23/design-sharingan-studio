@@ -1,3 +1,9 @@
+import type {
+  AutonomyChange,
+  AutonomyPolicy,
+  AutonomyPolicyEvaluation,
+} from "./policy";
+
 export type ISODateTime = string;
 
 export type ProjectStatus =
@@ -288,6 +294,84 @@ export interface VisualFinding {
   reason: string;
   recommendedAction: string;
   status: string;
+}
+
+export interface MangekyoRenderTarget {
+  route: string;
+  viewport: {
+    name: string;
+    width: number;
+    height: number;
+  };
+}
+
+export interface MangekyoPolicyEvaluationEvidence {
+  id: string;
+  roundNumber: number;
+  proposalId: string;
+  change: AutonomyChange;
+  policy: AutonomyPolicy;
+  evaluation: AutonomyPolicyEvaluation;
+  evaluatedAt: ISODateTime;
+}
+
+export interface MangekyoHumanGate {
+  id: string;
+  roundNumber: number;
+  requestedChange: AutonomyChange;
+  proposal: ChangeProposal;
+  proposalThreadId: string;
+  policyEvaluationId: string;
+  requestedAt: ISODateTime;
+  reasons: string[];
+  affectedScope: string[];
+  impact: string;
+}
+
+export interface MangekyoHumanGateDecision {
+  id: string;
+  gateId: string;
+  decision: "REJECT" | "APPROVE_ONCE" | "EXPAND_SCOPE";
+  decidedBy: string;
+  createdAt: ISODateTime;
+  comment?: string;
+  policyAfter?: AutonomyPolicy;
+}
+
+export interface MangekyoRoundEvidence {
+  round: VisualRound;
+  proposal: ChangeProposal;
+  proposalThreadId: string;
+  policyEvaluationId: string;
+  mutationCompletedAt: ISODateTime;
+  visualAnalysisThreadId: string;
+  gateDecisionId?: string;
+}
+
+export interface MangekyoLoopSession extends DesignSession {
+  type: "MANGEKYO_LOOP";
+  status: MangekyoStatus;
+  sourceExecutionSessionId: string;
+  sourceDesignSessionId: string;
+  approvedApproachId: string;
+  directionApprovalId: string;
+  approvedDirection: string;
+  initialPolicy: AutonomyPolicy;
+  policy: AutonomyPolicy;
+  renderTarget: MangekyoRenderTarget;
+  referenceIds: string[];
+  maxRounds: number;
+  importantThreshold: number;
+  claimedScreens: string[];
+  inspectedScreens: string[];
+  rounds: MangekyoRoundEvidence[];
+  policyEvaluations: MangekyoPolicyEvaluationEvidence[];
+  gates: MangekyoHumanGate[];
+  gateDecisions: MangekyoHumanGateDecision[];
+  currentGate?: MangekyoHumanGate;
+  initialRender?: RenderArtifact;
+  finalRender?: RenderArtifact;
+  stopReason?: string;
 }
 
 export interface DesignGenome {

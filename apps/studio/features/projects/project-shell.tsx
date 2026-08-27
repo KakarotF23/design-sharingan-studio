@@ -3,11 +3,13 @@
 import {
   createContext,
   useContext,
+  useEffect,
   useMemo,
+  useState,
   type ReactNode,
 } from "react";
 import { usePathname } from "next/navigation";
-import { StudioShell } from "@design-sharingan/ui";
+import { StudioShell, type StudioMode } from "@design-sharingan/ui";
 import {
   workspaceDefinitions,
   type StudioProjectState,
@@ -17,6 +19,9 @@ import {
 const ProjectStateContext = createContext<StudioProjectState | undefined>(
   undefined,
 );
+const ExecutionModeContext = createContext<
+  { mode: StudioMode; setMode(mode: StudioMode): void } | undefined
+>(undefined);
 
 function activeWorkspace(pathname: string): WorkspaceKind {
   const segment = pathname.split("/").filter(Boolean).at(-1);
@@ -33,6 +38,15 @@ export function useStudioProject(): StudioProjectState {
   return project;
 }
 
+export function useStudioExecutionMode(): {
+  mode: StudioMode;
+  setMode(mode: StudioMode): void;
+} {
+  const state = useContext(ExecutionModeContext);
+  if (state === undefined) throw new Error("Studio execution mode is unavailable");
+  return state;
+}
+
 export function ProjectShell({
   project,
   children,
@@ -43,6 +57,11 @@ export function ProjectShell({
   const pathname = usePathname();
   const workspace = activeWorkspace(pathname);
   const definition = workspaceDefinitions[workspace];
+  const [executionMode, setExecutionMode] = useState<StudioMode>("SAFE");
+
+  useEffect(() => {
+    if (workspace !== "execute") setExecutionMode("SAFE");
+  }, [workspace]);
 
   const context = useMemo(
     () => [
@@ -50,7 +69,12 @@ export function ProjectShell({
       { label: "Project", value: project.name },
       { label: "Source", value: project.sourceType },
       { label: "Framework", value: project.framework ?? "Unknown" },
-      { label: "Mode", value: "Safe" },
+      {
+        label: "Mode",
+        value: workspace === "execute" && executionMode === "MANGEKYO"
+          ? "Mangekyō"
+          : "Safe",
+      },
       {
         label: "Runtime",
         value: project.capabilities.canRun
@@ -64,23 +88,25 @@ export function ProjectShell({
           : "Render unavailable",
       },
     ],
-    [definition.title, project],
+    [definition.title, executionMode, project, workspace],
   );
 
   return (
     <ProjectStateContext.Provider value={project}>
-      <StudioShell
-        project={project}
-        activePath={pathname}
-        context={context}
-        activityStatus={
-          project.status === "READY"
-            ? "Project ready for a deliberate next action"
-            : "Project configuration required before execution"
-        }
-      >
-        {children}
-      </StudioShell>
+      <ExecutionModeContext.Provider value={{ mode: executionMode, setMode: setExecutionMode }}>
+        <StudioShell
+          project={project}
+          activePath={pathname}
+          context={context}
+          activityStatus={
+            project.status === "READY"
+              ? "Project ready for a deliberate next action"
+              : "Project configuration required before execution"
+          }
+        >
+          {children}
+        </StudioShell>
+      </ExecutionModeContext.Provider>
     </ProjectStateContext.Provider>
   );
 }

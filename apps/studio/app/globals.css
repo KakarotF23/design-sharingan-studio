@@ -1053,6 +1053,281 @@ textarea:focus-visible {
   background: var(--crimson);
 }
 
+.mangekyo-activity {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin: 0;
+  padding: 0.8rem 1rem;
+  border: 1px solid #4c3033;
+  color: var(--muted);
+  background: #121013;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.04em;
+}
+
+.mangekyo-activity span {
+  width: 0.45rem;
+  height: 0.45rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--crimson);
+}
+
+.mangekyo-start {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 2rem;
+  padding: clamp(1.2rem, 3vw, 2rem);
+  border-top: 2px solid var(--crimson);
+  border-bottom: 1px solid var(--steel);
+  background: #10141a;
+}
+
+.mangekyo-start h2,
+.visual-compare h2,
+.mangekyo-findings h2,
+.visual-rounds h2,
+.autonomy-boundary h2 {
+  margin: 0.45rem 0 0.8rem;
+  font-family: var(--font-display);
+  font-size: clamp(1.7rem, 3vw, 2.55rem);
+  letter-spacing: -0.035em;
+}
+
+.mangekyo-start p:last-child,
+.visual-compare figure p,
+.visual-rounds__empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.6;
+}
+
+.mangekyo-round-head {
+  display: grid;
+  grid-template-columns: minmax(11rem, 0.45fr) minmax(0, 1.55fr);
+  border-top: 2px solid var(--crimson);
+  border-left: 1px solid var(--steel);
+}
+
+.mangekyo-round-head > div,
+.mangekyo-round-head dl {
+  margin: 0;
+  padding: 1rem;
+  border-right: 1px solid var(--steel);
+  border-bottom: 1px solid var(--steel);
+}
+
+.mangekyo-round-head strong {
+  display: inline-block;
+  margin-top: 0.4rem;
+  font-family: var(--font-display);
+  font-size: 3.5rem;
+  line-height: 0.9;
+}
+
+.mangekyo-round-head > div > span {
+  color: var(--dimmed);
+  font-family: var(--font-mono);
+}
+
+.mangekyo-round-head dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.mangekyo-round-head dt,
+.visual-rounds dt,
+.autonomy-boundary dt {
+  color: var(--dimmed);
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.mangekyo-round-head dd,
+.visual-rounds dd,
+.autonomy-boundary dd {
+  margin: 0.35rem 0 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.visual-compare > header,
+.mangekyo-findings > header,
+.visual-rounds > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--steel);
+}
+
+.visual-compare > header > span {
+  color: var(--crimson);
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+}
+
+.visual-compare__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-left: 1px solid var(--steel);
+}
+
+.visual-compare figure {
+  min-width: 0;
+  margin: 0;
+  padding: 1rem;
+  border-right: 1px solid var(--steel);
+  border-bottom: 1px solid var(--steel);
+  background: #0e1116;
+}
+
+.visual-compare figcaption {
+  margin-bottom: 0.8rem;
+  color: var(--dimmed);
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+}
+
+.visual-compare img {
+  width: 100%;
+  max-height: 30rem;
+  display: block;
+  object-fit: contain;
+  background: #080a0d;
+}
+
+.mangekyo-findings ol,
+.visual-rounds ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mangekyo-findings > p {
+  color: var(--muted);
+}
+
+.mangekyo-findings li {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  gap: 1rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--steel);
+}
+
+.mangekyo-findings li > span {
+  align-self: start;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #6d3539;
+  color: #d68387;
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  text-align: center;
+}
+
+.mangekyo-findings li[data-severity="IMPORTANT"] > span { color: #d5b986; border-color: #66583b; }
+.mangekyo-findings li[data-severity="POLISH"] > span { color: #a8c0ae; border-color: #35483b; }
+
+.mangekyo-findings h3,
+.visual-rounds h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+}
+
+.mangekyo-findings li p,
+.mangekyo-findings li strong,
+.visual-rounds li p {
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 400;
+  line-height: 1.55;
+}
+
+.mangekyo-findings li strong { display: block; color: var(--bone); }
+
+.autonomy-boundary {
+  display: grid;
+  grid-template-columns: 4.5rem minmax(0, 1fr);
+  gap: 1.2rem;
+  padding: clamp(1.2rem, 3vw, 2rem);
+  border: 1px solid #6d3539;
+  border-top: 2px solid var(--crimson);
+  background: #171114;
+}
+
+.autonomy-boundary__signal {
+  width: 3.25rem;
+  height: 3.25rem;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--crimson);
+  border-radius: 50%;
+  color: var(--crimson);
+  font-family: var(--font-display);
+  font-size: 2rem;
+}
+
+.autonomy-boundary > div > p:not(.utility-label) {
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.autonomy-boundary dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin: 1.2rem 0;
+}
+
+.autonomy-boundary__actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid #6d3539;
+  border-left: 1px solid #6d3539;
+}
+
+.autonomy-boundary__actions button {
+  min-height: 2.8rem;
+  border: 0;
+  border-right: 1px solid #6d3539;
+  border-bottom: 1px solid #6d3539;
+  color: var(--bone);
+  background: #21171a;
+  cursor: pointer;
+}
+
+.visual-rounds li {
+  display: grid;
+  grid-template-columns: 9rem minmax(0, 1fr) minmax(12rem, 0.6fr);
+  gap: 1rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--steel);
+}
+
+.visual-rounds__index {
+  display: grid;
+  align-content: start;
+  gap: 0.35rem;
+  color: var(--bone);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+}
+
+.visual-rounds__index span { color: var(--crimson); }
+.visual-rounds dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.6rem; margin: 0; }
+
 .proposal-start {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1555,6 +1830,24 @@ textarea:focus-visible {
   .proposal-start {
     grid-template-columns: 1fr;
     align-items: stretch;
+  }
+
+  .mangekyo-start,
+  .mangekyo-round-head,
+  .visual-compare__grid,
+  .autonomy-boundary,
+  .visual-rounds li {
+    grid-template-columns: 1fr;
+  }
+
+  .mangekyo-round-head dl,
+  .autonomy-boundary dl,
+  .autonomy-boundary__actions {
+    grid-template-columns: 1fr;
+  }
+
+  .mangekyo-findings li {
+    grid-template-columns: 6rem minmax(0, 1fr);
   }
 
   .proposal-start button,

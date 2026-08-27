@@ -145,7 +145,7 @@ function projectEnvironment(
   isolatedHome: string,
 ): NodeJS.ProcessEnv {
   const inheritedKeys = ["PATH", "TMPDIR", "TMP", "TEMP", "NODE_ENV", "CI", "NO_COLOR"] as const;
-  const environment: NodeJS.ProcessEnv = {
+  const environment: Record<string, string | undefined> = {
     HOME: isolatedHome,
     XDG_CONFIG_HOME: join(isolatedHome, "config"),
     XDG_CACHE_HOME: join(isolatedHome, "cache"),
@@ -173,7 +173,7 @@ function projectEnvironment(
     }
     environment[key] = value;
   }
-  return environment;
+  return environment as NodeJS.ProcessEnv;
 }
 
 export const defaultProcessRunner: ProcessRunner = {

@@ -145,7 +145,7 @@ async function runGit(cwd: string, args: readonly string[]): Promise<GitResult> 
     let retainedBytes = 0;
     let originalBytes = 0;
     let finished = false;
-    const environment: NodeJS.ProcessEnv = {
+    const environment: Record<string, string | undefined> = {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: undefined,
       XDG_CONFIG_HOME: undefined,
@@ -168,7 +168,7 @@ async function runGit(cwd: string, args: readonly string[]): Promise<GitResult> 
       ...args,
     ], {
       cwd,
-      env: environment,
+      env: environment as NodeJS.ProcessEnv,
       shell: false,
       stdio: ["ignore", "pipe", "ignore"],
     });

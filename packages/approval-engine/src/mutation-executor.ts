@@ -27,10 +27,17 @@ import {
 import type { CodexAgentRunInput } from "@design-sharingan/agent-runtime";
 import type {
   Approval,
+  AutonomyChange,
+  AutonomyPolicy,
+  AutonomyPolicyEvaluation,
   ChangeProposal,
+  MangekyoHumanGate,
+  MangekyoHumanGateDecision,
+  MangekyoPolicyEvaluationEvidence,
   SafeMutationFailureEvidence,
   SafeMutationTargetDisposition,
 } from "@design-sharingan/core";
+import { evaluateAutonomyPolicy } from "@design-sharingan/core";
 
 const MAX_APPROVED_PATHS = 128;
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -112,6 +119,62 @@ export interface MutationExecutorOptions {
   agent: MutationAgent;
   mutationDriver?: MutationDriver;
 }
+
+export interface AutonomousMutationAuthorization {
+  kind: "AUTONOMOUS_POLICY_ALLOW";
+  id: string;
+  loopSessionId: string;
+  proposalId: string;
+  proposalThreadId: string;
+  change: AutonomyChange;
+  policy: AutonomyPolicy;
+  evaluation: AutonomyPolicyEvaluation & { decision: "ALLOW" };
+  evaluatedAt: string;
+  expiresAt: string;
+}
+
+export interface ExecutePolicyAuthorizedMutationInput {
+  workspaceRoot: string;
+  loopSessionId: string;
+  proposal: ChangeProposal;
+  proposalThreadId: string;
+  policy: AutonomyPolicy;
+  change: AutonomyChange;
+  agent: MutationAgent;
+  mutationDriver?: MutationDriver;
+}
+
+export interface ExecuteApproveOnceMutationInput {
+  workspaceRoot: string;
+  loopSessionId: string;
+  proposal: ChangeProposal;
+  proposalThreadId: string;
+  change: AutonomyChange;
+  gate: MangekyoHumanGate;
+  policyEvaluation: MangekyoPolicyEvaluationEvidence;
+  decision: MangekyoHumanGateDecision & { decision: "APPROVE_ONCE" };
+  now: Date;
+  agent: MutationAgent;
+  mutationDriver?: MutationDriver;
+}
+
+export interface PolicyAuthorizationStore {
+  createId(): string;
+  now(): Date;
+  persistAuthorization(authorization: AutonomousMutationAuthorization): Promise<void>;
+  loadAuthorization(id: string): Promise<unknown>;
+}
+
+export type PolicyAuthorizedMutationResult =
+  | {
+      decision: "HUMAN_GATE";
+      evaluation: AutonomyPolicyEvaluation & { decision: "HUMAN_GATE" };
+    }
+  | {
+      decision: "APPLIED";
+      authorization: AutonomousMutationAuthorization;
+      mutation: MutationResult;
+    };
 
 export class SafeMutationExecutionError extends Error {
   readonly failure: SafeMutationFailureEvidence;
@@ -245,6 +308,155 @@ function validateGate(proposal: ChangeProposal, approval: Approval | undefined):
   }
   if (!safeIdentifier(proposal.id) || !safeIdentifier(proposal.sessionId)) {
     throw new Error("Safe Mode proposal identity is invalid");
+  }
+}
+
+function stableJson(value: unknown): string {
+  function sort(entry: unknown): unknown {
+    if (Array.isArray(entry)) return entry.map(sort);
+    if (entry !== null && typeof entry === "object") {
+      return Object.fromEntries(
+        Object.entries(entry)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, nested]) => [key, sort(nested)]),
+      );
+    }
+    return entry;
+  }
+  return JSON.stringify(sort(value));
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function validAutonomyPolicy(value: AutonomyPolicy): boolean {
+  return (
+    typeof value.allowStyleChanges === "boolean" &&
+    typeof value.allowSmallComponentRefactors === "boolean" &&
+    Number.isSafeInteger(value.maxFilesForComponentRefactor) &&
+    value.maxFilesForComponentRefactor >= 0 &&
+    value.maxFilesForComponentRefactor <= MAX_APPROVED_PATHS &&
+    typeof value.allowNewPresentationalComponents === "boolean" &&
+    typeof value.allowDependencyInstall === "boolean" &&
+    typeof value.allowNavigationChanges === "boolean" &&
+    typeof value.allowDataModelChanges === "boolean" &&
+    typeof value.allowFileDeletion === "boolean" &&
+    Array.isArray(value.protectedPaths) &&
+    value.protectedPaths.length > 0 &&
+    value.protectedPaths.length <= MAX_APPROVED_PATHS &&
+    value.protectedPaths.every(
+      (path) =>
+        typeof path === "string" &&
+        path.length > 0 &&
+        Buffer.byteLength(path, "utf8") <= 512 &&
+        !path.includes("\0"),
+    )
+  );
+}
+
+function validateAutonomousGate(
+  proposal: ChangeProposal,
+  authorization: AutonomousMutationAuthorization,
+  now: Date,
+): void {
+  const proposalFiles = [
+    ...proposal.filesToCreate,
+    ...proposal.filesToModify,
+    ...proposal.filesToDelete,
+  ];
+  const reevaluated = evaluateAutonomyPolicy(authorization.policy, authorization.change);
+  if (
+    authorization.kind !== "AUTONOMOUS_POLICY_ALLOW" ||
+    !safeIdentifier(authorization.id) ||
+    !safeIdentifier(authorization.loopSessionId) ||
+    authorization.loopSessionId !== proposal.sessionId ||
+    authorization.proposalId !== proposal.id ||
+    authorization.proposalThreadId.length === 0 ||
+    Buffer.byteLength(authorization.proposalThreadId, "utf8") > 256 ||
+    authorization.evaluation.decision !== "ALLOW" ||
+    authorization.evaluation.reasons.length !== 0 ||
+    reevaluated.decision !== "ALLOW" ||
+    reevaluated.reasons.length !== 0 ||
+    !validAutonomyPolicy(authorization.policy) ||
+    stableJson(authorization.change.files) !== stableJson(proposalFiles) ||
+    !isIsoTimestamp(authorization.evaluatedAt) ||
+    !isIsoTimestamp(authorization.expiresAt) ||
+    Date.parse(authorization.expiresAt) - Date.parse(authorization.evaluatedAt) !== 5 * 60_000 ||
+    now.getTime() < Date.parse(authorization.evaluatedAt) ||
+    now.getTime() > Date.parse(authorization.expiresAt) ||
+    proposal.status !== "PROPOSED"
+  ) {
+    throw new Error("Persisted autonomy authorization is missing, stale, ambiguous, or invalid");
+  }
+}
+
+function exactObject(value: unknown, keys: readonly string[]): boolean {
+  return value !== null && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function validateApproveOnceGate(input: ExecuteApproveOnceMutationInput): void {
+  const files = [
+    ...input.proposal.filesToCreate,
+    ...input.proposal.filesToModify,
+    ...input.proposal.filesToDelete,
+  ];
+  const gate = input.gate;
+  const evidence = input.policyEvaluation;
+  const decision = input.decision;
+  const decisionKeys = [
+    "id", "gateId", "decision", "decidedBy", "createdAt",
+    ...(decision.comment === undefined ? [] : ["comment"]),
+  ];
+  if (
+    !Number.isFinite(input.now.getTime()) ||
+    !safeIdentifier(input.loopSessionId) ||
+    input.proposal.sessionId !== input.loopSessionId ||
+    input.proposal.status !== "PROPOSED" ||
+    input.proposalThreadId.length === 0 ||
+    Buffer.byteLength(input.proposalThreadId, "utf8") > 256 ||
+    !exactObject(gate, [
+      "id", "roundNumber", "requestedChange", "proposal", "proposalThreadId",
+      "policyEvaluationId", "requestedAt", "reasons", "affectedScope", "impact",
+    ]) ||
+    !safeIdentifier(gate.id) ||
+    !Number.isSafeInteger(gate.roundNumber) ||
+    gate.roundNumber < 1 ||
+    gate.roundNumber > 5 ||
+    !isIsoTimestamp(gate.requestedAt) ||
+    gate.reasons.length === 0 ||
+    gate.proposalThreadId !== input.proposalThreadId ||
+    stableJson(gate.proposal) !== stableJson(input.proposal) ||
+    stableJson(gate.requestedChange) !== stableJson(input.change) ||
+    !exactObject(evidence, [
+      "id", "roundNumber", "proposalId", "change", "policy", "evaluation", "evaluatedAt",
+    ]) ||
+    !safeIdentifier(evidence.id) ||
+    gate.policyEvaluationId !== evidence.id ||
+    evidence.roundNumber !== gate.roundNumber ||
+    evidence.proposalId !== input.proposal.id ||
+    evidence.evaluation.decision !== "HUMAN_GATE" ||
+    evidence.evaluation.reasons.length === 0 ||
+    !validAutonomyPolicy(evidence.policy) ||
+    stableJson(evidence.change) !== stableJson(input.change) ||
+    stableJson(input.change.files) !== stableJson(files) ||
+    !isIsoTimestamp(evidence.evaluatedAt) ||
+    !exactObject(decision, decisionKeys) ||
+    !safeIdentifier(decision.id) ||
+    decision.decision !== "APPROVE_ONCE" ||
+    decision.gateId !== gate.id ||
+    decision.decidedBy.trim().length === 0 ||
+    Buffer.byteLength(decision.decidedBy, "utf8") > 256 ||
+    (decision.comment !== undefined && Buffer.byteLength(decision.comment, "utf8") > 2_000) ||
+    !isIsoTimestamp(decision.createdAt) ||
+    Date.parse(decision.createdAt) < Date.parse(gate.requestedAt) ||
+    input.now.getTime() < Date.parse(decision.createdAt) ||
+    input.now.getTime() > Date.parse(decision.createdAt) + 5 * 60_000
+  ) {
+    throw new Error("Persisted Approve Once authorization is missing, stale, ambiguous, or invalid");
   }
 }
 
@@ -1193,22 +1405,45 @@ export class MutationExecutor {
     proposal: ChangeProposal;
     approval: Approval | undefined;
   }): Promise<MutationResult> {
+    return this.applyAuthorized(input.proposal, () =>
+      validateGate(input.proposal, input.approval),
+    );
+  }
+
+  async applyAutonomous(input: {
+    proposal: ChangeProposal;
+    authorization: AutonomousMutationAuthorization;
+    now: Date;
+  }): Promise<MutationResult> {
+    return this.applyAuthorized(input.proposal, () =>
+      validateAutonomousGate(input.proposal, input.authorization, input.now),
+    );
+  }
+
+  async applyApproveOnce(input: ExecuteApproveOnceMutationInput): Promise<MutationResult> {
+    return this.applyAuthorized(input.proposal, () => validateApproveOnceGate(input));
+  }
+
+  private async applyAuthorized(
+    proposal: ChangeProposal,
+    validateAuthorization: () => void,
+  ): Promise<MutationResult> {
     let claim:
       | { handle: Awaited<ReturnType<typeof open>>; path: string }
       | undefined;
     let mirrorRoot: string | undefined;
     let targetMutationApplied = false;
     try {
-      validateGate(input.proposal, input.approval);
+      validateAuthorization();
       if (
         this.options.proposalThreadId.length === 0 ||
         Buffer.byteLength(this.options.proposalThreadId, "utf8") > 256
       ) {
         throw new Error("Safe Mode proposal thread id is invalid");
       }
-      const requestedRecords = validateProposalPaths(input.proposal);
+      const requestedRecords = validateProposalPaths(proposal);
       const rootPath = await canonicalWorkspaceRoot(this.options.workspaceRoot);
-      claim = await acquireExecutionClaim(rootPath, input.proposal.id);
+      claim = await acquireExecutionClaim(rootPath, proposal.id);
       const targetRecords = await captureTargetRecords(rootPath, requestedRecords);
       const gitBefore = await captureGitBefore(rootPath);
       mirrorRoot = await mkdtemp(
@@ -1225,7 +1460,7 @@ export class MutationExecutor {
       await seedMirror(canonicalMirror, targetRecords);
       const result = await this.options.agent.run({
         workingDirectory: canonicalMirror,
-        prompt: mutationPrompt(input.proposal),
+        prompt: mutationPrompt(proposal),
         threadId: this.options.proposalThreadId,
       });
       if (result.threadId !== this.options.proposalThreadId) {
@@ -1247,7 +1482,7 @@ export class MutationExecutor {
       targetMutationApplied = true;
       const git = await captureGitAfter(rootPath, gitBefore, deltas);
       return {
-        proposalId: input.proposal.id,
+        proposalId: proposal.id,
         threadId: result.threadId,
         filesChanged: deltas.map((delta) => delta.relativePath),
         git,
@@ -1263,9 +1498,9 @@ export class MutationExecutor {
       throw new SafeMutationExecutionError(
         targetDisposition,
         [
-          ...input.proposal.filesToCreate,
-          ...input.proposal.filesToModify,
-          ...input.proposal.filesToDelete,
+          ...proposal.filesToCreate,
+          ...proposal.filesToModify,
+          ...proposal.filesToDelete,
         ],
         error,
       );
@@ -1279,4 +1514,82 @@ export class MutationExecutor {
       }
     }
   }
+}
+
+export async function executePolicyAuthorizedMutation(
+  input: ExecutePolicyAuthorizedMutationInput,
+  store: PolicyAuthorizationStore,
+): Promise<PolicyAuthorizedMutationResult> {
+  if (
+    !safeIdentifier(input.loopSessionId) ||
+    input.proposal.sessionId !== input.loopSessionId ||
+    input.proposalThreadId.length === 0 ||
+    Buffer.byteLength(input.proposalThreadId, "utf8") > 256 ||
+    !validAutonomyPolicy(input.policy)
+  ) {
+    throw new Error("Autonomous mutation request is invalid or ambiguous");
+  }
+  const evaluation = evaluateAutonomyPolicy(input.policy, input.change);
+  if (evaluation.decision === "HUMAN_GATE") {
+    return {
+      decision: "HUMAN_GATE",
+      evaluation: { decision: "HUMAN_GATE", reasons: [...evaluation.reasons] },
+    };
+  }
+  const evaluatedAt = store.now();
+  if (!Number.isFinite(evaluatedAt.getTime())) {
+    throw new Error("Autonomy policy evaluation time is invalid");
+  }
+  const authorization: AutonomousMutationAuthorization = {
+    kind: "AUTONOMOUS_POLICY_ALLOW",
+    id: store.createId(),
+    loopSessionId: input.loopSessionId,
+    proposalId: input.proposal.id,
+    proposalThreadId: input.proposalThreadId,
+    change: { kind: input.change.kind, files: [...input.change.files] },
+    policy: {
+      ...input.policy,
+      protectedPaths: [...input.policy.protectedPaths],
+    },
+    evaluation: { decision: "ALLOW", reasons: [] },
+    evaluatedAt: evaluatedAt.toISOString(),
+    expiresAt: new Date(evaluatedAt.getTime() + 5 * 60_000).toISOString(),
+  };
+  validateAutonomousGate(input.proposal, authorization, evaluatedAt);
+  await store.persistAuthorization(authorization);
+  const persisted = await store.loadAuthorization(authorization.id);
+  if (stableJson(persisted) !== stableJson(authorization)) {
+    throw new Error("Persisted autonomy authorization is missing, stale, ambiguous, or invalid");
+  }
+  const executionTime = store.now();
+  validateAutonomousGate(
+    input.proposal,
+    persisted as AutonomousMutationAuthorization,
+    executionTime,
+  );
+  const mutation = await new MutationExecutor({
+    workspaceRoot: input.workspaceRoot,
+    proposalThreadId: input.proposalThreadId,
+    agent: input.agent,
+    ...(input.mutationDriver === undefined
+      ? {}
+      : { mutationDriver: input.mutationDriver }),
+  }).applyAutonomous({
+    proposal: input.proposal,
+    authorization: persisted as AutonomousMutationAuthorization,
+    now: executionTime,
+  });
+  return { decision: "APPLIED", authorization, mutation };
+}
+
+export async function executeApproveOnceMutation(
+  input: ExecuteApproveOnceMutationInput,
+): Promise<MutationResult> {
+  validateApproveOnceGate(input);
+  return new MutationExecutor({
+    workspaceRoot: input.workspaceRoot,
+    proposalThreadId: input.proposalThreadId,
+    agent: input.agent,
+    ...(input.mutationDriver === undefined ? {} : { mutationDriver: input.mutationDriver }),
+  }).applyApproveOnce(input);
 }

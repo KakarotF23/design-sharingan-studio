@@ -10,9 +10,12 @@
     "@design-sharingan/agent-runtime": "workspace:*",
     "@design-sharingan/approval-engine": "workspace:*",
     "@design-sharingan/core": "workspace:*",
+    "@design-sharingan/mangekyo-engine": "workspace:*",
     "@design-sharingan/project-adapters": "workspace:*",
+    "@design-sharingan/render-engine": "workspace:*",
     "@design-sharingan/sharingan-engine": "workspace:*",
     "@design-sharingan/ui": "workspace:*",
+    "@design-sharingan/visual-engine": "workspace:*",
     "next": "latest",
     "react": "latest",
     "react-dom": "latest"

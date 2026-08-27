@@ -22,12 +22,18 @@ import type {
   DesignApproach,
   FeatureBrief,
 } from "@design-sharingan/core";
+import { DEFAULT_AUTONOMY_POLICY } from "@design-sharingan/core";
 import type { CodexAgentRunInput } from "@design-sharingan/agent-runtime";
 import {
   CHANGE_PROPOSAL_OUTPUT_SCHEMA,
   generateChangeProposal,
 } from "../change-proposal";
-import { MutationExecutor } from "../mutation-executor";
+import {
+  executeApproveOnceMutation,
+  executePolicyAuthorizedMutation,
+  MutationExecutor,
+  type AutonomousMutationAuthorization,
+} from "../mutation-executor";
 
 const execFile = promisify(execFileCallback);
 
@@ -377,6 +383,208 @@ describe("Safe Mode mutation gate", () => {
       }),
     ).rejects.toThrow(/thread id is invalid/i);
     expect(agentRuns).toBe(0);
+  });
+});
+
+describe("Mangekyo policy-authorized mutation gate", () => {
+  it("reuses the controlled transaction only for the exact persisted Approve Once gate", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    const proposal = proposalFixture({
+      sessionId: "mangekyo-session-1",
+      filesToModify: ["src/file.ts"],
+    });
+    let agentRuns = 0;
+    const result = await executeApproveOnceMutation({
+      workspaceRoot,
+      loopSessionId: "mangekyo-session-1",
+      proposal,
+      proposalThreadId: "thread-proposal-1",
+      change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+      gate: {
+        id: "gate-1",
+        roundNumber: 1,
+        requestedChange: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        proposal,
+        proposalThreadId: "thread-proposal-1",
+        policyEvaluationId: "policy-navigation",
+        requestedAt: "2026-08-27T01:00:00.000Z",
+        reasons: ["Navigation changes require a Human Gate."],
+        affectedScope: ["/"],
+        impact: "Changes navigation.",
+      },
+      policyEvaluation: {
+        id: "policy-navigation",
+        roundNumber: 1,
+        proposalId: proposal.id,
+        change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        policy: DEFAULT_AUTONOMY_POLICY,
+        evaluation: { decision: "HUMAN_GATE", reasons: ["Navigation changes require a Human Gate."] },
+        evaluatedAt: "2026-08-27T01:00:00.000Z",
+      },
+      decision: {
+        id: "gate-decision-1",
+        gateId: "gate-1",
+        decision: "APPROVE_ONCE",
+        decidedBy: "local-user",
+        createdAt: "2026-08-27T01:00:01.000Z",
+      },
+      now: new Date("2026-08-27T01:00:02.000Z"),
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          agentRuns += 1;
+          await writeFile(join(input.workingDirectory, "src/file.ts"), "after\n", "utf8");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    expect(result.filesChanged).toEqual(["src/file.ts"]);
+    expect(agentRuns).toBe(1);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+  });
+
+  it("persists and reloads an exact ALLOW evaluation before reusing the controlled mirror transaction", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    let persisted: AutonomousMutationAuthorization | undefined;
+    let agentRuns = 0;
+    const result = await executePolicyAuthorizedMutation(
+      {
+        workspaceRoot,
+        loopSessionId: "mangekyo-session-1",
+        proposal: proposalFixture({
+          sessionId: "mangekyo-session-1",
+          filesToModify: ["src/file.ts"],
+        }),
+        proposalThreadId: "thread-proposal-1",
+        policy: DEFAULT_AUTONOMY_POLICY,
+        change: { kind: "STYLE_CHANGE", files: ["src/file.ts"] },
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            agentRuns += 1;
+            await writeFile(join(input.workingDirectory, "src/file.ts"), "after\n", "utf8");
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      },
+      {
+        createId: () => "authorization-1",
+        now: () => new Date("2026-08-27T01:00:00.000Z"),
+        persistAuthorization: async (authorization) => {
+          persisted = structuredClone(authorization);
+        },
+        loadAuthorization: async () => structuredClone(persisted),
+      },
+    );
+
+    expect(result).toMatchObject({
+      decision: "APPLIED",
+      authorization: {
+        kind: "AUTONOMOUS_POLICY_ALLOW",
+        id: "authorization-1",
+        loopSessionId: "mangekyo-session-1",
+        proposalId: "proposal-safe-1",
+        evaluation: { decision: "ALLOW", reasons: [] },
+        change: { kind: "STYLE_CHANGE", files: ["src/file.ts"] },
+      },
+      mutation: {
+        proposalId: "proposal-safe-1",
+        threadId: "thread-proposal-1",
+        filesChanged: ["src/file.ts"],
+      },
+    });
+    if (result.decision !== "APPLIED") throw new Error("Expected an applied mutation");
+    expect(persisted).toEqual(result.authorization);
+    expect(agentRuns).toBe(1);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+  });
+
+  it("fails closed at HUMAN_GATE before persistence or target mutation for a navigation change", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    let persisted = false;
+    let agentRuns = 0;
+    const result = await executePolicyAuthorizedMutation(
+      {
+        workspaceRoot,
+        loopSessionId: "mangekyo-session-1",
+        proposal: proposalFixture({
+          sessionId: "mangekyo-session-1",
+          filesToModify: ["src/file.ts"],
+        }),
+        proposalThreadId: "thread-proposal-1",
+        policy: DEFAULT_AUTONOMY_POLICY,
+        change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        agent: {
+          async run<TStructured>() {
+            agentRuns += 1;
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      },
+      {
+        createId: () => "authorization-unused",
+        now: () => new Date("2026-08-27T01:00:00.000Z"),
+        persistAuthorization: async () => {
+          persisted = true;
+        },
+        loadAuthorization: async () => undefined,
+      },
+    );
+
+    expect(result).toMatchObject({
+      decision: "HUMAN_GATE",
+      evaluation: { decision: "HUMAN_GATE" },
+    });
+    expect(persisted).toBe(false);
+    expect(agentRuns).toBe(0);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("before\n");
+  });
+
+  it("rejects missing or tampered persisted ALLOW evidence before the mutation agent runs", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    let persisted: AutonomousMutationAuthorization | undefined;
+    let agentRuns = 0;
+    await expect(
+      executePolicyAuthorizedMutation(
+        {
+          workspaceRoot,
+          loopSessionId: "mangekyo-session-1",
+          proposal: proposalFixture({
+            sessionId: "mangekyo-session-1",
+            filesToModify: ["src/file.ts"],
+          }),
+          proposalThreadId: "thread-proposal-1",
+          policy: DEFAULT_AUTONOMY_POLICY,
+          change: { kind: "STYLE_CHANGE", files: ["src/file.ts"] },
+          agent: {
+            async run<TStructured>() {
+              agentRuns += 1;
+              return { threadId: "thread-proposal-1", structured: null as TStructured };
+            },
+          },
+        },
+        {
+          createId: () => "authorization-1",
+          now: () => new Date("2026-08-27T01:00:00.000Z"),
+          persistAuthorization: async (authorization) => {
+            persisted = authorization;
+          },
+          loadAuthorization: async () =>
+            persisted === undefined
+              ? undefined
+              : { ...persisted, proposalId: "tampered-proposal" },
+        },
+      ),
+    ).rejects.toThrow(/persisted autonomy authorization/i);
+    expect(agentRuns).toBe(0);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("before\n");
   });
 });
 
