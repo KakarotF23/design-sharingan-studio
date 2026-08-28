@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 import type {
   AutonomyChange,
@@ -16,6 +16,7 @@ import type {
   VisualFinding,
   VisualRound,
 } from "@design-sharingan/core";
+import { DEFAULT_AUTONOMY_POLICY, evaluateAutonomyPolicy } from "@design-sharingan/core";
 import { assertPathInsideWorkspace } from "./path-policy";
 import {
   ensureDesignWorkspace,
@@ -27,6 +28,7 @@ import {
 
 const MAX_RENDER_BYTES = 25 * 1024 * 1024;
 const MAX_AUTHORIZATION_BYTES = 64 * 1024;
+const MAX_CLAIM_BYTES = 16 * 1024;
 
 function exact(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return (
@@ -108,7 +110,11 @@ function policy(value: unknown): value is AutonomyPolicy {
     typeof value.allowNavigationChanges === "boolean" &&
     typeof value.allowDataModelChanges === "boolean" &&
     typeof value.allowFileDeletion === "boolean" &&
-    texts(value.protectedPaths, 128, 512, true)
+    texts(value.protectedPaths, 128, 512, true) &&
+    new Set(value.protectedPaths as string[]).size === (value.protectedPaths as string[]).length &&
+    DEFAULT_AUTONOMY_POLICY.protectedPaths.every(
+      (mandatory) => (value.protectedPaths as string[]).includes(mandatory),
+    )
   );
 }
 
@@ -204,12 +210,19 @@ function proposal(value: unknown, sessionId: string): value is ChangeProposal {
 
 function sourceRevision(value: unknown): boolean {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  if ((value as { kind?: unknown }).kind === "UNVERSIONED") {
-    return (
-      exact(value, ["kind", "available", "reason"]) &&
-      value.available === false &&
-      (value.reason === "NOT_A_GIT_WORKSPACE" || value.reason === "GIT_EVIDENCE_UNAVAILABLE")
-    );
+  const record = value as Record<string, unknown>;
+  if (record.kind === "UNVERSIONED") {
+    return record.available === false
+      ? exact(record, ["kind", "available", "reason"]) &&
+        (record.reason === "NOT_A_GIT_WORKSPACE" || record.reason === "GIT_EVIDENCE_UNAVAILABLE")
+      : exact(record, ["kind", "available", "truncated", "worktreeFingerprint", "fileCount"]) &&
+        record.available === true &&
+        record.truncated === false &&
+        typeof record.worktreeFingerprint === "string" &&
+        /^[0-9a-f]{64}$/.test(record.worktreeFingerprint) &&
+        Number.isSafeInteger(record.fileCount) &&
+        (record.fileCount as number) >= 0 &&
+        (record.fileCount as number) <= 512;
   }
   return (
     exact(value, [
@@ -230,23 +243,39 @@ function sourceRevision(value: unknown): boolean {
     (value.status === "CLEAN" || value.status === "DIRTY") &&
     Array.isArray(value.entries) &&
     value.entries.length <= 1_024 &&
+    new Set(value.entries.map((entry) =>
+      entry !== null && typeof entry === "object" && !Array.isArray(entry)
+        ? (entry as { path?: unknown }).path
+        : undefined,
+    )).size === value.entries.length &&
     value.entries.every(
       (entry) =>
         entry !== null &&
         typeof entry === "object" &&
         !Array.isArray(entry) &&
-        Object.keys(entry).every((key) => ["index", "workingTree", "path", "originalPath"].includes(key)) &&
+        exact(entry, [
+          "index",
+          "workingTree",
+          "path",
+          ...(Object.hasOwn(entry, "originalPath") ? ["originalPath"] : []),
+        ]) &&
         typeof (entry as { index?: unknown }).index === "string" &&
         ((entry as { index: string }).index.length === 1) &&
         typeof (entry as { workingTree?: unknown }).workingTree === "string" &&
         ((entry as { workingTree: string }).workingTree.length === 1) &&
-        text((entry as { path?: unknown }).path, 512),
+        text((entry as { path?: unknown }).path, 512) &&
+        (!Object.hasOwn(entry, "originalPath") || text(
+          (entry as { originalPath?: unknown }).originalPath,
+          512,
+        )),
     ) &&
-    typeof value.truncated === "boolean" &&
+    value.truncated === false &&
     typeof value.worktreeFingerprint === "string" &&
     /^[0-9a-f]{64}$/.test(value.worktreeFingerprint) &&
     Number.isSafeInteger(value.fileCount) &&
-    (value.fileCount as number) >= 0
+    (value.fileCount as number) >= value.entries.length &&
+    (value.fileCount as number) <= 512 &&
+    (value.status === "CLEAN" ? value.entries.length === 0 : value.entries.length > 0)
   );
 }
 
@@ -303,6 +332,14 @@ function finding(value: unknown, screen: string): value is VisualFinding {
   );
 }
 
+function integrity(value: unknown): boolean {
+  return (
+    exact(value, ["status", "evidence"]) &&
+    ["PASS", "REGRESSION", "CONFLICT", "NOT_VERIFIED"].includes(value.status as string) &&
+    texts(value.evidence, 16, 2_000, true)
+  );
+}
+
 function visualRound(value: unknown, session: MangekyoLoopSession): value is VisualRound {
   if (!exact(value, [
     "roundNumber",
@@ -318,7 +355,10 @@ function visualRound(value: unknown, session: MangekyoLoopSession): value is Vis
     "importantCount",
     "polishCount",
     "uxIntegrity",
+    "productConsistency",
+    "accessibility",
     "genomeIntegrity",
+    ...(Object.hasOwn(value as object, "genomeEvidenceVersion") ? ["genomeEvidenceVersion"] : []),
     "status",
   ])) return false;
   return (
@@ -340,8 +380,14 @@ function visualRound(value: unknown, session: MangekyoLoopSession): value is Vis
     [value.criticalCount, value.importantCount, value.polishCount].every(
       (count) => Number.isSafeInteger(count) && (count as number) >= 0 && (count as number) <= 64,
     ) &&
-    text(value.uxIntegrity, 1_000) &&
-    text(value.genomeIntegrity, 1_000) &&
+    integrity(value.uxIntegrity) &&
+    integrity(value.productConsistency) &&
+    integrity(value.accessibility) &&
+    integrity(value.genomeIntegrity) &&
+    (value.genomeEvidenceVersion === undefined || text(value.genomeEvidenceVersion, 128)) &&
+    ((value.genomeIntegrity as { status?: unknown }).status === "NOT_VERIFIED"
+      ? value.genomeEvidenceVersion === undefined
+      : value.genomeEvidenceVersion !== undefined) &&
     ["IDLE", "PREPARING", "POLICY_CHECK", "EDITING", "RUNNING", "CAPTURING", "COMPARING", "DECIDING", "FIXING", "HUMAN_GATE", "COMPLETE", "BLOCKED", "FAILED"].includes(value.status as string)
   );
 }
@@ -430,6 +476,7 @@ function roundEvidence(value: unknown, session: MangekyoLoopSession): value is M
       "proposalThreadId",
       "policyEvaluationId",
       "mutationCompletedAt",
+      "mutationSourceRevision",
       "visualAnalysisThreadId",
       ...optional,
     ]) &&
@@ -438,9 +485,185 @@ function roundEvidence(value: unknown, session: MangekyoLoopSession): value is M
     text(value.proposalThreadId, 256) &&
     identifier(value.policyEvaluationId) &&
     iso(value.mutationCompletedAt) &&
+    sourceRevision(value.mutationSourceRevision) &&
     text(value.visualAnalysisThreadId, 256) &&
     (value.gateDecisionId === undefined || identifier(value.gateDecisionId))
   );
+}
+
+function semanticSessionRelations(session: MangekyoLoopSession): boolean {
+  const proposalFiles = (value: ChangeProposal): string[] => [
+    ...value.filesToCreate,
+    ...value.filesToModify,
+    ...value.filesToDelete,
+  ];
+  if (
+    session.initialRender !== undefined && (
+      Date.parse(session.initialRender.capturedAt) < Date.parse(session.createdAt) ||
+      Date.parse(session.initialRender.capturedAt) > Date.parse(session.updatedAt)
+    )
+  ) {
+    return false;
+  }
+  for (const gateEvidence of session.gates) {
+    const policyEntry = session.policyEvaluations.find(
+      ({ id }) => id === gateEvidence.policyEvaluationId,
+    );
+    if (
+      policyEntry === undefined ||
+      gateEvidence.roundNumber > session.rounds.length + 1 ||
+      policyEntry.evaluation.decision !== "HUMAN_GATE" ||
+      policyEntry.roundNumber !== gateEvidence.roundNumber ||
+      policyEntry.proposalId !== gateEvidence.proposal.id ||
+      stableJson(policyEntry.change) !== stableJson(gateEvidence.requestedChange) ||
+      stableJson(proposalFiles(gateEvidence.proposal)) !==
+        stableJson(gateEvidence.requestedChange.files) ||
+      Date.parse(gateEvidence.requestedAt) < Date.parse(policyEntry.evaluatedAt) ||
+      Date.parse(gateEvidence.requestedAt) > Date.parse(session.updatedAt)
+    ) {
+      return false;
+    }
+  }
+  const freshScreens = new Set<string>();
+  for (const [index, evidence] of session.rounds.entries()) {
+    const round = evidence.round;
+    const policyEntry = session.policyEvaluations.find(({ id }) => id === evidence.policyEvaluationId);
+    const expectedFiles = proposalFiles(evidence.proposal);
+    const counts = {
+      critical: round.findingsAfter.filter(({ severity }) => severity === "CRITICAL").length,
+      important: round.findingsAfter.filter(({ severity }) => severity === "IMPORTANT").length,
+      polish: round.findingsAfter.filter(({ severity }) => severity === "POLISH").length,
+    };
+    const previousRender = index === 0
+      ? session.initialRender
+      : session.rounds[index - 1]?.round.afterRender;
+    const previousFindings = index === 0
+      ? []
+      : session.rounds[index - 1]?.round.findingsAfter ?? [];
+    if (
+      round.roundNumber !== index + 1 ||
+      round.completedAt === undefined ||
+      round.afterRender === undefined ||
+      policyEntry === undefined ||
+      policyEntry.roundNumber !== round.roundNumber ||
+      policyEntry.proposalId !== evidence.proposal.id ||
+      stableJson(policyEntry.change.files) !== stableJson(expectedFiles) ||
+      stableJson(evidence.mutationSourceRevision) !== stableJson(round.afterRender.sourceRevision) ||
+      evidence.mutationSourceRevision.available !== true ||
+      evidence.mutationSourceRevision.truncated ||
+      stableJson(round.filesChanged) !== stableJson(expectedFiles) ||
+      stableJson(round.beforeRender) !== stableJson(previousRender) ||
+      stableJson(round.findingsBefore) !== stableJson(previousFindings) ||
+      round.startedAt !== policyEntry.evaluatedAt ||
+      Date.parse(evidence.mutationCompletedAt) < Date.parse(round.startedAt) ||
+      Date.parse(round.afterRender.capturedAt) <= Date.parse(evidence.mutationCompletedAt) ||
+      Date.parse(round.completedAt) < Date.parse(round.afterRender.capturedAt) ||
+      Date.parse(round.completedAt) > Date.parse(session.updatedAt) ||
+      round.criticalCount !== counts.critical ||
+      round.importantCount !== counts.important ||
+      round.polishCount !== counts.polish ||
+      stableJson(evaluateAutonomyPolicy(policyEntry.policy, policyEntry.change)) !==
+        stableJson(policyEntry.evaluation) ||
+      !["PASS", "REGRESSION", "NOT_VERIFIED"].includes(round.uxIntegrity.status) ||
+      !["PASS", "REGRESSION", "NOT_VERIFIED"].includes(round.productConsistency.status) ||
+      !["PASS", "REGRESSION", "NOT_VERIFIED"].includes(round.accessibility.status) ||
+      !["PASS", "CONFLICT", "NOT_VERIFIED"].includes(round.genomeIntegrity.status)
+    ) {
+      return false;
+    }
+    if (
+      new Set(round.findingsBefore.map(({ id }) => id)).size !== round.findingsBefore.length ||
+      new Set(round.findingsAfter.map(({ id }) => id)).size !== round.findingsAfter.length ||
+      !["FIXING", "DECIDING", "COMPLETE", "BLOCKED"].includes(round.status) ||
+      (index < session.rounds.length - 1 && round.status !== "FIXING") ||
+      (session.status === "DECIDING" && index === session.rounds.length - 1 && round.status !== "DECIDING")
+    ) {
+      return false;
+    }
+    if (round.afterRender.route === session.renderTarget.route) {
+      freshScreens.add(round.afterRender.route);
+    }
+  }
+  if (
+    stableJson([...freshScreens]) !== stableJson(session.inspectedScreens) ||
+    (session.status === "COMPLETE" && !session.claimedScreens.every((screen) => freshScreens.has(screen)))
+  ) {
+    return false;
+  }
+  for (const decision of session.gateDecisions) {
+    const historicalGate = session.gates.find(({ id }) => id === decision.gateId);
+    const linkedRounds = session.rounds.filter(
+      ({ gateDecisionId }) => gateDecisionId === decision.id,
+    );
+    if (
+      historicalGate === undefined ||
+      Date.parse(decision.createdAt) < Date.parse(historicalGate.requestedAt) ||
+      Date.parse(decision.createdAt) > Date.parse(session.updatedAt) ||
+      (decision.decision === "EXPAND_SCOPE" && (
+        decision.policyAfter === undefined ||
+        evaluateAutonomyPolicy(decision.policyAfter, historicalGate.requestedChange).decision !== "ALLOW"
+      ))
+    ) {
+      return false;
+    }
+    if (
+      (decision.decision === "REJECT" && (
+        session.status !== "BLOCKED" || linkedRounds.length !== 0
+      )) ||
+      (decision.decision === "APPROVE_ONCE" && !(
+        linkedRounds.length === 1 ||
+        (linkedRounds.length === 0 && session.status === "FAILED")
+      )) ||
+      (decision.decision === "EXPAND_SCOPE" && !session.policyEvaluations.some(
+        (entry) =>
+          entry.roundNumber === historicalGate.roundNumber &&
+          entry.proposalId === historicalGate.proposal.id &&
+          entry.evaluation.decision === "ALLOW" &&
+          Date.parse(entry.evaluatedAt) >= Date.parse(decision.createdAt) &&
+          stableJson(entry.change) === stableJson(historicalGate.requestedChange),
+      ))
+    ) {
+      return false;
+    }
+  }
+  const everyPolicyEvaluationLinked = session.policyEvaluations.every((entry) =>
+    entry.roundNumber <= session.rounds.length + 1 && (
+      session.gates.some(({ policyEvaluationId }) => policyEvaluationId === entry.id) ||
+      session.rounds.some(({ policyEvaluationId }) => policyEvaluationId === entry.id) ||
+      (
+        ["POLICY_CHECK", "EDITING", "RUNNING", "CAPTURING", "COMPARING", "FAILED"].includes(
+          session.status,
+        ) &&
+        session.policyEvaluations.at(-1)?.id === entry.id &&
+        entry.roundNumber === session.rounds.length + 1
+      )
+    ),
+  );
+  const lastExpansion = session.gateDecisions.filter(
+    ({ decision }) => decision === "EXPAND_SCOPE",
+  ).at(-1);
+  const expectedPolicy = lastExpansion?.policyAfter ?? session.initialPolicy;
+  if (
+    !everyPolicyEvaluationLinked ||
+    stableJson(session.policy) !== stableJson(expectedPolicy)
+  ) {
+    return false;
+  }
+  if (session.status === "COMPLETE") {
+    const latest = session.rounds.at(-1);
+    if (
+      latest === undefined ||
+      latest.round.uxIntegrity.status !== "PASS" ||
+      latest.round.productConsistency.status !== "PASS" ||
+      latest.round.accessibility.status !== "PASS" ||
+      latest.round.genomeIntegrity.status !== "PASS" ||
+      latest.round.criticalCount !== 0 ||
+      latest.round.importantCount > session.importantThreshold
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSession {
@@ -449,6 +672,8 @@ export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSess
     ...(Object.hasOwn(value, "currentGate") ? ["currentGate"] : []),
     ...(Object.hasOwn(value, "initialRender") ? ["initialRender"] : []),
     ...(Object.hasOwn(value, "finalRender") ? ["finalRender"] : []),
+    ...(Object.hasOwn(value, "mutationFailure") ? ["mutationFailure"] : []),
+    ...(Object.hasOwn(value, "stopRequest") ? ["stopRequest"] : []),
     ...(Object.hasOwn(value, "stopReason") ? ["stopReason"] : []),
   ];
   if (!exact(value, [
@@ -493,6 +718,7 @@ export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSess
     text(session.approvedDirection, 4_000) &&
     policy(session.policy) &&
     policy(session.initialPolicy) &&
+    stableJson(session.initialPolicy) === stableJson(DEFAULT_AUTONOMY_POLICY) &&
     exact(session.renderTarget, ["route", "viewport"]) &&
     text(session.renderTarget.route, 512) &&
     exact(session.renderTarget.viewport, ["name", "width", "height"]) &&
@@ -525,6 +751,16 @@ export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSess
     session.gateDecisions.every(gateDecision) &&
     new Set(session.gateDecisions.map(({ id }) => id)).size === session.gateDecisions.length &&
     session.gateDecisions.every((decision) => session.gates.some(({ id }) => id === decision.gateId)) &&
+    session.gates.every((historicalGate) => {
+      const decisions = session.gateDecisions.filter(({ gateId }) => gateId === historicalGate.id);
+      if (session.currentGate?.id === historicalGate.id) return decisions.length === 0;
+      const stoppedAtThisGate =
+        session.status === "BLOCKED" &&
+        session.stopRequest !== undefined &&
+        session.gates.at(-1)?.id === historicalGate.id &&
+        Date.parse(session.stopRequest.requestedAt) >= Date.parse(historicalGate.requestedAt);
+      return stoppedAtThisGate ? decisions.length === 0 : decisions.length === 1;
+    }) &&
     (session.currentGate === undefined || gate(session.currentGate, session.id)) &&
     (session.currentGate === undefined || session.gates.some(
       (entry) => entry.id === session.currentGate?.id && stableJson(entry) === stableJson(session.currentGate),
@@ -559,7 +795,32 @@ export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSess
     }) &&
     (session.initialRender === undefined || render(session.initialRender, session)) &&
     (session.finalRender === undefined || render(session.finalRender, session)) &&
-    (session.stopReason === undefined || text(session.stopReason, 2_000))
+    (session.mutationFailure === undefined || (
+      exact(session.mutationFailure, ["targetDisposition", "affectedPaths"]) &&
+      ["NO_TARGET_CHANGE", "ROLLED_BACK", "RECONCILIATION_REQUIRED"].includes(
+        session.mutationFailure.targetDisposition,
+      ) &&
+      texts(session.mutationFailure.affectedPaths, 128, 512, true) &&
+      session.status === "FAILED"
+    )) &&
+    (session.stopRequest === undefined || (
+      stopRequest(session.stopRequest) &&
+      session.stopRequest.loopSessionId === session.id &&
+      Date.parse(session.stopRequest.sessionVersion) <= Date.parse(session.updatedAt) &&
+      Date.parse(session.stopRequest.requestedAt) <= Date.parse(session.updatedAt) &&
+      session.status === "BLOCKED" &&
+      session.finalRender === undefined
+    )) &&
+    (session.status !== "COMPLETE" || (
+      session.rounds.length > 0 &&
+      session.finalRender !== undefined &&
+      session.rounds.at(-1)?.round.status === "COMPLETE" &&
+      stableJson(session.rounds.at(-1)?.round.afterRender) === stableJson(session.finalRender)
+    )) &&
+    (session.status === "COMPLETE" || session.finalRender === undefined) &&
+    (session.stopReason === undefined || text(session.stopReason, 2_000)) &&
+    (!["COMPLETE", "BLOCKED", "FAILED"].includes(session.status) || session.stopReason !== undefined) &&
+    semanticSessionRelations(session)
   );
 }
 
@@ -668,6 +929,382 @@ async function authorizationRoot(rootPath: string, projectId: string): Promise<s
     throw new Error("Mangekyo authorization store is not a private project-scoped directory");
   }
   return directory;
+}
+
+async function mangekyoClaimRoot(rootPath: string, projectId: string): Promise<string> {
+  await loadProjectMetadata(rootPath, projectId);
+  const workspace = await ensureDesignWorkspace(rootPath);
+  const directory = assertPathInsideWorkspace(
+    workspace.cachePath,
+    join(workspace.cachePath, "mangekyo-claims"),
+  );
+  await mkdir(directory, { mode: 0o700 }).catch((error: unknown) => {
+    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+  });
+  const entry = await lstat(directory);
+  if (
+    entry.isSymbolicLink() ||
+    !entry.isDirectory() ||
+    (entry.mode & 0o077) !== 0 ||
+    (await realpath(directory)) !== directory
+  ) {
+    throw new Error("Mangekyo claim store is not a private project-scoped directory");
+  }
+  return directory;
+}
+
+async function writeExclusiveClaim(
+  directory: string,
+  name: string,
+  value: unknown,
+  replayMessage: string,
+): Promise<void> {
+  const path = assertPathInsideWorkspace(directory, join(directory, name));
+  const serialized = `${JSON.stringify(value)}\n`;
+  if (Buffer.byteLength(serialized, "utf8") > MAX_CLAIM_BYTES) {
+    throw new Error("Mangekyo claim exceeds its byte bound");
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    await handle.writeFile(serialized, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    const directoryHandle = await open(directory, constants.O_RDONLY);
+    try {
+      await directoryHandle.sync();
+    } finally {
+      await directoryHandle.close();
+    }
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      throw new Error(replayMessage);
+    }
+    throw error;
+  }
+}
+
+export interface MangekyoActiveLoopClaim {
+  loopSessionId: string;
+  sourceExecutionSessionId: string;
+  claimedAt: string;
+}
+
+function activeLoopClaim(value: unknown): value is MangekyoActiveLoopClaim {
+  return (
+    exact(value, ["loopSessionId", "sourceExecutionSessionId", "claimedAt"]) &&
+    identifier(value.loopSessionId) &&
+    identifier(value.sourceExecutionSessionId) &&
+    iso(value.claimedAt)
+  );
+}
+
+export async function claimMangekyoActiveLoop(
+  rootPath: string,
+  projectId: string,
+  claim: MangekyoActiveLoopClaim,
+): Promise<void> {
+  if (!activeLoopClaim(claim)) throw new Error("Mangekyo active-loop claim is invalid");
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  await writeExclusiveClaim(
+    directory,
+    "active-loop.claim",
+    claim,
+    "Another Mangekyo loop already owns the active project claim",
+  );
+}
+
+export async function loadMangekyoActiveLoopClaim(
+  rootPath: string,
+  projectId: string,
+): Promise<MangekyoActiveLoopClaim | undefined> {
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const path = assertPathInsideWorkspace(directory, join(directory, "active-loop.claim"));
+  const before = await lstat(path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (before === undefined) return undefined;
+  if (
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.nlink !== 1 ||
+    before.size < 2 ||
+    before.size > MAX_CLAIM_BYTES
+  ) {
+    throw new Error("The active Mangekyo loop claim is invalid or ambiguous");
+  }
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    const parsed = JSON.parse(await handle.readFile("utf8")) as unknown;
+    const after = await lstat(path);
+    if (
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      !activeLoopClaim(parsed)
+    ) {
+      throw new Error("The active Mangekyo loop claim changed while it was authenticated");
+    }
+    return parsed;
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function releaseMangekyoActiveLoop(
+  rootPath: string,
+  projectId: string,
+  release: MangekyoActiveLoopClaim & {
+    terminalStatus: "COMPLETE" | "BLOCKED" | "FAILED";
+  },
+): Promise<void> {
+  if (
+    !exact(release, [
+      "loopSessionId",
+      "sourceExecutionSessionId",
+      "claimedAt",
+      "terminalStatus",
+    ]) ||
+    !activeLoopClaim({
+      loopSessionId: release.loopSessionId,
+      sourceExecutionSessionId: release.sourceExecutionSessionId,
+      claimedAt: release.claimedAt,
+    }) ||
+    !["COMPLETE", "BLOCKED", "FAILED"].includes(release.terminalStatus)
+  ) {
+    throw new Error("Mangekyo active-loop release is invalid");
+  }
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const path = assertPathInsideWorkspace(directory, join(directory, "active-loop.claim"));
+  const before = await lstat(path).catch(() => undefined);
+  if (
+    before === undefined ||
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.nlink !== 1 ||
+    before.size < 2 ||
+    before.size > MAX_CLAIM_BYTES
+  ) {
+    throw new Error("The exact active loop claim is missing or ambiguous");
+  }
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    const parsed = JSON.parse(await handle.readFile("utf8")) as unknown;
+    if (
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      !activeLoopClaim(parsed) ||
+      stableJson(parsed) !== stableJson({
+        loopSessionId: release.loopSessionId,
+        sourceExecutionSessionId: release.sourceExecutionSessionId,
+        claimedAt: release.claimedAt,
+      })
+    ) {
+      throw new Error("The exact active loop claim is missing or ambiguous");
+    }
+  } finally {
+    await handle.close();
+  }
+  const current = await lstat(path);
+  if (current.dev !== before.dev || current.ino !== before.ino || current.size !== before.size) {
+    throw new Error("The exact active loop claim changed before terminal release");
+  }
+  await rm(path);
+  const directoryHandle = await open(directory, constants.O_RDONLY);
+  try {
+    await directoryHandle.sync();
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+export async function claimMangekyoGateDecision(
+  rootPath: string,
+  projectId: string,
+  claim: {
+    loopSessionId: string;
+    sessionVersion: string;
+    gateId: string;
+    decisionId: string;
+    decision: "REJECT" | "APPROVE_ONCE" | "EXPAND_SCOPE";
+    decidedAt: string;
+  },
+): Promise<void> {
+  if (
+    !exact(claim, [
+      "loopSessionId",
+      "sessionVersion",
+      "gateId",
+      "decisionId",
+      "decision",
+      "decidedAt",
+    ]) ||
+    !identifier(claim.loopSessionId) ||
+    !iso(claim.sessionVersion) ||
+    !identifier(claim.gateId) ||
+    !identifier(claim.decisionId) ||
+    !["REJECT", "APPROVE_ONCE", "EXPAND_SCOPE"].includes(claim.decision) ||
+    !iso(claim.decidedAt) ||
+    Date.parse(claim.decidedAt) < Date.parse(claim.sessionVersion)
+  ) {
+    throw new Error("Mangekyo Human Gate claim is invalid");
+  }
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const digest = createHash("sha256")
+    .update(`${claim.loopSessionId}\0${claim.sessionVersion}`)
+    .digest("hex");
+  await writeExclusiveClaim(
+    directory,
+    `action-${digest}.claim`,
+    claim,
+    "Mangekyo Human Gate was already decided or this session version already has an action",
+  );
+}
+
+export interface MangekyoStopRequest {
+  id: string;
+  loopSessionId: string;
+  sessionVersion: string;
+  requestedAt: string;
+  requestedBy: string;
+}
+
+function stopRequest(value: unknown): value is MangekyoStopRequest {
+  return (
+    exact(value, ["id", "loopSessionId", "sessionVersion", "requestedAt", "requestedBy"]) &&
+    identifier(value.id) &&
+    identifier(value.loopSessionId) &&
+    iso(value.sessionVersion) &&
+    iso(value.requestedAt) &&
+    Date.parse(value.requestedAt) >= Date.parse(value.sessionVersion) &&
+    text(value.requestedBy, 256)
+  );
+}
+
+async function stopRequests(
+  directory: string,
+  loopSessionId: string,
+): Promise<MangekyoStopRequest[]> {
+  const names = (await readdir(directory)).filter(
+    (name) => /^action-[0-9a-f]{64}\.claim$/.test(name),
+  );
+  if (names.length > 64) throw new Error("Mangekyo action claim history exceeds its bound");
+  const requests: MangekyoStopRequest[] = [];
+  for (const name of names) {
+    const path = assertPathInsideWorkspace(directory, join(directory, name));
+    const before = await lstat(path);
+    if (
+      before.isSymbolicLink() ||
+      !before.isFile() ||
+      before.nlink !== 1 ||
+      before.size < 2 ||
+      before.size > MAX_CLAIM_BYTES
+    ) {
+      throw new Error("Mangekyo action claim is invalid or ambiguous");
+    }
+    const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const opened = await handle.stat();
+      if (
+        !opened.isFile() ||
+        opened.dev !== before.dev ||
+        opened.ino !== before.ino ||
+        opened.size !== before.size
+      ) {
+        throw new Error("Mangekyo action claim changed while it was authenticated");
+      }
+      const parsed = JSON.parse(await handle.readFile("utf8")) as unknown;
+      if (stopRequest(parsed) && parsed.loopSessionId === loopSessionId) requests.push(parsed);
+    } finally {
+      await handle.close();
+    }
+  }
+  return requests;
+}
+
+export async function requestMangekyoStop(
+  rootPath: string,
+  projectId: string,
+  request: MangekyoStopRequest,
+): Promise<void> {
+  if (!stopRequest(request)) throw new Error("Mangekyo Stop request is invalid");
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  if ((await stopRequests(directory, request.loopSessionId)).length > 0) {
+    throw new Error("Mangekyo loop was already stopped");
+  }
+  const digest = createHash("sha256")
+    .update(`${request.loopSessionId}\0${request.sessionVersion}`)
+    .digest("hex");
+  await writeExclusiveClaim(
+    directory,
+    `action-${digest}.claim`,
+    request,
+    "Mangekyo session version already has an action",
+  );
+}
+
+export async function loadMangekyoStopRequest(
+  rootPath: string,
+  projectId: string,
+  loopSessionId: string,
+): Promise<MangekyoStopRequest | undefined> {
+  if (!identifier(loopSessionId)) throw new Error("Invalid Mangekyo loop session id");
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const requests = await stopRequests(directory, loopSessionId);
+  if (requests.length > 1) throw new Error("Mangekyo Stop request is ambiguous");
+  return requests[0];
+}
+
+export async function consumeMangekyoApproveOnceAuthorization(
+  rootPath: string,
+  projectId: string,
+  claim: {
+    loopSessionId: string;
+    sessionVersion: string;
+    gateId: string;
+    decisionId: string;
+    proposalId: string;
+  },
+): Promise<void> {
+  if (
+    !exact(claim, [
+      "loopSessionId",
+      "sessionVersion",
+      "gateId",
+      "decisionId",
+      "proposalId",
+    ]) ||
+    !identifier(claim.loopSessionId) ||
+    !iso(claim.sessionVersion) ||
+    !identifier(claim.gateId) ||
+    !identifier(claim.decisionId) ||
+    !identifier(claim.proposalId)
+  ) {
+    throw new Error("Approve Once consumption claim is invalid");
+  }
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const digest = createHash("sha256")
+    .update(`${claim.loopSessionId}\0${claim.gateId}\0${claim.decisionId}`)
+    .digest("hex");
+  await writeExclusiveClaim(
+    directory,
+    `approve-once-${digest}.claim`,
+    claim,
+    "Approve Once authorization was already consumed",
+  );
 }
 
 export async function saveMangekyoAuthorization(

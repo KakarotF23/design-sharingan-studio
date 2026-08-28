@@ -7,8 +7,11 @@ import type {
   MangekyoLoopSession,
   MangekyoPolicyEvaluationEvidence,
   MangekyoRenderTarget,
+  MangekyoStopRequest,
   RenderArtifact,
+  RenderSourceRevision,
   VisualFinding,
+  VisualIntegrityVerification,
   VisualRound,
 } from "@design-sharingan/core";
 import { evaluateAutonomyPolicy } from "@design-sharingan/core";
@@ -38,11 +41,21 @@ export interface MangekyoMutationResult {
   threadId: string;
   filesChanged: string[];
   completedAt: string;
+  sourceRevision: RenderSourceRevision;
 }
 
 export interface MangekyoLoopDependencies {
   createId(): string;
   now(): Date;
+  claimGateDecision(claim: {
+    loopSessionId: string;
+    sessionVersion: string;
+    gateId: string;
+    decisionId: string;
+    decision: "REJECT" | "APPROVE_ONCE" | "EXPAND_SCOPE";
+    decidedAt: string;
+  }): Promise<void>;
+  loadStopRequest(session: MangekyoLoopSession): Promise<MangekyoStopRequest | undefined>;
   proposeChange(
     session: MangekyoLoopSession,
     roundNumber: number,
@@ -70,7 +83,17 @@ export interface MangekyoLoopDependencies {
     session: MangekyoLoopSession;
     roundNumber: number;
     render: RenderArtifact;
-  }): Promise<{ threadId: string; findings: VisualFinding[] }>;
+  }): Promise<{
+    threadId: string;
+    findings: VisualFinding[];
+    verification: {
+      uxIntegrity: VisualIntegrityVerification;
+      productConsistency: VisualIntegrityVerification;
+      accessibility: VisualIntegrityVerification;
+      genomeIntegrity: VisualIntegrityVerification;
+    };
+    genomeEvidenceVersion?: string;
+  }>;
   stopProject?(): Promise<void>;
   userStopped?(): boolean;
 }
@@ -79,6 +102,7 @@ export interface FreshFinalRenderInput {
   artifact: RenderArtifact;
   mutationCompletedAt: string;
   changedPaths: readonly string[];
+  mutationSourceRevision: RenderSourceRevision;
   target: MangekyoRenderTarget;
 }
 
@@ -143,6 +167,74 @@ function failureReason(prefix: string, error: unknown): string {
   return result || prefix;
 }
 
+function mutationFailureEvidence(error: unknown): MangekyoLoopSession["mutationFailure"] {
+  if (
+    !(error instanceof Error) ||
+    !("failure" in error) ||
+    error.failure === null ||
+    typeof error.failure !== "object" ||
+    !("targetDisposition" in error.failure) ||
+    !("affectedPaths" in error.failure) ||
+    !["NO_TARGET_CHANGE", "ROLLED_BACK", "RECONCILIATION_REQUIRED"].includes(
+      error.failure.targetDisposition as string,
+    ) ||
+    !Array.isArray(error.failure.affectedPaths) ||
+    error.failure.affectedPaths.length === 0 ||
+    error.failure.affectedPaths.length > 128 ||
+    !error.failure.affectedPaths.every(
+      (path) => typeof path === "string" && path.length > 0 && path.length <= 512,
+    )
+  ) {
+    return undefined;
+  }
+  return {
+    targetDisposition: error.failure.targetDisposition as NonNullable<
+      MangekyoLoopSession["mutationFailure"]
+    >["targetDisposition"],
+    affectedPaths: [...error.failure.affectedPaths] as string[],
+  };
+}
+
+function validStopRequest(
+  request: MangekyoStopRequest,
+  session: MangekyoLoopSession,
+): boolean {
+  return (
+    safeIdentifier(request.id) &&
+    request.loopSessionId === session.id &&
+    iso(request.sessionVersion) &&
+    iso(request.requestedAt) &&
+    Date.parse(request.requestedAt) >= Date.parse(request.sessionVersion) &&
+    Date.parse(request.sessionVersion) <= Date.parse(session.updatedAt) &&
+    request.requestedBy.trim().length > 0 &&
+    new TextEncoder().encode(request.requestedBy).byteLength <= 256
+  );
+}
+
+async function stopCheckpoint(
+  session: MangekyoLoopSession,
+  dependencies: MangekyoLoopDependencies,
+): Promise<MangekyoLoopSession | undefined> {
+  const request = session.stopRequest ?? await dependencies.loadStopRequest(cloneSession(session));
+  if (request === undefined) return undefined;
+  if (!validStopRequest(request, session)) {
+    throw new Error("Durable Mangekyo Stop request is stale, ambiguous, or invalid");
+  }
+  const { finalRender: _finalRender, ...withoutFinalPass } = cloneSession(session);
+  return persistAndReload(
+    {
+      ...withoutFinalPass,
+      status: "BLOCKED",
+      updatedAt: timestamp(dependencies),
+      currentGate: undefined,
+      stopRequest: structuredClone(request),
+      stopReason: "The user stopped the visual loop before completion.",
+    },
+    dependencies,
+    "user Stop checkpoint",
+  );
+}
+
 function assertPendingChange(
   session: MangekyoLoopSession,
   roundNumber: number,
@@ -194,6 +286,7 @@ function withStatus(
 
 export function isFreshFinalRender(input: FreshFinalRenderInput): boolean {
   const revision = input.artifact.sourceRevision;
+  const mutationRevision = input.mutationSourceRevision;
   if (
     !iso(input.mutationCompletedAt) ||
     !iso(input.artifact.capturedAt) ||
@@ -202,19 +295,24 @@ export function isFreshFinalRender(input: FreshFinalRenderInput): boolean {
     input.artifact.viewport !== input.target.viewport.name ||
     input.artifact.viewportWidth !== input.target.viewport.width ||
     input.artifact.viewportHeight !== input.target.viewport.height ||
-    revision.kind !== "GIT" ||
     revision.available !== true ||
     revision.truncated ||
-    !/^[0-9a-f]{64}$/.test(revision.worktreeFingerprint)
+    !/^[0-9a-f]{64}$/.test(revision.worktreeFingerprint) ||
+    mutationRevision.available !== true ||
+    mutationRevision.truncated ||
+    !/^[0-9a-f]{64}$/.test(mutationRevision.worktreeFingerprint) ||
+    stableJson(revision) !== stableJson(mutationRevision)
   ) {
     return false;
   }
+  if (input.changedPaths.length === 0) return false;
+  if (revision.kind === "UNVERSIONED") return true;
   const evidencedPaths = new Set(
     revision.entries.flatMap(({ path, originalPath }) =>
       originalPath === undefined ? [path] : [path, originalPath],
     ),
   );
-  return input.changedPaths.length > 0 && input.changedPaths.every((path) => evidencedPaths.has(path));
+  return input.changedPaths.every((path) => evidencedPaths.has(path));
 }
 
 function findingsCounts(findings: readonly VisualFinding[]) {
@@ -222,16 +320,6 @@ function findingsCounts(findings: readonly VisualFinding[]) {
     criticalCount: findings.filter(({ severity }) => severity === "CRITICAL").length,
     importantCount: findings.filter(({ severity }) => severity === "IMPORTANT").length,
     polishCount: findings.filter(({ severity }) => severity === "POLISH").length,
-    uxRegressions: findings.filter(
-      ({ category, severity }) =>
-        category === "ACCESSIBILITY" &&
-        (severity === "CRITICAL" || severity === "IMPORTANT"),
-    ).length,
-    genomeConflicts: findings.filter(
-      ({ category, severity }) =>
-        category === "GENOME" &&
-        (severity === "CRITICAL" || severity === "IMPORTANT"),
-    ).length,
   };
 }
 
@@ -244,6 +332,11 @@ async function executeRound(
   dependencies: MangekyoLoopDependencies,
 ): Promise<MangekyoLoopSession> {
   let working = cloneSession(session);
+  working = withStatus(working, "EDITING", dependencies);
+  working.currentGate = undefined;
+  working = await persistAndReload(working, dependencies, "editing checkpoint");
+  const stoppedBeforeMutation = await stopCheckpoint(working, dependencies);
+  if (stoppedBeforeMutation !== undefined) return stoppedBeforeMutation;
   let mutation: MangekyoMutationResult;
   try {
     mutation = await dependencies.executeChange({
@@ -254,9 +347,11 @@ async function executeRound(
       authorization,
     });
   } catch (error) {
+    const mutationFailure = mutationFailureEvidence(error);
     const failed: MangekyoLoopSession = {
       ...withStatus(working, "FAILED", dependencies),
       stopReason: failureReason("Authorized mutation failed", error),
+      ...(mutationFailure === undefined ? {} : { mutationFailure }),
     };
     return persistAndReload(failed, dependencies, "mutation failure checkpoint");
   }
@@ -269,7 +364,10 @@ async function executeRound(
     mutation.proposalId !== pending.proposal.id ||
     mutation.threadId !== pending.proposalThreadId ||
     stableJson(mutation.filesChanged) !== stableJson(expectedFiles) ||
-    !iso(mutation.completedAt)
+    !iso(mutation.completedAt) ||
+    mutation.sourceRevision.available !== true ||
+    mutation.sourceRevision.truncated ||
+    !/^[0-9a-f]{64}$/.test(mutation.sourceRevision.worktreeFingerprint)
   ) {
     throw new Error("Autonomous mutation evidence is missing, stale, or ambiguous");
   }
@@ -340,31 +438,12 @@ async function executeRound(
     artifact: afterRender,
     mutationCompletedAt: mutation.completedAt,
     changedPaths: mutation.filesChanged,
+    mutationSourceRevision: mutation.sourceRevision,
     target: working.renderTarget,
   });
   const inspectedScreens = fresh
     ? [...new Set([...working.inspectedScreens, afterRender.route])]
     : [...working.inspectedScreens];
-  const stop = evaluateStopCriteria({
-    round: roundNumber,
-    maxRounds: working.maxRounds,
-    criticalCount: counts.criticalCount,
-    importantCount: counts.importantCount,
-    importantThreshold: working.importantThreshold,
-    uxRegressions: counts.uxRegressions,
-    genomeConflicts: counts.genomeConflicts,
-    hasFreshFinalRender: fresh,
-    userStopped: dependencies.userStopped?.() ?? false,
-    claimedScreens: working.claimedScreens,
-    inspectedScreens,
-  });
-  const nextStatus = stop.pass
-    ? "COMPLETE"
-    : stop.stop
-      ? stop.outcome === "BUILD_FAILED"
-        ? "FAILED"
-        : "BLOCKED"
-      : "FIXING";
   const visualRound: VisualRound = {
     roundNumber,
     startedAt: policyEvaluation.evaluatedAt,
@@ -378,13 +457,18 @@ async function executeRound(
     criticalCount: counts.criticalCount,
     importantCount: counts.importantCount,
     polishCount: counts.polishCount,
-    uxIntegrity: counts.uxRegressions === 0 ? "PASS" : "REGRESSION",
-    genomeIntegrity: counts.genomeConflicts === 0 ? "PASS" : "CONFLICT",
-    status: nextStatus,
+    uxIntegrity: structuredClone(analysis.verification.uxIntegrity),
+    productConsistency: structuredClone(analysis.verification.productConsistency),
+    accessibility: structuredClone(analysis.verification.accessibility),
+    genomeIntegrity: structuredClone(analysis.verification.genomeIntegrity),
+    ...(analysis.genomeEvidenceVersion === undefined
+      ? {}
+      : { genomeEvidenceVersion: analysis.genomeEvidenceVersion }),
+    status: "DECIDING",
   };
-  const completed: MangekyoLoopSession = {
+  const deciding: MangekyoLoopSession = {
     ...working,
-    status: nextStatus,
+    status: "DECIDING",
     updatedAt: completedAt,
     inspectedScreens,
     rounds: [
@@ -395,6 +479,7 @@ async function executeRound(
         proposalThreadId: pending.proposalThreadId,
         policyEvaluationId: policyEvaluation.id,
         mutationCompletedAt: mutation.completedAt,
+        mutationSourceRevision: structuredClone(mutation.sourceRevision),
         visualAnalysisThreadId: analysis.threadId,
         ...(authorization.kind === "APPROVE_ONCE"
           ? { gateDecisionId: authorization.decision.id }
@@ -402,10 +487,74 @@ async function executeRound(
       },
     ],
     currentGate: undefined,
+  };
+  const checkpoint = await persistAndReload(deciding, dependencies, "deciding checkpoint");
+  return finalizeDecidingRound(checkpoint, dependencies);
+}
+
+async function finalizeDecidingRound(
+  session: MangekyoLoopSession,
+  dependencies: MangekyoLoopDependencies,
+): Promise<MangekyoLoopSession> {
+  const latest = session.rounds.at(-1);
+  const afterRender = latest?.round.afterRender;
+  if (
+    session.status !== "DECIDING" ||
+    latest === undefined ||
+    latest.round.status !== "DECIDING" ||
+    afterRender === undefined
+  ) {
+    throw new Error("Durable deciding checkpoint is missing its completed visual evidence");
+  }
+  const counts = findingsCounts(latest.round.findingsAfter);
+  const stopRequest = session.stopRequest ?? await dependencies.loadStopRequest(cloneSession(session));
+  if (stopRequest !== undefined && !validStopRequest(stopRequest, session)) {
+    throw new Error("Durable Mangekyo Stop request is stale, ambiguous, or invalid");
+  }
+  const fresh = isFreshFinalRender({
+    artifact: afterRender,
+    mutationCompletedAt: latest.mutationCompletedAt,
+    changedPaths: latest.round.filesChanged,
+    mutationSourceRevision: latest.mutationSourceRevision,
+    target: session.renderTarget,
+  });
+  const stop = evaluateStopCriteria({
+    round: latest.round.roundNumber,
+    maxRounds: session.maxRounds,
+    criticalCount: counts.criticalCount,
+    importantCount: counts.importantCount,
+    importantThreshold: session.importantThreshold,
+    integrity: {
+      uxIntegrity: latest.round.uxIntegrity.status === "PASS" ? "PASS" : latest.round.uxIntegrity.status === "NOT_VERIFIED" ? "NOT_VERIFIED" : "REGRESSION",
+      productConsistency: latest.round.productConsistency.status === "PASS" ? "PASS" : latest.round.productConsistency.status === "NOT_VERIFIED" ? "NOT_VERIFIED" : "REGRESSION",
+      accessibility: latest.round.accessibility.status === "PASS" ? "PASS" : latest.round.accessibility.status === "NOT_VERIFIED" ? "NOT_VERIFIED" : "REGRESSION",
+      genomeIntegrity: latest.round.genomeIntegrity.status === "PASS" ? "PASS" : latest.round.genomeIntegrity.status === "NOT_VERIFIED" ? "NOT_VERIFIED" : "CONFLICT",
+    },
+    hasFreshFinalRender: fresh,
+    userStopped: stopRequest !== undefined || (dependencies.userStopped?.() ?? false),
+    claimedScreens: session.claimedScreens,
+    inspectedScreens: session.inspectedScreens,
+  });
+  const nextStatus = stop.pass
+    ? "COMPLETE"
+    : stop.stop
+      ? stop.outcome === "BUILD_FAILED"
+        ? "FAILED"
+        : "BLOCKED"
+      : "FIXING";
+  const finalized: MangekyoLoopSession = {
+    ...cloneSession(session),
+    status: nextStatus,
+    updatedAt: timestamp(dependencies),
+    rounds: session.rounds.map((entry, index) => index === session.rounds.length - 1
+      ? { ...structuredClone(entry), round: { ...structuredClone(entry.round), status: nextStatus } }
+      : structuredClone(entry)),
+    currentGate: undefined,
+    ...(stopRequest === undefined ? {} : { stopRequest: structuredClone(stopRequest) }),
     ...(stop.pass ? { finalRender: afterRender } : {}),
     ...(stop.stop || stop.pass ? { stopReason: stop.reason } : {}),
   };
-  return persistAndReload(completed, dependencies, "visual round checkpoint");
+  return persistAndReload(finalized, dependencies, "visual round checkpoint");
 }
 
 async function processPendingChange(
@@ -486,6 +635,9 @@ export async function runMangekyoLoop(
     throw new Error("Mangekyo entry evidence is missing or ambiguous");
   }
   let working = cloneSession(session);
+  if (["COMPLETE", "BLOCKED", "FAILED"].includes(working.status)) return working;
+  const stopped = await stopCheckpoint(working, dependencies);
+  if (stopped !== undefined) return stopped;
   if (working.status === "IDLE") {
     working = await persistAndReload(
       withStatus(working, "PREPARING", dependencies),
@@ -493,7 +645,12 @@ export async function runMangekyoLoop(
       "preparation checkpoint",
     );
   }
+  if (working.status === "DECIDING") {
+    working = await finalizeDecidingRound(working, dependencies);
+  }
   while (working.status === "PREPARING" || working.status === "FIXING") {
+    const stoppedBetweenRounds = await stopCheckpoint(working, dependencies);
+    if (stoppedBetweenRounds !== undefined) return stoppedBetweenRounds;
     const roundNumber = working.rounds.length + 1;
     if (roundNumber > working.maxRounds) {
       const blocked: MangekyoLoopSession = {
@@ -571,25 +728,38 @@ export async function resolveHumanGate(
     ...(policyAfter === undefined ? {} : { policyAfter }),
   };
   if (!safeIdentifier(baseDecision.id)) throw new Error("Human gate decision id is invalid");
-  let decided: MangekyoLoopSession = {
-    ...cloneSession(session),
+  await dependencies.claimGateDecision({
+    loopSessionId: session.id,
+    sessionVersion: session.updatedAt,
+    gateId: gate.id,
+    decisionId: baseDecision.id,
+    decision: baseDecision.decision,
+    decidedAt: baseDecision.createdAt,
+  });
+  const { stopReason: _pendingGateReason, ...sessionWithoutGateReason } = cloneSession(session);
+  const decided: MangekyoLoopSession = {
+    ...sessionWithoutGateReason,
+    status: resolution.decision === "REJECT" ? "BLOCKED" : "EDITING",
     updatedAt: baseDecision.createdAt,
     policy: policyAfter ?? session.policy,
     gates: session.gates.some(({ id }) => id === gate.id)
       ? [...session.gates]
       : [...session.gates, gate],
     gateDecisions: [...session.gateDecisions, baseDecision],
+    currentGate: undefined,
+    ...(resolution.decision === "REJECT"
+      ? { stopReason: "The pending policy-boundary change was rejected." }
+      : {}),
   };
-  decided = await persistAndReload(decided, dependencies, "human gate decision checkpoint");
 
   if (resolution.decision === "REJECT") {
-    const blocked: MangekyoLoopSession = {
-      ...withStatus(decided, "BLOCKED", dependencies),
-      currentGate: undefined,
-      stopReason: "The pending policy-boundary change was rejected.",
-    };
-    return persistAndReload(blocked, dependencies, "rejected gate checkpoint");
+    return persistAndReload(decided, dependencies, "rejected gate checkpoint");
   }
+  const persistedDecision = await persistAndReload(
+    decided,
+    dependencies,
+    "human gate decision checkpoint",
+  );
 
   const pending: ProposedVisualChange = {
     proposal: gate.proposal,
@@ -600,11 +770,10 @@ export async function resolveHumanGate(
     impact: gate.impact,
   };
   if (resolution.decision === "EXPAND_SCOPE") {
-    const resumed = { ...decided, currentGate: undefined };
-    return processPendingChange(resumed, gate.roundNumber, pending, dependencies);
+    return processPendingChange(persistedDecision, gate.roundNumber, pending, dependencies);
   }
 
-  const policyEvaluation = decided.policyEvaluations.find(
+  const policyEvaluation = persistedDecision.policyEvaluations.find(
     ({ id }) => id === gate.policyEvaluationId,
   );
   if (policyEvaluation === undefined || policyEvaluation.evaluation.decision !== "HUMAN_GATE") {
@@ -613,9 +782,8 @@ export async function resolveHumanGate(
   const approveOnceDecision = baseDecision as MangekyoHumanGateDecision & {
     decision: "APPROVE_ONCE";
   };
-  const resumed = { ...decided, currentGate: undefined };
   return executeRound(
-    resumed,
+    persistedDecision,
     gate.roundNumber,
     pending,
     policyEvaluation,

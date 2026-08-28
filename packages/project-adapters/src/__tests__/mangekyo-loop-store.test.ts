@@ -6,11 +6,19 @@ import { DEFAULT_AUTONOMY_POLICY } from "@design-sharingan/core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  claimMangekyoGateDecision,
+  claimMangekyoActiveLoop,
+  consumeMangekyoApproveOnceAuthorization,
+  isMangekyoLoopSession,
+  loadMangekyoActiveLoopClaim,
+  loadMangekyoStopRequest,
   loadMangekyoAuthorization,
   loadMangekyoLoopSession,
   loadMangekyoRenderImage,
   saveMangekyoAuthorization,
   saveMangekyoLoopSession,
+  requestMangekyoStop,
+  releaseMangekyoActiveLoop,
 } from "../mangekyo-loop-store";
 import { ensureDesignWorkspace, saveProjectMetadata } from "../workspace-store";
 
@@ -84,12 +92,12 @@ function sessionFixture(rootPath: string): MangekyoLoopSession {
     maxRounds: 5,
     importantThreshold: 2,
     claimedScreens: ["/"],
-    inspectedScreens: ["/"],
+    inspectedScreens: [],
     rounds: [],
     policyEvaluations: [
       {
         id: "policy-evaluation-1",
-        roundNumber: 2,
+        roundNumber: 1,
         proposalId: "proposal-navigation",
         change: { kind: "NAVIGATION_CHANGE", files: ["server.mjs"] },
         policy: DEFAULT_AUTONOMY_POLICY,
@@ -104,7 +112,7 @@ function sessionFixture(rootPath: string): MangekyoLoopSession {
     gateDecisions: [],
     currentGate: {
       id: "gate-1",
-      roundNumber: 2,
+      roundNumber: 1,
       requestedChange: { kind: "NAVIGATION_CHANGE", files: ["server.mjs"] },
       proposal: {
         id: "proposal-navigation",
@@ -147,11 +155,378 @@ function sessionFixture(rootPath: string): MangekyoLoopSession {
   return session;
 }
 
+function completeSessionFixture(rootPath: string): MangekyoLoopSession {
+  const session = sessionFixture(rootPath);
+  const proposal = structuredClone(session.currentGate?.proposal as NonNullable<typeof session.currentGate>["proposal"]);
+  proposal.id = "proposal-style";
+  proposal.summary = "Strengthen the evidence hierarchy.";
+  proposal.reason = "Preserve behavior while improving hierarchy.";
+  proposal.policyViolations = [];
+  const change = { kind: "STYLE_CHANGE" as const, files: ["server.mjs"] };
+  const mutationSourceRevision = {
+    kind: "GIT" as const,
+    available: true as const,
+    head: "a".repeat(40),
+    branch: "fixture",
+    status: "DIRTY" as const,
+    entries: [{ index: " ", workingTree: "M", path: "server.mjs" }],
+    truncated: false,
+    worktreeFingerprint: "c".repeat(64),
+    fileCount: 2,
+  };
+  const afterRender: RenderArtifact = {
+    ...renderArtifact(join(rootPath, ".design-sharingan", "renders", "mangekyo-1", "round-1.png")),
+    id: "render-after-1",
+    capturedAt: "2026-08-27T01:00:04.000Z",
+    sourceRevision: mutationSourceRevision,
+  };
+  session.status = "COMPLETE";
+  session.updatedAt = "2026-08-27T01:00:06.000Z";
+  session.currentGate = undefined;
+  session.gates = [];
+  session.gateDecisions = [];
+  session.policyEvaluations = [{
+    id: "policy-style",
+    roundNumber: 1,
+    proposalId: proposal.id,
+    change,
+    policy: DEFAULT_AUTONOMY_POLICY,
+    evaluation: { decision: "ALLOW", reasons: [] },
+    evaluatedAt: "2026-08-27T01:00:02.000Z",
+  }];
+  session.rounds = [{
+    round: {
+      roundNumber: 1,
+      startedAt: "2026-08-27T01:00:02.000Z",
+      completedAt: "2026-08-27T01:00:05.000Z",
+      beforeRender: structuredClone(session.initialRender),
+      afterRender,
+      filesChanged: ["server.mjs"],
+      findingsBefore: [],
+      actions: ["Strengthen the evidence hierarchy."],
+      findingsAfter: [],
+      criticalCount: 0,
+      importantCount: 0,
+      polishCount: 0,
+      uxIntegrity: { status: "PASS", evidence: ["UX remains intact."] },
+      productConsistency: { status: "PASS", evidence: ["Product patterns remain intact."] },
+      accessibility: { status: "PASS", evidence: ["No accessibility regression is visible."] },
+      genomeIntegrity: { status: "PASS", evidence: ["Approved Genome v1 remains intact."] },
+      genomeEvidenceVersion: "1",
+      status: "COMPLETE",
+    },
+    proposal,
+    proposalThreadId: "thread-style",
+    policyEvaluationId: "policy-style",
+    mutationCompletedAt: "2026-08-27T01:00:03.000Z",
+    mutationSourceRevision,
+    visualAnalysisThreadId: "visual-style",
+  }];
+  session.inspectedScreens = ["/"];
+  session.finalRender = afterRender;
+  session.stopReason = "Quality criteria satisfied with fresh final evidence.";
+  return session;
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { force: true, recursive: true })));
 });
 
 describe("Mangekyo loop persistence", () => {
+  it("rejects policies that remove any mandatory protected path", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    session.policy = {
+      ...session.policy,
+      protectedPaths: session.policy.protectedPaths.filter((path) => path !== ".git/**"),
+    };
+
+    expect(isMangekyoLoopSession(session)).toBe(false);
+    await expect(saveMangekyoLoopSession(project.rootPath, session)).rejects.toThrow(
+      /invalid Mangekyo loop/i,
+    );
+  });
+
+  it("rejects fabricated COMPLETE evidence that reuses the initial render without a completed final round", () => {
+    const session = sessionFixture("/project");
+    session.status = "COMPLETE";
+    session.currentGate = undefined;
+    session.finalRender = structuredClone(session.initialRender);
+    session.stopReason = "Quality criteria satisfied with fresh final evidence.";
+
+    expect(isMangekyoLoopSession(session)).toBe(false);
+  });
+
+  it("rejects a current Human Gate that already has a conflicting durable decision", () => {
+    const session = sessionFixture("/project");
+    session.gateDecisions = [{
+      id: "decision-reject",
+      gateId: "gate-1",
+      decision: "REJECT",
+      decidedBy: "local-user",
+      createdAt: "2026-08-27T01:00:03.000Z",
+    }];
+
+    expect(isMangekyoLoopSession(session)).toBe(false);
+  });
+
+  it("accepts the exact crash-truthful POLICY_CHECK checkpoint before mutation", () => {
+    const session = sessionFixture("/project");
+    session.status = "POLICY_CHECK";
+    session.currentGate = undefined;
+    session.gates = [];
+
+    expect(isMangekyoLoopSession(session)).toBe(true);
+  });
+
+  it.each([
+    ["finding counts", (session: MangekyoLoopSession) => {
+      (session.rounds[0] as NonNullable<typeof session.rounds[0]>).round.importantCount = 1;
+    }],
+    ["exact post-mutation source", (session: MangekyoLoopSession) => {
+      const evidence = session.rounds[0] as NonNullable<typeof session.rounds[0]>;
+      evidence.mutationSourceRevision = {
+        ...(evidence.mutationSourceRevision as Extract<RenderArtifact["sourceRevision"], { kind: "GIT" }>),
+        worktreeFingerprint: "d".repeat(64),
+      };
+    }],
+    ["claimed screen coverage", (session: MangekyoLoopSession) => {
+      session.claimedScreens = ["/", "/settings"];
+    }],
+    ["sequential round identity", (session: MangekyoLoopSession) => {
+      (session.rounds[0] as NonNullable<typeof session.rounds[0]>).round.roundNumber = 2;
+    }],
+    ["recomputed policy outcome", (session: MangekyoLoopSession) => {
+      const evidence = session.policyEvaluations[0] as NonNullable<typeof session.policyEvaluations[0]>;
+      evidence.policy = { ...evidence.policy, allowStyleChanges: false };
+    }],
+    ["final render link", (session: MangekyoLoopSession) => {
+      session.finalRender = {
+        ...(session.finalRender as RenderArtifact),
+        id: "unrelated-final-render",
+      };
+    }],
+    ["orphan policy evaluation", (session: MangekyoLoopSession) => {
+      session.policyEvaluations.push({
+        ...(session.policyEvaluations[0] as NonNullable<typeof session.policyEvaluations[0]>),
+        id: "orphan-policy-evaluation",
+        proposalId: "orphan-proposal",
+      });
+    }],
+    ["unbounded source fingerprint", (session: MangekyoLoopSession) => {
+      const evidence = session.rounds[0] as NonNullable<typeof session.rounds[0]>;
+      evidence.mutationSourceRevision = {
+        ...(evidence.mutationSourceRevision as Extract<RenderArtifact["sourceRevision"], { kind: "GIT" }>),
+        fileCount: 513,
+      };
+      (evidence.round.afterRender as RenderArtifact).sourceRevision = structuredClone(
+        evidence.mutationSourceRevision,
+      );
+      session.finalRender = structuredClone(evidence.round.afterRender);
+    }],
+  ] as const)("rejects persisted COMPLETE evidence with tampered %s", (_label, tamper) => {
+    const session = completeSessionFixture("/project");
+    tamper(session);
+    expect(isMangekyoLoopSession(session)).toBe(false);
+  });
+
+  it("rejects a resolved gate decision that predates its requested gate", () => {
+    const session = sessionFixture("/project");
+    session.status = "BLOCKED";
+    session.currentGate = undefined;
+    session.stopReason = "The pending policy-boundary change was rejected.";
+    session.gateDecisions = [{
+      id: "decision-reject",
+      gateId: "gate-1",
+      decision: "REJECT",
+      decidedBy: "local-user",
+      createdAt: "2026-08-27T01:00:01.000Z",
+    }];
+
+    expect(isMangekyoLoopSession(session)).toBe(false);
+  });
+
+  it("rejects a gate whose proposal files are unrelated to its requested change", () => {
+    const session = sessionFixture("/project");
+    const gate = session.currentGate as NonNullable<typeof session.currentGate>;
+    gate.proposal.filesToModify = ["unrelated.ts"];
+    session.gates = [structuredClone(gate)];
+
+    expect(isMangekyoLoopSession(session)).toBe(false);
+  });
+
+  it("rejects an Approve Once decision that has no linked completed execution or failed mutation", () => {
+    const session = sessionFixture("/project");
+    session.status = "BLOCKED";
+    session.updatedAt = "2026-08-27T01:00:03.000Z";
+    session.currentGate = undefined;
+    session.gateDecisions = [{
+      id: "decision-approve",
+      gateId: "gate-1",
+      decision: "APPROVE_ONCE",
+      decidedBy: "local-user",
+      createdAt: "2026-08-27T01:00:03.000Z",
+    }];
+    session.stopReason = "Fabricated unresolved authorization.";
+
+    expect(isMangekyoLoopSession(session)).toBe(false);
+  });
+
+  it("accepts a durable user Stop as the sole truthful resolution of a pending Human Gate", () => {
+    const session = sessionFixture("/project");
+    session.status = "BLOCKED";
+    session.updatedAt = "2026-08-27T01:00:03.000Z";
+    session.currentGate = undefined;
+    session.stopRequest = {
+      id: "stop-request-1",
+      loopSessionId: session.id,
+      sessionVersion: "2026-08-27T01:00:02.000Z",
+      requestedAt: "2026-08-27T01:00:03.000Z",
+      requestedBy: "local-user",
+    };
+    session.stopReason = "The user stopped the visual loop before completion.";
+
+    expect(isMangekyoLoopSession(session)).toBe(true);
+    expect(session.finalRender).toBeUndefined();
+  });
+
+  it("atomically claims one mixed Human Gate decision for the exact session version", async () => {
+    const project = await projectFixture();
+    const base = {
+      loopSessionId: "mangekyo-1",
+      sessionVersion: "2026-08-27T01:00:02.000Z",
+      gateId: "gate-1",
+      decidedAt: "2026-08-27T01:00:03.000Z",
+    };
+
+    const outcomes = await Promise.allSettled([
+      claimMangekyoGateDecision(project.rootPath, project.id, {
+        ...base,
+        decisionId: "decision-approve",
+        decision: "APPROVE_ONCE",
+      }),
+      claimMangekyoGateDecision(project.rootPath, project.id, {
+        ...base,
+        decisionId: "decision-reject",
+        decision: "REJECT",
+      }),
+    ]);
+
+    expect(outcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter(({ status }) => status === "rejected")).toHaveLength(1);
+    expect(
+      (outcomes.find(({ status }) => status === "rejected") as PromiseRejectedResult).reason,
+    ).toEqual(expect.objectContaining({ message: expect.stringMatching(/already decided/i) }));
+  });
+
+  it("atomically claims one active project loop and releases it only for the exact proven terminal session", async () => {
+    const project = await projectFixture();
+    const first = {
+      loopSessionId: "mangekyo-1",
+      sourceExecutionSessionId: "safe-session-1",
+      claimedAt: "2026-08-27T01:00:00.000Z",
+    };
+    const outcomes = await Promise.allSettled([
+      claimMangekyoActiveLoop(project.rootPath, project.id, first),
+      claimMangekyoActiveLoop(project.rootPath, project.id, {
+        ...first,
+        loopSessionId: "mangekyo-2",
+      }),
+    ]);
+    expect(outcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter(({ status }) => status === "rejected")).toHaveLength(1);
+
+    const winner = outcomes[0]?.status === "fulfilled"
+      ? first
+      : { ...first, loopSessionId: "mangekyo-2" };
+    await expect(
+      loadMangekyoActiveLoopClaim(project.rootPath, project.id),
+    ).resolves.toEqual(winner);
+    await expect(
+      releaseMangekyoActiveLoop(project.rootPath, project.id, {
+        ...winner,
+        loopSessionId: "different-session",
+        terminalStatus: "BLOCKED",
+      }),
+    ).rejects.toThrow(/exact active loop|ambiguous/i);
+    await releaseMangekyoActiveLoop(project.rootPath, project.id, {
+      ...winner,
+      terminalStatus: "BLOCKED",
+    });
+    await expect(
+      loadMangekyoActiveLoopClaim(project.rootPath, project.id),
+    ).resolves.toBeUndefined();
+    await expect(
+      claimMangekyoActiveLoop(project.rootPath, project.id, {
+        loopSessionId: "mangekyo-3",
+        sourceExecutionSessionId: "safe-session-2",
+        claimedAt: "2026-08-27T01:00:04.000Z",
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("persists and reloads one durable Stop request for an exact active session version", async () => {
+    const project = await projectFixture();
+    const request = {
+      id: "stop-request-1",
+      loopSessionId: "mangekyo-1",
+      sessionVersion: "2026-08-27T01:00:02.000Z",
+      requestedAt: "2026-08-27T01:00:03.000Z",
+      requestedBy: "local-user",
+    };
+
+    await requestMangekyoStop(project.rootPath, project.id, request);
+
+    await expect(
+      loadMangekyoStopRequest(project.rootPath, project.id, request.loopSessionId),
+    ).resolves.toEqual(request);
+    await expect(
+      requestMangekyoStop(project.rootPath, project.id, { ...request, id: "stop-request-replay" }),
+    ).rejects.toThrow(/already has an action|already stopped/i);
+  });
+
+  it("serializes a Stop request against a Human Gate decision for the same session version", async () => {
+    const project = await projectFixture();
+    const outcomes = await Promise.allSettled([
+      requestMangekyoStop(project.rootPath, project.id, {
+        id: "stop-request-1",
+        loopSessionId: "mangekyo-1",
+        sessionVersion: "2026-08-27T01:00:02.000Z",
+        requestedAt: "2026-08-27T01:00:03.000Z",
+        requestedBy: "local-user",
+      }),
+      claimMangekyoGateDecision(project.rootPath, project.id, {
+        loopSessionId: "mangekyo-1",
+        sessionVersion: "2026-08-27T01:00:02.000Z",
+        gateId: "gate-1",
+        decisionId: "decision-reject",
+        decision: "REJECT",
+        decidedAt: "2026-08-27T01:00:03.000Z",
+      }),
+    ]);
+
+    expect(outcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter(({ status }) => status === "rejected")).toHaveLength(1);
+  });
+
+  it("durably and immutably consumes one exact Approve Once authorization", async () => {
+    const project = await projectFixture();
+    const claim = {
+      loopSessionId: "mangekyo-1",
+      sessionVersion: "2026-08-27T01:00:03.000Z",
+      gateId: "gate-1",
+      decisionId: "decision-approve",
+      proposalId: "proposal-navigation",
+    };
+
+    await expect(
+      consumeMangekyoApproveOnceAuthorization(project.rootPath, project.id, claim),
+    ).resolves.toBeUndefined();
+    await expect(
+      consumeMangekyoApproveOnceAuthorization(project.rootPath, project.id, claim),
+    ).rejects.toThrow(/already consumed/i);
+  });
+
   it("round-trips only an exact project-scoped autonomous policy authorization", async () => {
     const project = await projectFixture();
     const authorization = {
@@ -195,13 +570,13 @@ describe("Mangekyo loop persistence", () => {
 
   it("serves one authenticated binary when the same render is linked by loop checkpoints", async () => {
     const project = await projectFixture();
-    const session = sessionFixture(project.rootPath);
-    session.finalRender = structuredClone(session.initialRender);
+    const session = completeSessionFixture(project.rootPath);
     await mkdir(join(project.rootPath, ".design-sharingan", "renders", "mangekyo-1"), {
       recursive: true,
     });
     const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
     await writeFile(session.initialRender?.imagePath as string, bytes);
+    await writeFile(session.finalRender?.imagePath as string, bytes);
     await saveMangekyoLoopSession(project.rootPath, session);
 
     await expect(

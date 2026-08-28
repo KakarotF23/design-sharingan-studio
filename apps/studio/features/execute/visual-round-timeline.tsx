@@ -25,6 +25,10 @@ export function VisualRoundTimeline({ rounds }: { rounds: readonly MangekyoRound
                 <div><dt>Critical</dt><dd>{round.criticalCount}</dd></div>
                 <div><dt>Important</dt><dd>{round.importantCount}</dd></div>
                 <div><dt>Polish</dt><dd>{round.polishCount}</dd></div>
+                <div><dt>UX integrity</dt><dd>{round.uxIntegrity}</dd></div>
+                <div><dt>Product consistency</dt><dd>{round.productConsistency}</dd></div>
+                <div><dt>Accessibility</dt><dd>{round.accessibility}</dd></div>
+                <div><dt>Genome integrity</dt><dd>{round.genomeIntegrity}</dd></div>
               </dl>
             </li>
           ))}

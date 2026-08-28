@@ -80,7 +80,12 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async () => {
-  await rm(sandboxPath, { force: true, recursive: true });
+  await rm(sandboxPath, {
+    force: true,
+    recursive: true,
+    maxRetries: 5,
+    retryDelay: 50,
+  });
 });
 
 test("allows a style round then enters a durable HUMAN_GATE before a navigation mutation", async ({
@@ -121,6 +126,7 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
   const sourceBeforeLoop = await readFile(join(projectPath, "server.mjs"), "utf8");
   const stylesBeforeLoop = await readFile(join(projectPath, "styles.css"), "utf8");
   expect(sourceBeforeLoop).not.toContain("data-mangekyo-navigation");
+  await rm(join(projectPath, ".git"), { force: true, recursive: true });
 
   await page.getByRole("button", { name: "Mangekyō" }).click();
   await expect(page.getByRole("heading", { name: "Mangekyō visual loop" })).toBeVisible();
@@ -140,6 +146,11 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
   await expect(page.getByRole("button", { name: "Approve Once" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Expand Scope" })).toBeVisible();
   await expect(page.locator(".mangekyo-activity")).toContainText("Human decision required");
+  await expect(page.locator(".visual-rounds")).toContainText("UX integrity");
+  await expect(page.locator(".visual-rounds")).toContainText("Product consistency");
+  await expect(page.locator(".visual-rounds")).toContainText("Accessibility");
+  await expect(page.locator(".visual-rounds")).toContainText("Genome integrity");
+  await expect(page.locator(".visual-rounds")).toContainText("NOT_VERIFIED");
 
   const sourceAtGate = await readFile(join(projectPath, "server.mjs"), "utf8");
   const stylesAtGate = await readFile(join(projectPath, "styles.css"), "utf8");
@@ -162,7 +173,15 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
   ).find((record) => record.type === "MANGEKYO_LOOP");
   expect(loopRecord).toMatchObject({
     status: "HUMAN_GATE",
-    rounds: [{ round: { roundNumber: 1 } }],
+    rounds: [{
+      mutationSourceRevision: { kind: "UNVERSIONED", available: true, truncated: false },
+      round: {
+        roundNumber: 1,
+        afterRender: {
+          sourceRevision: { kind: "UNVERSIONED", available: true, truncated: false },
+        },
+      },
+    }],
     currentGate: {
       requestedChange: { kind: "NAVIGATION_CHANGE", files: ["server.mjs"] },
     },
@@ -204,4 +223,65 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
     "stopped without a whole-product pass",
   );
   expect(await readFile(join(projectPath, "server.mjs"), "utf8")).toBe(sourceBeforeLoop);
+
+  const startEndpoint = `${new URL(studioPath as string, "http://studio.invalid").pathname.replace(/\/overview$/, "/execute")}/mangekyo/start`;
+  const competingStarts = await page.evaluate(
+    async ({ endpoint, sourceSessionId }) => Promise.all(
+      [0, 1].map(async () => {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ safeSessionId: sourceSessionId }),
+        });
+        return { status: response.status, payload: await response.json() as unknown };
+      }),
+    ),
+    { endpoint: startEndpoint, sourceSessionId: (loopRecord as { sourceExecutionSessionId: string }).sourceExecutionSessionId },
+  );
+  expect(competingStarts.map(({ status }) => status).sort()).toEqual([200, 422]);
+  const acceptedStart = competingStarts.find(({ status }) => status === 200)?.payload as {
+    session?: { id?: string; status?: string };
+  };
+  expect(acceptedStart.session?.id).not.toBe((loopRecord as { id: string }).id);
+  expect(acceptedStart.session?.status).toBe("HUMAN_GATE");
+  const retainedLoops = (
+    await Promise.all(
+      (await readdir(join(projectPath, ".design-sharingan", "sessions")))
+        .filter((file) => file.endsWith(".json"))
+        .map(async (file) => JSON.parse(
+          await readFile(join(projectPath, ".design-sharingan", "sessions", file), "utf8"),
+        ) as { type?: string }),
+    )
+  ).filter(({ type }) => type === "MANGEKYO_LOOP");
+  expect(retainedLoops).toHaveLength(2);
+
+  await page.reload();
+  await page.getByRole("button", { name: "Mangekyō" }).click();
+  await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Stop visual loop" })).toBeVisible();
+  await page.getByRole("button", { name: "Stop visual loop" }).click();
+  await expect(page.getByText("BLOCKED", { exact: true })).toBeVisible();
+  await expect(page.locator(".mangekyo-activity")).toContainText(
+    "stopped without a whole-product pass",
+  );
+  await page.reload();
+  await page.getByRole("button", { name: "Mangekyō" }).click();
+  await expect(page.getByText("BLOCKED", { exact: true })).toBeVisible();
+  const stoppedLoop = (
+    await Promise.all(
+      (await readdir(join(projectPath, ".design-sharingan", "sessions")))
+        .filter((file) => file.endsWith(".json"))
+        .map(async (file) => JSON.parse(
+          await readFile(join(projectPath, ".design-sharingan", "sessions", file), "utf8"),
+        ) as Record<string, unknown>),
+    )
+  ).find((record) => record.id === acceptedStart.session?.id);
+  expect(stoppedLoop).toMatchObject({
+    status: "BLOCKED",
+    stopRequest: {
+      loopSessionId: acceptedStart.session?.id,
+      requestedBy: "local-user",
+    },
+  });
+  expect(stoppedLoop).not.toHaveProperty("finalRender");
 });

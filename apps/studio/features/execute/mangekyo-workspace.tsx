@@ -100,6 +100,18 @@ export function MangekyoWorkspace({
               <p className="utility-label">CURRENT ROUND</p>
               <strong>{String(Math.max(1, session.currentRound)).padStart(2, "0")}</strong>
               <span>/ {String(session.maxRounds).padStart(2, "0")}</span>
+              {session.status !== "COMPLETE" &&
+              session.status !== "BLOCKED" &&
+              session.status !== "FAILED" ? (
+                <button
+                  className="mangekyo-stop"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void action("stop", { sessionId: session.id })}
+                >
+                  Stop visual loop
+                </button>
+              ) : null}
             </div>
             <dl>
               <div><dt>Status</dt><dd>{session.status}</dd></div>

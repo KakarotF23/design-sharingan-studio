@@ -64,6 +64,10 @@ function sessionView(session: MangekyoLoopSession): MangekyoSessionView {
       importantCount: round.importantCount,
       polishCount: round.polishCount,
       filesChanged: [...round.filesChanged],
+      uxIntegrity: round.uxIntegrity.status,
+      productConsistency: round.productConsistency.status,
+      accessibility: round.accessibility.status,
+      genomeIntegrity: round.genomeIntegrity.status,
     })),
     ...(session.currentGate === undefined ? {} : {
       currentGate: {

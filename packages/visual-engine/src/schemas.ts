@@ -11,7 +11,18 @@ export interface VisualFindingWireOutput {
 }
 
 export interface VisualAnalysisWireOutput {
+  verification: {
+    uxIntegrity: IntegrityVerification<"PASS" | "REGRESSION" | "NOT_VERIFIED">;
+    productConsistency: IntegrityVerification<"PASS" | "REGRESSION" | "NOT_VERIFIED">;
+    accessibility: IntegrityVerification<"PASS" | "REGRESSION" | "NOT_VERIFIED">;
+    genomeIntegrity: IntegrityVerification<"PASS" | "CONFLICT" | "NOT_VERIFIED">;
+  };
   findings: VisualFindingWireOutput[];
+}
+
+export interface IntegrityVerification<TStatus extends string> {
+  status: TStatus;
+  evidence: string[];
 }
 
 const boundedText = {
@@ -69,15 +80,43 @@ const findingSchema = {
 export const VISUAL_ANALYSIS_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
+    verification: {
+      type: "object",
+      properties: {
+        uxIntegrity: verificationSchema(["PASS", "REGRESSION", "NOT_VERIFIED"]),
+        productConsistency: verificationSchema(["PASS", "REGRESSION", "NOT_VERIFIED"]),
+        accessibility: verificationSchema(["PASS", "REGRESSION", "NOT_VERIFIED"]),
+        genomeIntegrity: verificationSchema(["PASS", "CONFLICT", "NOT_VERIFIED"])
+      },
+      required: ["uxIntegrity", "productConsistency", "accessibility", "genomeIntegrity"],
+      additionalProperties: false
+    },
     findings: {
       type: "array",
       items: findingSchema,
       maxItems: 64
     }
   },
-  required: ["findings"],
+  required: ["verification", "findings"],
   additionalProperties: false
 } as const;
+
+function verificationSchema(statuses: readonly string[]) {
+  return {
+    type: "object",
+    properties: {
+      status: { type: "string", enum: statuses },
+      evidence: {
+        type: "array",
+        items: boundedText,
+        minItems: 1,
+        maxItems: 16
+      }
+    },
+    required: ["status", "evidence"],
+    additionalProperties: false
+  } as const;
+}
 
 const severityValues = new Set(["CRITICAL", "IMPORTANT", "POLISH", "IGNORE"]);
 const categoryValues = new Set([
@@ -121,12 +160,48 @@ function boundedTextValue(value: unknown, maximum: number): value is string {
   );
 }
 
+function integrityVerification(
+  value: unknown,
+  statuses: ReadonlySet<string>
+): boolean {
+  return (
+    exactRecord(value, ["status", "evidence"]) &&
+    statuses.has(value.status as string) &&
+    Array.isArray(value.evidence) &&
+    value.evidence.length > 0 &&
+    value.evidence.length <= 16 &&
+    value.evidence.every((entry) => boundedTextValue(entry, 2_000))
+  );
+}
+
 export function assertVisualAnalysisWireOutput(
   value: unknown,
   expectedScreen: string
 ): VisualAnalysisWireOutput {
   if (
-    !exactRecord(value, ["findings"]) ||
+    !exactRecord(value, ["verification", "findings"]) ||
+    !exactRecord(value.verification, [
+      "uxIntegrity",
+      "productConsistency",
+      "accessibility",
+      "genomeIntegrity"
+    ]) ||
+    !integrityVerification(
+      value.verification.uxIntegrity,
+      new Set(["PASS", "REGRESSION", "NOT_VERIFIED"])
+    ) ||
+    !integrityVerification(
+      value.verification.productConsistency,
+      new Set(["PASS", "REGRESSION", "NOT_VERIFIED"])
+    ) ||
+    !integrityVerification(
+      value.verification.accessibility,
+      new Set(["PASS", "REGRESSION", "NOT_VERIFIED"])
+    ) ||
+    !integrityVerification(
+      value.verification.genomeIntegrity,
+      new Set(["PASS", "CONFLICT", "NOT_VERIFIED"])
+    ) ||
     !Array.isArray(value.findings) ||
     value.findings.length > 64 ||
     !value.findings.every(

@@ -1795,9 +1795,16 @@ export async function saveRenderArtifact(
   const allowedIndexStatusCodes = new Set([" ", "M", "T", "A", "D", "R", "C", "U"]);
   const allowedWorktreeStatusCodes = new Set([" ", "M", "T", "D", "R", "C", "U"]);
   const validSourceRevision = source.kind === "UNVERSIONED"
-    ? hasExactKeys(source, ["kind", "available", "reason"]) &&
-      source.available === false &&
-      (source.reason === "NOT_A_GIT_WORKSPACE" || source.reason === "GIT_EVIDENCE_UNAVAILABLE")
+    ? source.available === false
+      ? hasExactKeys(source, ["kind", "available", "reason"]) &&
+        (source.reason === "NOT_A_GIT_WORKSPACE" || source.reason === "GIT_EVIDENCE_UNAVAILABLE")
+      : hasExactKeys(source, ["kind", "available", "truncated", "worktreeFingerprint", "fileCount"]) &&
+        source.available === true &&
+        source.truncated === false &&
+        /^[0-9a-f]{64}$/.test(source.worktreeFingerprint) &&
+        Number.isSafeInteger(source.fileCount) &&
+        source.fileCount >= 0 &&
+        source.fileCount <= 512
     : source.kind === "GIT" &&
       hasExactKeys(source, ["kind", "available", "head", "branch", "status", "entries", "truncated", "worktreeFingerprint", "fileCount"]) &&
       source.available === true &&

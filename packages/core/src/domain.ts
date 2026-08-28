@@ -264,6 +264,13 @@ export type RenderSourceRevision =
       kind: "UNVERSIONED";
       available: false;
       reason: "NOT_A_GIT_WORKSPACE" | "GIT_EVIDENCE_UNAVAILABLE";
+    }
+  | {
+      kind: "UNVERSIONED";
+      available: true;
+      truncated: false;
+      worktreeFingerprint: string;
+      fileCount: number;
     };
 
 export interface VisualRound {
@@ -279,9 +286,17 @@ export interface VisualRound {
   criticalCount: number;
   importantCount: number;
   polishCount: number;
-  uxIntegrity: string;
-  genomeIntegrity: string;
+  uxIntegrity: VisualIntegrityVerification;
+  productConsistency: VisualIntegrityVerification;
+  accessibility: VisualIntegrityVerification;
+  genomeIntegrity: VisualIntegrityVerification;
+  genomeEvidenceVersion?: string;
   status: MangekyoStatus;
+}
+
+export interface VisualIntegrityVerification {
+  status: "PASS" | "REGRESSION" | "CONFLICT" | "NOT_VERIFIED";
+  evidence: string[];
 }
 
 export interface VisualFinding {
@@ -338,12 +353,21 @@ export interface MangekyoHumanGateDecision {
   policyAfter?: AutonomyPolicy;
 }
 
+export interface MangekyoStopRequest {
+  id: string;
+  loopSessionId: string;
+  sessionVersion: ISODateTime;
+  requestedAt: ISODateTime;
+  requestedBy: string;
+}
+
 export interface MangekyoRoundEvidence {
   round: VisualRound;
   proposal: ChangeProposal;
   proposalThreadId: string;
   policyEvaluationId: string;
   mutationCompletedAt: ISODateTime;
+  mutationSourceRevision: RenderSourceRevision;
   visualAnalysisThreadId: string;
   gateDecisionId?: string;
 }
@@ -371,6 +395,11 @@ export interface MangekyoLoopSession extends DesignSession {
   currentGate?: MangekyoHumanGate;
   initialRender?: RenderArtifact;
   finalRender?: RenderArtifact;
+  mutationFailure?: {
+    targetDisposition: "NO_TARGET_CHANGE" | "ROLLED_BACK" | "RECONCILIATION_REQUIRED";
+    affectedPaths: string[];
+  };
+  stopRequest?: MangekyoStopRequest;
   stopReason?: string;
 }
 

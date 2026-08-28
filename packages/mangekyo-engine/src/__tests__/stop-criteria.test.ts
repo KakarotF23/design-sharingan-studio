@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { evaluateStopCriteria } from "../stop-criteria";
 
+const verifiedIntegrity = {
+  uxIntegrity: "PASS",
+  productConsistency: "PASS",
+  accessibility: "PASS",
+  genomeIntegrity: "PASS",
+} as const;
+
 describe("evaluateStopCriteria", () => {
   it("stops when critical findings are zero and final evidence is fresh", () => {
     expect(
@@ -13,6 +20,7 @@ describe("evaluateStopCriteria", () => {
         importantThreshold: 2,
         uxRegressions: 0,
         genomeConflicts: 0,
+        integrity: verifiedIntegrity,
         hasFreshFinalRender: true
       }).stop
     ).toBe(true);
@@ -28,6 +36,7 @@ describe("evaluateStopCriteria", () => {
         importantThreshold: 2,
         uxRegressions: 0,
         genomeConflicts: 0,
+        integrity: verifiedIntegrity,
         hasFreshFinalRender: false
       }).reason
     ).toMatch(/fresh render/i);
@@ -43,6 +52,7 @@ describe("evaluateStopCriteria", () => {
         importantThreshold: 2,
         uxRegressions: 0,
         genomeConflicts: 0,
+        integrity: verifiedIntegrity,
         hasFreshFinalRender: true
       }),
     ).toEqual({
@@ -67,6 +77,7 @@ describe("evaluateStopCriteria", () => {
         importantThreshold: 2,
         uxRegressions: 0,
         genomeConflicts: 0,
+        integrity: verifiedIntegrity,
         hasFreshFinalRender: true,
         ...state
       }),
@@ -83,10 +94,36 @@ describe("evaluateStopCriteria", () => {
         importantThreshold: 2,
         uxRegressions: 0,
         genomeConflicts: 0,
+        integrity: verifiedIntegrity,
         hasFreshFinalRender: true,
         claimedScreens: ["/", "/settings"],
         inspectedScreens: ["/"]
       }),
     ).toMatchObject({ stop: false, pass: false, outcome: "CONTINUE" });
+  });
+
+  it.each([
+    ["UX regression", { uxIntegrity: "REGRESSION" }],
+    ["product inconsistency", { productConsistency: "REGRESSION" }],
+    ["accessibility regression", { accessibility: "REGRESSION" }],
+    ["missing Genome evidence", { genomeIntegrity: "NOT_VERIFIED" }],
+  ] as const)("cannot PASS with %s even when visual finding counts are zero", (_label, override) => {
+    expect(evaluateStopCriteria({
+      round: 2,
+      maxRounds: 5,
+      criticalCount: 0,
+      importantCount: 0,
+      importantThreshold: 2,
+      uxRegressions: 0,
+      genomeConflicts: 0,
+      hasFreshFinalRender: true,
+      integrity: {
+        uxIntegrity: "PASS",
+        productConsistency: "PASS",
+        accessibility: "PASS",
+        genomeIntegrity: "PASS",
+        ...override,
+      },
+    })).toMatchObject({ stop: false, pass: false, outcome: "CONTINUE" });
   });
 });

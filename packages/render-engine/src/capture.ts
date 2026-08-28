@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { devNull } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { chromium } from "@playwright/test";
@@ -22,6 +22,17 @@ const MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_SOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 5_000;
 const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+const UNVERSIONED_EXCLUDED_DIRECTORIES = new Set([
+  ".design-sharingan",
+  ".git",
+  ".next",
+  ".turbo",
+  ".cache",
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+]);
 
 export interface RenderViewport {
   name: string;
@@ -440,9 +451,63 @@ async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSo
   };
 }
 
-async function captureSourceRevision(workspace: ProjectWorkspace): Promise<RenderSourceRevision> {
+async function unversionedSourcePaths(rootPath: string): Promise<string[]> {
+  const paths: string[] = [];
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(join(rootPath, directory), { withFileTypes: true });
+    entries.sort((left, right) => Buffer.compare(Buffer.from(left.name), Buffer.from(right.name)));
+    for (const entry of entries) {
+      if (entry.name.includes("\0") || entry.name.includes("\n") || entry.name.includes("\r")) {
+        throw new Error("Unversioned source evidence contained an unsafe path");
+      }
+      const path = directory === "" ? entry.name : `${directory}/${entry.name}`;
+      safeEvidenceText(path, 1024, false);
+      if (entry.isDirectory() && UNVERSIONED_EXCLUDED_DIRECTORIES.has(entry.name)) {
+        continue;
+      }
+      const absolute = assertSafeSourcePath(rootPath, path);
+      const metadata = await lstat(absolute);
+      if (metadata.isSymbolicLink()) {
+        throw new Error("Unversioned render source evidence refused a source symlink");
+      }
+      if (metadata.isDirectory()) {
+        await visit(path);
+        continue;
+      }
+      if (!metadata.isFile()) {
+        throw new Error("Unversioned source evidence contained an unsupported file type");
+      }
+      paths.push(path);
+      if (paths.length > MAX_GIT_ENTRIES) {
+        throw new Error("Unversioned source evidence exceeded the complete render-input file bound");
+      }
+    }
+  };
+  await visit("");
+  return paths;
+}
+
+async function captureUnversionedSnapshot(workspace: ProjectWorkspace): Promise<RenderSourceRevision> {
+  const paths = await unversionedSourcePaths(workspace.rootPath);
+  return {
+    kind: "UNVERSIONED",
+    available: true,
+    truncated: false,
+    worktreeFingerprint: await fingerprintWorktree(workspace.rootPath, paths),
+    fileCount: paths.length,
+  };
+}
+
+export async function captureWorkspaceSourceRevision(
+  workspace: ProjectWorkspace,
+): Promise<RenderSourceRevision> {
   if (!workspace.hasGit) {
-    return { kind: "UNVERSIONED", available: false, reason: "NOT_A_GIT_WORKSPACE" };
+    const first = await captureUnversionedSnapshot(workspace);
+    const second = await captureUnversionedSnapshot(workspace);
+    if (JSON.stringify(first) !== JSON.stringify(second)) {
+      throw new Error("Unversioned source evidence changed while its coherent snapshot was captured");
+    }
+    return second;
   }
   if (!workspace.capabilities.canUseGit) {
     throw new Error("Complete Git evidence is not authorized for this declared Git workspace");
@@ -526,7 +591,7 @@ export async function captureRender(options: CaptureRenderOptions): Promise<Capt
     }
   };
   const target = captureUrl(options.baseUrl, options.route);
-  const beforeRevision = await stage(captureSourceRevision(options.workspace), "source revision");
+  const beforeRevision = await stage(captureWorkspaceSourceRevision(options.workspace), "source revision");
   const browserPromise = (options.browserLauncher ?? defaultBrowserLauncher).launch();
   const browser = await stage(browserPromise, "browser launch", async (lateBrowser) => {
     await cleanup(lateBrowser.close(), "late browser").catch(() => undefined);
@@ -568,7 +633,7 @@ export async function captureRender(options: CaptureRenderOptions): Promise<Capt
   if (cleanupError !== undefined) throw cleanupError;
   if (captureError !== undefined) throw captureError;
   if (screenshot === undefined) throw new Error("Render capture did not produce screenshot bytes");
-  const afterRevision = await stage(captureSourceRevision(options.workspace), "source revision recheck");
+  const afterRevision = await stage(captureWorkspaceSourceRevision(options.workspace), "source revision recheck");
   if (JSON.stringify(beforeRevision) !== JSON.stringify(afterRevision)) {
     throw new Error("Project source changed during capture; refusing stale render evidence");
   }

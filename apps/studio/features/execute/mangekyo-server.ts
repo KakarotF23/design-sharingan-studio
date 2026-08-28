@@ -22,18 +22,30 @@ import {
   type ProposedVisualChange,
 } from "@design-sharingan/mangekyo-engine";
 import {
+  claimMangekyoActiveLoop,
+  claimMangekyoGateDecision,
+  consumeMangekyoApproveOnceAuthorization,
   detectProject,
   listReferences,
   listSessions,
   loadMangekyoAuthorization,
+  loadMangekyoActiveLoopClaim,
   loadMangekyoLoopSession,
+  loadMangekyoStopRequest,
   loadSafeExecutionState,
+  releaseMangekyoActiveLoop,
+  requestMangekyoStop,
   saveMangekyoAuthorization,
   saveMangekyoLoopSession,
   type ProjectWorkspace,
   type SafeExecutionEditingSession,
 } from "@design-sharingan/project-adapters";
-import { captureRender, startDevServer, type DevServerHandle } from "@design-sharingan/render-engine";
+import {
+  captureRender,
+  captureWorkspaceSourceRevision,
+  startDevServer,
+  type DevServerHandle,
+} from "@design-sharingan/render-engine";
 import { analyzeRender } from "@design-sharingan/visual-engine";
 import { createAnalysisStagingDirectory } from "../projects/project-locator";
 import {
@@ -96,11 +108,60 @@ async function currentLoop(project: Project): Promise<MangekyoLoopSession | unde
   const records = (await listSessions(project.rootPath, project.id)).filter(
     ({ type }) => type === "MANGEKYO_LOOP",
   );
-  if (records.length > 1) throw new Error("Mangekyo loop evidence is ambiguous");
-  const record = records[0];
-  return record === undefined
-    ? undefined
-    : loadMangekyoLoopSession(project.rootPath, project.id, record.id);
+  const sessions = await Promise.all(records.map(({ id }) =>
+    loadMangekyoLoopSession(project.rootPath, project.id, id),
+  ));
+  const active = sessions.filter(({ status }) => !isTerminalStatus(status));
+  if (active.length > 1) throw new Error("Mangekyo active-loop evidence is ambiguous");
+  const claim = await loadMangekyoActiveLoopClaim(project.rootPath, project.id);
+  if (
+    (active.length === 0 && claim !== undefined) ||
+    (active[0] !== undefined && (
+      claim === undefined ||
+      claim.loopSessionId !== active[0].id ||
+      claim.sourceExecutionSessionId !== active[0].sourceExecutionSessionId ||
+      claim.claimedAt !== active[0].createdAt
+    ))
+  ) {
+    throw new Error("Mangekyo active-loop claim is missing, stale, or ambiguous");
+  }
+  return active[0] ?? sessions.sort(
+    (left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
+  )[0];
+}
+
+async function requireActiveClaim(
+  project: Project,
+  session: MangekyoLoopSession,
+): Promise<void> {
+  const claim = await loadMangekyoActiveLoopClaim(project.rootPath, project.id);
+  if (
+    claim === undefined ||
+    claim.loopSessionId !== session.id ||
+    claim.sourceExecutionSessionId !== session.sourceExecutionSessionId ||
+    claim.claimedAt !== session.createdAt
+  ) {
+    throw new Error("The exact active Mangekyo loop claim is missing or stale");
+  }
+}
+
+function isTerminalStatus(
+  status: MangekyoLoopSession["status"],
+): status is "COMPLETE" | "BLOCKED" | "FAILED" {
+  return status === "COMPLETE" || status === "BLOCKED" || status === "FAILED";
+}
+
+async function releaseTerminalClaim(
+  project: Project,
+  session: MangekyoLoopSession,
+): Promise<void> {
+  if (!isTerminalStatus(session.status)) return;
+  await releaseMangekyoActiveLoop(project.rootPath, project.id, {
+    loopSessionId: session.id,
+    sourceExecutionSessionId: session.sourceExecutionSessionId,
+    claimedAt: session.createdAt,
+    terminalStatus: session.status,
+  });
 }
 
 export async function loadMangekyoContext(project: Project): Promise<{
@@ -163,6 +224,16 @@ async function loopDependencies(input: {
   return {
     createId: randomUUID,
     now: () => new Date(),
+    claimGateDecision: (claim) => claimMangekyoGateDecision(
+      input.project.rootPath,
+      input.project.id,
+      claim,
+    ),
+    loadStopRequest: (session) => loadMangekyoStopRequest(
+      input.project.rootPath,
+      input.project.id,
+      session.id,
+    ),
     async proposeChange(session, roundNumber): Promise<ProposedVisualChange> {
       const latestFindings = session.rounds.at(-1)?.round.findingsAfter ?? [];
       const findingEvidence = latestFindings.slice(0, 8).map((finding) => ({
@@ -233,6 +304,7 @@ async function loopDependencies(input: {
         const mutation = await executeApproveOnceMutation({
           workspaceRoot: input.project.rootPath,
           loopSessionId: session.id,
+          sessionVersion: session.updatedAt,
           proposal,
           proposalThreadId,
           change,
@@ -240,13 +312,21 @@ async function loopDependencies(input: {
           policyEvaluation,
           decision: authorization.decision,
           now: new Date(),
+          consumeAuthorization: (claim) => consumeMangekyoApproveOnceAuthorization(
+            input.project.rootPath,
+            input.project.id,
+            claim,
+          ),
           agent: createMangekyoMutationAgent(),
         });
+        const completedAt = new Date().toISOString();
+        const sourceRevision = await captureWorkspaceSourceRevision(input.workspace);
         return {
           proposalId: mutation.proposalId,
           threadId: mutation.threadId,
           filesChanged: [...mutation.filesChanged],
-          completedAt: new Date().toISOString(),
+          completedAt,
+          sourceRevision,
         };
       }
       const result = await executePolicyAuthorizedMutation(
@@ -277,11 +357,14 @@ async function loopDependencies(input: {
       if (result.decision !== "APPLIED") {
         throw new Error("Persisted loop policy no longer authorizes the pending mutation");
       }
+      const completedAt = new Date().toISOString();
+      const sourceRevision = await captureWorkspaceSourceRevision(input.workspace);
       return {
         proposalId: result.mutation.proposalId,
         threadId: result.mutation.threadId,
         filesChanged: [...result.mutation.filesChanged],
-        completedAt: new Date().toISOString(),
+        completedAt,
+        sourceRevision,
       };
     },
     async runProject() {
@@ -335,7 +418,14 @@ async function loopDependencies(input: {
         },
         { agent: createMangekyoVisualAgent(), createId: randomUUID },
       );
-      return { threadId: visual.threadId, findings: visual.findings };
+      return {
+        threadId: visual.threadId,
+        findings: visual.findings,
+        verification: visual.verification,
+        ...(visual.genomeEvidenceVersion === undefined
+          ? {}
+          : { genomeEvidenceVersion: visual.genomeEvidenceVersion }),
+      };
     },
     async stopProject() {
       const active = devServer;
@@ -351,11 +441,8 @@ export async function startMangekyoLoop(
   safeSessionId: string,
 ): Promise<{ references: Reference[]; session: MangekyoLoopSession }> {
   const existing = await currentLoop(project);
-  if (existing !== undefined) {
-    if (existing.sourceExecutionSessionId !== safeSessionId) {
-      throw new Error("Another durable Mangekyo loop already owns this project");
-    }
-    return { references: await listReferences(project.rootPath, project.id), session: existing };
+  if (existing !== undefined && !isTerminalStatus(existing.status)) {
+    throw new Error("Another durable Mangekyo loop already owns this project");
   }
   const safe = await loadSafeExecutionState(project.rootPath, project.id);
   if (safe.id !== safeSessionId || safe.status !== "EDITING") {
@@ -370,11 +457,16 @@ export async function startMangekyoLoop(
     throw new Error("Mangekyo requires authenticated project reference images");
   }
   const workspace = await workspaceFor(project);
-  if (!workspace.capabilities.canRun || !workspace.capabilities.canRender || !workspace.hasGit) {
-    throw new Error("Mangekyo requires a runnable, renderable Git-backed web project");
+  if (!workspace.capabilities.canRun || !workspace.capabilities.canRender) {
+    throw new Error("Mangekyo requires a runnable, renderable web project");
   }
   const sessionId = randomUUID();
   const createdAt = new Date().toISOString();
+  await claimMangekyoActiveLoop(project.rootPath, project.id, {
+    loopSessionId: sessionId,
+    sourceExecutionSessionId: safe.id,
+    claimedAt: createdAt,
+  });
   const initialRender = await captureBaseline(workspace, sessionId);
   const session: MangekyoLoopSession = {
     id: sessionId,
@@ -417,6 +509,7 @@ export async function startMangekyoLoop(
     );
     const dependencies = await loopDependencies({ project, workspace, safe, references, analysisPath });
     const completed = await runMangekyoLoop(session, dependencies);
+    await releaseTerminalClaim(project, completed);
     return { references: allReferences, session: completed };
   } finally {
     await rm(analysisPath, { force: true, recursive: true });
@@ -432,6 +525,7 @@ export async function decideMangekyoGate(
   if (session.status !== "HUMAN_GATE" || session.currentGate === undefined) {
     throw new Error("Mangekyo is not waiting at a Human Gate");
   }
+  await requireActiveClaim(project, session);
   const safe = await loadSafeExecutionState(project.rootPath, project.id);
   if (safe.id !== session.sourceExecutionSessionId || safe.status !== "EDITING") {
     throw new Error("Mangekyo source execution evidence is stale");
@@ -453,7 +547,51 @@ export async function decideMangekyoGate(
         }
       : { decision, decidedBy: "local-user" };
     const completed = await resolveHumanGate(session, resolution, dependencies);
+    await releaseTerminalClaim(project, completed);
     return { references: allReferences, session: completed };
+  } finally {
+    await rm(analysisPath, { force: true, recursive: true });
+  }
+}
+
+export async function stopMangekyoLoop(
+  project: Project,
+  sessionId: string,
+): Promise<{ references: Reference[]; session: MangekyoLoopSession }> {
+  const session = await loadMangekyoLoopSession(project.rootPath, project.id, sessionId);
+  if (isTerminalStatus(session.status)) {
+    throw new Error("Mangekyo loop is already terminal");
+  }
+  await requireActiveClaim(project, session);
+  const safe = await loadSafeExecutionState(project.rootPath, project.id);
+  if (safe.id !== session.sourceExecutionSessionId || safe.status !== "EDITING") {
+    throw new Error("Mangekyo source execution evidence is stale");
+  }
+  const allReferences = await listReferences(project.rootPath, project.id);
+  const references = allReferences.filter(({ id }) => session.referenceIds.includes(id));
+  if (
+    references.length !== session.referenceIds.length ||
+    references.some(({ imagePath }) => typeof imagePath !== "string")
+  ) {
+    throw new Error("Mangekyo reference evidence is missing or stale");
+  }
+  await requestMangekyoStop(project.rootPath, project.id, {
+    id: randomUUID(),
+    loopSessionId: session.id,
+    sessionVersion: session.updatedAt,
+    requestedAt: new Date().toISOString(),
+    requestedBy: "local-user",
+  });
+  if (session.status !== "HUMAN_GATE") {
+    return { references: allReferences, session };
+  }
+  const workspace = await workspaceFor(project);
+  const analysisPath = await createAnalysisStagingDirectory(project.rootPath);
+  try {
+    const dependencies = await loopDependencies({ project, workspace, safe, references, analysisPath });
+    const stopped = await runMangekyoLoop(session, dependencies);
+    await releaseTerminalClaim(project, stopped);
+    return { references: allReferences, session: stopped };
   } finally {
     await rm(analysisPath, { force: true, recursive: true });
   }

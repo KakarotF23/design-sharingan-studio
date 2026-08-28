@@ -34,6 +34,10 @@ export interface MangekyoRoundView {
   importantCount: number;
   polishCount: number;
   filesChanged: string[];
+  uxIntegrity: string;
+  productConsistency: string;
+  accessibility: string;
+  genomeIntegrity: string;
 }
 
 export interface MangekyoGateView {

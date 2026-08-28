@@ -108,6 +108,24 @@ export function createMangekyoVisualAgent(): VisualAnalysisAgent {
           finalResponse: "",
           items: [],
           structured: {
+            verification: {
+              uxIntegrity: {
+                status: "PASS",
+                evidence: ["The rendered primary task and existing navigation remain usable."],
+              },
+              productConsistency: {
+                status: "PASS",
+                evidence: ["The rendered surface preserves the existing product language."],
+              },
+              accessibility: {
+                status: "PASS",
+                evidence: ["No observable accessibility regression is present in this render."],
+              },
+              genomeIntegrity: {
+                status: "NOT_VERIFIED",
+                evidence: ["No authenticated approved Genome evidence was supplied to this analysis."],
+              },
+            },
             findings: [
               {
                 severity: "IMPORTANT",

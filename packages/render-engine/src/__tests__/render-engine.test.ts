@@ -533,8 +533,8 @@ function fakeBrowser(
   return { launcher: { async launch() { return browser; } }, browser, calls };
 }
 
-// Production break caught: capture metadata can otherwise point at a different route/revision than the bytes that were actually persisted.
-it("captures a PNG and atomically persists exact session, round, viewport, route, and unversioned source evidence", async () => {
+// Production break caught: a Local Folder render without a complete source fingerprint cannot be proven fresh after mutation.
+it("captures a PNG and atomically persists exact session, round, viewport, route, and authenticated unversioned source evidence", async () => {
   const active = await workspace();
   const browser = fakeBrowser("http://127.0.0.1:4310/account");
 
@@ -559,8 +559,10 @@ it("captures a PNG and atomically persists exact session, round, viewport, route
     capturedAt: "2026-08-25T09:00:00.000Z",
     sourceRevision: {
       kind: "UNVERSIONED",
-      available: false,
-      reason: "NOT_A_GIT_WORKSPACE",
+      available: true,
+      truncated: false,
+      worktreeFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+      fileCount: 0,
     },
   });
   expect(result.artifact.imagePath).toBe(join(
@@ -576,6 +578,23 @@ it("captures a PNG and atomically persists exact session, round, viewport, route
     "page-close",
     "browser-close",
   ]);
+});
+
+it("rejects an unversioned Local Folder render when source bytes change during capture", async () => {
+  const active = await workspace();
+  await writeFile(join(active.rootPath, "app.ts"), "before\n");
+
+  await expect(captureRender({
+    workspace: active,
+    baseUrl: "http://127.0.0.1:4310",
+    route: "/",
+    viewport: { name: "desktop", width: 1440, height: 800 },
+    sessionId: "session-1",
+    roundId: "round-1",
+    browserLauncher: fakeBrowser("http://127.0.0.1:4310/", PNG, async () => {
+      await writeFile(join(active.rootPath, "app.ts"), "after\n");
+    }).launcher,
+  })).rejects.toThrow(/source changed|fingerprint/i);
 });
 
 // Production break caught: a clean-looking HEAD without structured dirty/untracked evidence can falsely bind a render to committed source.

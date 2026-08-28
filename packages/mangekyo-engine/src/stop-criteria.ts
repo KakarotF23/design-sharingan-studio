@@ -4,8 +4,14 @@ export interface StopCriteriaInput {
   criticalCount: number;
   importantCount: number;
   importantThreshold: number;
-  uxRegressions: number;
-  genomeConflicts: number;
+  uxRegressions?: number;
+  genomeConflicts?: number;
+  integrity: {
+    uxIntegrity: "PASS" | "REGRESSION" | "NOT_VERIFIED";
+    productConsistency: "PASS" | "REGRESSION" | "NOT_VERIFIED";
+    accessibility: "PASS" | "REGRESSION" | "NOT_VERIFIED";
+    genomeIntegrity: "PASS" | "CONFLICT" | "NOT_VERIFIED";
+  };
   hasFreshFinalRender: boolean;
   buildFailed?: boolean;
   userStopped?: boolean;
@@ -65,8 +71,10 @@ export function evaluateStopCriteria(input: StopCriteriaInput): StopCriteriaResu
     scopeCovered &&
     input.criticalCount === 0 &&
     input.importantCount <= input.importantThreshold &&
-    input.uxRegressions === 0 &&
-    input.genomeConflicts === 0;
+    input.integrity.uxIntegrity === "PASS" &&
+    input.integrity.productConsistency === "PASS" &&
+    input.integrity.accessibility === "PASS" &&
+    input.integrity.genomeIntegrity === "PASS";
 
   if (meetsQualityCriteria) {
     return {

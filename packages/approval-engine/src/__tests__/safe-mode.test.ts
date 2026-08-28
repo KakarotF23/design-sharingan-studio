@@ -399,6 +399,7 @@ describe("Mangekyo policy-authorized mutation gate", () => {
     const result = await executeApproveOnceMutation({
       workspaceRoot,
       loopSessionId: "mangekyo-session-1",
+      sessionVersion: "2026-08-27T01:00:01.000Z",
       proposal,
       proposalThreadId: "thread-proposal-1",
       change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
@@ -431,6 +432,7 @@ describe("Mangekyo policy-authorized mutation gate", () => {
         createdAt: "2026-08-27T01:00:01.000Z",
       },
       now: new Date("2026-08-27T01:00:02.000Z"),
+      consumeAuthorization: async () => undefined,
       agent: {
         async run<TStructured>(input: CodexAgentRunInput) {
           agentRuns += 1;
@@ -443,6 +445,93 @@ describe("Mangekyo policy-authorized mutation gate", () => {
     expect(result.filesChanged).toEqual(["src/file.ts"]);
     expect(agentRuns).toBe(1);
     expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+  });
+
+  it("durably consumes one exact Approve Once authorization before mutation and rejects sequential replay", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    const proposal = proposalFixture({
+      sessionId: "mangekyo-session-1",
+      filesToModify: ["src/file.ts"],
+    });
+    let consumed = false;
+    let agentRuns = 0;
+    const input = {
+      workspaceRoot,
+      loopSessionId: "mangekyo-session-1",
+      sessionVersion: "2026-08-27T01:00:00.500Z",
+      proposal,
+      proposalThreadId: "thread-proposal-1",
+      change: { kind: "NAVIGATION_CHANGE" as const, files: ["src/file.ts"] },
+      gate: {
+        id: "gate-1",
+        roundNumber: 1,
+        requestedChange: { kind: "NAVIGATION_CHANGE" as const, files: ["src/file.ts"] },
+        proposal,
+        proposalThreadId: "thread-proposal-1",
+        policyEvaluationId: "policy-navigation",
+        requestedAt: "2026-08-27T01:00:00.000Z",
+        reasons: ["Navigation changes require a Human Gate."],
+        affectedScope: ["/"],
+        impact: "Changes navigation.",
+      },
+      policyEvaluation: {
+        id: "policy-navigation",
+        roundNumber: 1,
+        proposalId: proposal.id,
+        change: { kind: "NAVIGATION_CHANGE" as const, files: ["src/file.ts"] },
+        policy: DEFAULT_AUTONOMY_POLICY,
+        evaluation: {
+          decision: "HUMAN_GATE" as const,
+          reasons: ["Navigation changes require a Human Gate."],
+        },
+        evaluatedAt: "2026-08-27T01:00:00.000Z",
+      },
+      decision: {
+        id: "gate-decision-1",
+        gateId: "gate-1",
+        decision: "APPROVE_ONCE" as const,
+        decidedBy: "local-user",
+        createdAt: "2026-08-27T01:00:00.500Z",
+      },
+      now: new Date("2026-08-27T01:00:02.000Z"),
+      consumeAuthorization: async (claim: {
+        loopSessionId: string;
+        sessionVersion: string;
+        gateId: string;
+        decisionId: string;
+        proposalId: string;
+      }) => {
+        expect(claim).toEqual({
+          loopSessionId: "mangekyo-session-1",
+          sessionVersion: "2026-08-27T01:00:00.500Z",
+          gateId: "gate-1",
+          decisionId: "gate-decision-1",
+          proposalId: "proposal-safe-1",
+        });
+        if (consumed) throw new Error("Approve Once authorization was already consumed");
+        consumed = true;
+      },
+      agent: {
+        async run<TStructured>(agentInput: CodexAgentRunInput) {
+          agentRuns += 1;
+          await writeFile(
+            join(agentInput.workingDirectory, "src/file.ts"),
+            `after-${agentRuns}\n`,
+            "utf8",
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    };
+
+    await expect(executeApproveOnceMutation(input)).resolves.toMatchObject({
+      filesChanged: ["src/file.ts"],
+    });
+    await expect(executeApproveOnceMutation(input)).rejects.toThrow(/already consumed/i);
+    expect(agentRuns).toBe(1);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after-1\n");
   });
 
   it("persists and reloads an exact ALLOW evaluation before reusing the controlled mirror transaction", async () => {

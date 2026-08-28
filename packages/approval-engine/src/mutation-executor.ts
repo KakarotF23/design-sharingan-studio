@@ -147,6 +147,7 @@ export interface ExecutePolicyAuthorizedMutationInput {
 export interface ExecuteApproveOnceMutationInput {
   workspaceRoot: string;
   loopSessionId: string;
+  sessionVersion: string;
   proposal: ChangeProposal;
   proposalThreadId: string;
   change: AutonomyChange;
@@ -154,6 +155,13 @@ export interface ExecuteApproveOnceMutationInput {
   policyEvaluation: MangekyoPolicyEvaluationEvidence;
   decision: MangekyoHumanGateDecision & { decision: "APPROVE_ONCE" };
   now: Date;
+  consumeAuthorization(claim: {
+    loopSessionId: string;
+    sessionVersion: string;
+    gateId: string;
+    decisionId: string;
+    proposalId: string;
+  }): Promise<void>;
   agent: MutationAgent;
   mutationDriver?: MutationDriver;
 }
@@ -414,6 +422,9 @@ function validateApproveOnceGate(input: ExecuteApproveOnceMutationInput): void {
   if (
     !Number.isFinite(input.now.getTime()) ||
     !safeIdentifier(input.loopSessionId) ||
+    !isIsoTimestamp(input.sessionVersion) ||
+    Date.parse(input.sessionVersion) < Date.parse(input.decision.createdAt) ||
+    Date.parse(input.sessionVersion) > input.now.getTime() ||
     input.proposal.sessionId !== input.loopSessionId ||
     input.proposal.status !== "PROPOSED" ||
     input.proposalThreadId.length === 0 ||
@@ -1586,6 +1597,13 @@ export async function executeApproveOnceMutation(
   input: ExecuteApproveOnceMutationInput,
 ): Promise<MutationResult> {
   validateApproveOnceGate(input);
+  await input.consumeAuthorization({
+    loopSessionId: input.loopSessionId,
+    sessionVersion: input.sessionVersion,
+    gateId: input.gate.id,
+    decisionId: input.decision.id,
+    proposalId: input.proposal.id,
+  });
   return new MutationExecutor({
     workspaceRoot: input.workspaceRoot,
     proposalThreadId: input.proposalThreadId,

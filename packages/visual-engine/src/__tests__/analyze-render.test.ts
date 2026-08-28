@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodexAgentResult, CodexAgentRunInput } from "@design-sharingan/agent-runtime";
@@ -8,6 +8,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { analyzeRender, type VisualAnalysisWireOutput } from "../analyze-render";
 
 const wireOutput: VisualAnalysisWireOutput = {
+  verification: {
+    uxIntegrity: { status: "PASS", evidence: ["Primary task and navigation remain usable."] },
+    productConsistency: { status: "PASS", evidence: ["Existing component language is preserved."] },
+    accessibility: { status: "PASS", evidence: ["No observable contrast or interaction regression."] },
+    genomeIntegrity: { status: "PASS", evidence: ["Approved Genome v1 invariant remains visible."] }
+  },
   findings: [
     {
       severity: "IMPORTANT",
@@ -120,10 +126,13 @@ describe("analyzeRender", () => {
     );
 
     expect(runInput?.workingDirectory).toBe(analysisWorkingDirectory);
-    expect(runInput?.images).toEqual([referencePath, renderPath]);
+    expect(runInput?.images).toHaveLength(2);
+    expect(runInput?.images?.every((path) => path.startsWith(`${analysisWorkingDirectory}/`))).toBe(true);
+    expect(runInput?.images).not.toContain(referencePath);
+    expect(runInput?.images).not.toContain(renderPath);
     expect(runInput?.outputSchema).toMatchObject({
       type: "object",
-      required: ["findings"],
+      required: ["verification", "findings"],
       additionalProperties: false,
       properties: {
         findings: {
@@ -145,12 +154,98 @@ describe("analyzeRender", () => {
     });
     expect(runInput?.prompt).toContain("Inspect the rendered image output");
     expect(runInput?.prompt).toContain("not source code as a substitute");
-    expect(runInput?.prompt).toContain("hierarchy, UX integrity, accessibility, and product fit");
-    expect(runInput?.prompt).toContain("Do not chase pixel similarity at the expense of UX");
+    expect(runInput?.prompt).toContain(
+      "UX integrity > product consistency > accessibility > visual hierarchy > reference intent > pixel similarity"
+    );
     expect(result).toEqual({
       threadId: "visual-thread-1",
+      genomeEvidenceVersion: "1",
+      verification: wireOutput.verification,
       findings: [{ id: "finding-1", ...wireOutput.findings[0], status: "OPEN" }]
     });
+  });
+
+  it("requires Genome integrity to be NOT_VERIFIED when no authenticated Genome evidence is supplied", async () => {
+    await expect(analyzeRender(
+      {
+        projectId: "project-1",
+        projectRoot,
+        analysisWorkingDirectory,
+        screen: "/",
+        referenceImages: [{ referenceId: "reference-1", imagePath: referencePath }],
+        currentRender: artifact(),
+        productContext: {
+          name: "Fixture product",
+          approvedDirection: "Calm evidence-first hierarchy",
+          uxInvariants: ["Preserve navigation"],
+          designSystem: ["Use the existing crimson token"]
+        }
+      },
+      {
+        createId: () => "finding-1",
+        agent: {
+          async run<TStructured>() {
+            return {
+              threadId: "visual-thread-unverified",
+              finalResponse: JSON.stringify(wireOutput),
+              structured: wireOutput as TStructured,
+              items: []
+            };
+          }
+        }
+      }
+    )).rejects.toThrow(/Genome.*NOT_VERIFIED|authenticated Genome/i);
+  });
+
+  it("analyzes exclusive private image snapshots even if authenticated paths are replaced before agent reads", async () => {
+    const originalReference = await readFile(referencePath);
+    const output: VisualAnalysisWireOutput = structuredClone(wireOutput);
+    output.verification.genomeIntegrity = {
+      status: "NOT_VERIFIED",
+      evidence: ["No authenticated approved Genome was supplied."]
+    };
+    let imageInputs: string[] = [];
+
+    await analyzeRender(
+      {
+        projectId: "project-1",
+        projectRoot,
+        analysisWorkingDirectory,
+        screen: "/",
+        referenceImages: [{ referenceId: "reference-1", imagePath: referencePath }],
+        currentRender: artifact(),
+        productContext: {
+          name: "Fixture product",
+          approvedDirection: "Calm evidence-first hierarchy",
+          uxInvariants: ["Preserve navigation"],
+          designSystem: ["Use the existing crimson token"]
+        }
+      },
+      {
+        createId: () => "finding-1",
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            imageInputs = [...(input.images ?? [])];
+            await rename(referencePath, `${referencePath}.authenticated`);
+            await writeFile(
+              referencePath,
+              Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 9, 9, 9, 9])
+            );
+            expect(imageInputs[0]).not.toBe(referencePath);
+            expect(await readFile(imageInputs[0] as string)).toEqual(originalReference);
+            return {
+              threadId: "visual-thread-snapshot",
+              finalResponse: JSON.stringify(output),
+              structured: output as TStructured,
+              items: []
+            };
+          }
+        }
+      }
+    );
+
+    expect(imageInputs.every((path) => path.startsWith(`${analysisWorkingDirectory}/`))).toBe(true);
+    await Promise.all(imageInputs.map((path) => expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" })));
   });
 
   it.each([
