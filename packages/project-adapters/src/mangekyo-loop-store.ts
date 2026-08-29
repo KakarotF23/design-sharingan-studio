@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { isAbsolute, join, posix, relative, sep } from "node:path";
 import type {
   AutonomyChange,
   AutonomyPolicy,
@@ -208,6 +208,50 @@ function proposal(value: unknown, sessionId: string): value is ChangeProposal {
   );
 }
 
+function sourcePathEvidence(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length > 128) return false;
+  const paths = value.map((entry) =>
+    entry !== null && typeof entry === "object" && !Array.isArray(entry)
+      ? (entry as { path?: unknown }).path
+      : undefined,
+  );
+  return new Set(paths).size === paths.length && value.every((entry) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const record = entry as Record<string, unknown>;
+    const path = record.path;
+    if (
+      typeof path !== "string" ||
+      Buffer.byteLength(path, "utf8") === 0 ||
+      Buffer.byteLength(path, "utf8") > 1_024 ||
+      isAbsolute(path) ||
+      path === ".." ||
+      path.startsWith("../") ||
+      path.includes("\\") ||
+      path.includes("\0") ||
+      path.includes("\n") ||
+      path.includes("\r") ||
+      posix.normalize(path) !== path ||
+      path === ".git" ||
+      path.startsWith(".git/") ||
+      path === ".design-sharingan" ||
+      path.startsWith(".design-sharingan/")
+    ) return false;
+    if (record.state === "MISSING") return exact(record, ["path", "state"]);
+    return (
+      record.state === "FILE" &&
+      exact(record, ["path", "state", "mode", "size", "contentHash"]) &&
+      Number.isSafeInteger(record.mode) &&
+      (record.mode as number) >= 0 &&
+      (record.mode as number) <= 0o777 &&
+      Number.isSafeInteger(record.size) &&
+      (record.size as number) >= 0 &&
+      (record.size as number) <= 16 * 1024 * 1024 &&
+      typeof record.contentHash === "string" &&
+      /^[0-9a-f]{64}$/.test(record.contentHash)
+    );
+  });
+}
+
 function sourceRevision(value: unknown): boolean {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -215,14 +259,15 @@ function sourceRevision(value: unknown): boolean {
     return record.available === false
       ? exact(record, ["kind", "available", "reason"]) &&
         (record.reason === "NOT_A_GIT_WORKSPACE" || record.reason === "GIT_EVIDENCE_UNAVAILABLE")
-      : exact(record, ["kind", "available", "truncated", "worktreeFingerprint", "fileCount"]) &&
+      : exact(record, ["kind", "available", "truncated", "worktreeFingerprint", "fileCount", "requiredPathEvidence"]) &&
         record.available === true &&
         record.truncated === false &&
         typeof record.worktreeFingerprint === "string" &&
         /^[0-9a-f]{64}$/.test(record.worktreeFingerprint) &&
         Number.isSafeInteger(record.fileCount) &&
         (record.fileCount as number) >= 0 &&
-        (record.fileCount as number) <= 512;
+        (record.fileCount as number) <= 512 &&
+        sourcePathEvidence(record.requiredPathEvidence);
   }
   return (
     exact(value, [
@@ -235,6 +280,7 @@ function sourceRevision(value: unknown): boolean {
       "truncated",
       "worktreeFingerprint",
       "fileCount",
+      "requiredPathEvidence",
     ]) &&
     value.kind === "GIT" &&
     value.available === true &&
@@ -275,6 +321,7 @@ function sourceRevision(value: unknown): boolean {
     Number.isSafeInteger(value.fileCount) &&
     (value.fileCount as number) >= value.entries.length &&
     (value.fileCount as number) <= 512 &&
+    sourcePathEvidence(value.requiredPathEvidence) &&
     (value.status === "CLEAN" ? value.entries.length === 0 : value.entries.length > 0)
   );
 }
@@ -551,6 +598,8 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
       stableJson(evidence.mutationSourceRevision) !== stableJson(round.afterRender.sourceRevision) ||
       evidence.mutationSourceRevision.available !== true ||
       evidence.mutationSourceRevision.truncated ||
+      stableJson(evidence.mutationSourceRevision.requiredPathEvidence.map(({ path }) => path)) !==
+        stableJson(expectedFiles) ||
       stableJson(round.filesChanged) !== stableJson(expectedFiles) ||
       stableJson(round.beforeRender) !== stableJson(previousRender) ||
       stableJson(round.findingsBefore) !== stableJson(previousFindings) ||
@@ -595,6 +644,41 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
     const linkedRounds = session.rounds.filter(
       ({ gateDecisionId }) => gateDecisionId === decision.id,
     );
+    const isLatestDecision = session.gateDecisions.at(-1)?.id === decision.id;
+    const exactPendingGate = historicalGate !== undefined &&
+      historicalGate.roundNumber === session.rounds.length + 1 &&
+      historicalGate.proposal.sessionId === session.id &&
+      session.policyEvaluations.at(-1)?.id === historicalGate.policyEvaluationId &&
+      historicalGate.requestedAt === session.policyEvaluations.at(-1)?.evaluatedAt &&
+      Date.parse(decision.createdAt) >= Date.parse(historicalGate.requestedAt) &&
+      session.currentGate === undefined &&
+      isLatestDecision;
+    const pendingApproveOnce =
+      decision.decision === "APPROVE_ONCE" &&
+      exactPendingGate &&
+      linkedRounds.length === 0 &&
+      ["EDITING", "RUNNING", "CAPTURING", "COMPARING"].includes(session.status);
+    const pendingExpansion =
+      decision.decision === "EXPAND_SCOPE" &&
+      exactPendingGate &&
+      linkedRounds.length === 0 &&
+      session.status === "EDITING" &&
+      session.updatedAt === decision.createdAt;
+    const stoppedPendingDecision =
+      exactPendingGate &&
+      linkedRounds.length === 0 &&
+      session.status === "BLOCKED" &&
+      session.stopRequest !== undefined &&
+      Date.parse(session.stopRequest.sessionVersion) >= Date.parse(decision.createdAt);
+    const hasAuthorizedExpansion = decision.decision === "EXPAND_SCOPE" &&
+      session.policyEvaluations.some(
+        (entry) =>
+          entry.roundNumber === historicalGate?.roundNumber &&
+          entry.proposalId === historicalGate.proposal.id &&
+          entry.evaluation.decision === "ALLOW" &&
+          Date.parse(entry.evaluatedAt) >= Date.parse(decision.createdAt) &&
+          stableJson(entry.change) === stableJson(historicalGate.requestedChange),
+      );
     if (
       historicalGate === undefined ||
       Date.parse(decision.createdAt) < Date.parse(historicalGate.requestedAt) ||
@@ -612,15 +696,12 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
       )) ||
       (decision.decision === "APPROVE_ONCE" && !(
         linkedRounds.length === 1 ||
-        (linkedRounds.length === 0 && session.status === "FAILED")
+        (linkedRounds.length === 0 && session.status === "FAILED") ||
+        pendingApproveOnce ||
+        stoppedPendingDecision
       )) ||
-      (decision.decision === "EXPAND_SCOPE" && !session.policyEvaluations.some(
-        (entry) =>
-          entry.roundNumber === historicalGate.roundNumber &&
-          entry.proposalId === historicalGate.proposal.id &&
-          entry.evaluation.decision === "ALLOW" &&
-          Date.parse(entry.evaluatedAt) >= Date.parse(decision.createdAt) &&
-          stableJson(entry.change) === stableJson(historicalGate.requestedChange),
+      (decision.decision === "EXPAND_SCOPE" && !(
+        hasAuthorizedExpansion || pendingExpansion || stoppedPendingDecision
       ))
     ) {
       return false;
@@ -636,6 +717,13 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
         ) &&
         session.policyEvaluations.at(-1)?.id === entry.id &&
         entry.roundNumber === session.rounds.length + 1
+      ) ||
+      (
+        session.status === "BLOCKED" &&
+        session.stopRequest !== undefined &&
+        session.policyEvaluations.at(-1)?.id === entry.id &&
+        entry.roundNumber === session.rounds.length + 1 &&
+        Date.parse(entry.evaluatedAt) <= Date.parse(session.stopRequest.sessionVersion)
       )
     ),
   );
@@ -1065,23 +1153,29 @@ export async function loadMangekyoActiveLoopClaim(
 export async function releaseMangekyoActiveLoop(
   rootPath: string,
   projectId: string,
-  release: MangekyoActiveLoopClaim & {
-    terminalStatus: "COMPLETE" | "BLOCKED" | "FAILED";
-  },
+  release: MangekyoActiveLoopClaim & (
+    | { terminalStatus: "COMPLETE" | "BLOCKED" | "FAILED" }
+    | { reservationStatus: "UNPERSISTED" }
+  ),
 ): Promise<void> {
+  const terminalStatus = "terminalStatus" in release ? release.terminalStatus : undefined;
+  const reservationStatus = "reservationStatus" in release ? release.reservationStatus : undefined;
   if (
     !exact(release, [
       "loopSessionId",
       "sourceExecutionSessionId",
       "claimedAt",
-      "terminalStatus",
+      terminalStatus === undefined ? "reservationStatus" : "terminalStatus",
     ]) ||
     !activeLoopClaim({
       loopSessionId: release.loopSessionId,
       sourceExecutionSessionId: release.sourceExecutionSessionId,
       claimedAt: release.claimedAt,
     }) ||
-    !["COMPLETE", "BLOCKED", "FAILED"].includes(release.terminalStatus)
+    !(
+      (terminalStatus !== undefined && ["COMPLETE", "BLOCKED", "FAILED"].includes(terminalStatus)) ||
+      reservationStatus === "UNPERSISTED"
+    )
   ) {
     throw new Error("Mangekyo active-loop release is invalid");
   }
@@ -1115,6 +1209,27 @@ export async function releaseMangekyoActiveLoop(
     ) {
       throw new Error("The exact active loop claim is missing or ambiguous");
     }
+
+    const records = (await listSessions(rootPath, projectId)).filter(
+      ({ id }) => id === release.loopSessionId,
+    );
+    if (terminalStatus === undefined) {
+      if (records.length !== 0) {
+        throw new Error("The start reservation has persisted or ambiguous loop evidence");
+      }
+    } else {
+      if (records.length !== 1 || records[0]?.type !== "MANGEKYO_LOOP") {
+        throw new Error("The exact durable terminal session is missing or ambiguous");
+      }
+      const session = await loadMangekyoLoopSession(rootPath, projectId, release.loopSessionId);
+      if (
+        session.status !== terminalStatus ||
+        session.sourceExecutionSessionId !== release.sourceExecutionSessionId ||
+        session.createdAt !== release.claimedAt
+      ) {
+        throw new Error("The exact durable terminal session is missing or ambiguous");
+      }
+    }
   } finally {
     await handle.close();
   }
@@ -1131,47 +1246,124 @@ export async function releaseMangekyoActiveLoop(
   }
 }
 
-export async function claimMangekyoGateDecision(
-  rootPath: string,
-  projectId: string,
-  claim: {
-    loopSessionId: string;
-    sessionVersion: string;
-    gateId: string;
-    decisionId: string;
-    decision: "REJECT" | "APPROVE_ONCE" | "EXPAND_SCOPE";
-    decidedAt: string;
-  },
-): Promise<void> {
-  if (
-    !exact(claim, [
+export interface MangekyoGateDecisionClaim {
+  loopSessionId: string;
+  sessionVersion: string;
+  gateId: string;
+  decisionId: string;
+  decision: "REJECT" | "APPROVE_ONCE" | "EXPAND_SCOPE";
+  decidedAt: string;
+}
+
+function gateDecisionClaim(value: unknown): value is MangekyoGateDecisionClaim {
+  return (
+    exact(value, [
       "loopSessionId",
       "sessionVersion",
       "gateId",
       "decisionId",
       "decision",
       "decidedAt",
-    ]) ||
-    !identifier(claim.loopSessionId) ||
-    !iso(claim.sessionVersion) ||
-    !identifier(claim.gateId) ||
-    !identifier(claim.decisionId) ||
-    !["REJECT", "APPROVE_ONCE", "EXPAND_SCOPE"].includes(claim.decision) ||
-    !iso(claim.decidedAt) ||
-    Date.parse(claim.decidedAt) < Date.parse(claim.sessionVersion)
-  ) {
-    throw new Error("Mangekyo Human Gate claim is invalid");
-  }
-  const directory = await mangekyoClaimRoot(rootPath, projectId);
+    ]) &&
+    identifier(value.loopSessionId) &&
+    iso(value.sessionVersion) &&
+    identifier(value.gateId) &&
+    identifier(value.decisionId) &&
+    ["REJECT", "APPROVE_ONCE", "EXPAND_SCOPE"].includes(value.decision as string) &&
+    iso(value.decidedAt) &&
+    Date.parse(value.decidedAt as string) >= Date.parse(value.sessionVersion as string)
+  );
+}
+
+function gateActionClaimPath(directory: string, claim: MangekyoGateDecisionClaim): string {
   const digest = createHash("sha256")
     .update(`${claim.loopSessionId}\0${claim.sessionVersion}`)
     .digest("hex");
+  return assertPathInsideWorkspace(directory, join(directory, `action-${digest}.claim`));
+}
+
+export async function claimMangekyoGateDecision(
+  rootPath: string,
+  projectId: string,
+  claim: MangekyoGateDecisionClaim,
+): Promise<void> {
+  if (!gateDecisionClaim(claim)) {
+    throw new Error("Mangekyo Human Gate claim is invalid");
+  }
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const path = gateActionClaimPath(directory, claim);
   await writeExclusiveClaim(
     directory,
-    `action-${digest}.claim`,
+    path.slice(directory.length + 1),
     claim,
     "Mangekyo Human Gate was already decided or this session version already has an action",
   );
+}
+
+export async function releaseMangekyoGateDecisionClaim(
+  rootPath: string,
+  projectId: string,
+  claim: MangekyoGateDecisionClaim,
+): Promise<void> {
+  if (!gateDecisionClaim(claim)) throw new Error("Mangekyo Human Gate claim is invalid");
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const path = gateActionClaimPath(directory, claim);
+  const before = await lstat(path).catch(() => undefined);
+  if (
+    before === undefined ||
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.nlink !== 1 ||
+    before.size < 2 ||
+    before.size > MAX_CLAIM_BYTES
+  ) {
+    throw new Error("The exact Human Gate action claim is missing or ambiguous");
+  }
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    const parsed = JSON.parse(await handle.readFile("utf8")) as unknown;
+    if (
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      !gateDecisionClaim(parsed) ||
+      stableJson(parsed) !== stableJson(claim)
+    ) {
+      throw new Error("The exact Human Gate action claim is missing or ambiguous");
+    }
+  } finally {
+    await handle.close();
+  }
+  const session = await loadMangekyoLoopSession(rootPath, projectId, claim.loopSessionId);
+  const gateEvidence = session.currentGate;
+  const policyEntry = session.policyEvaluations.find(
+    ({ id }) => id === gateEvidence?.policyEvaluationId,
+  );
+  if (
+    session.status !== "HUMAN_GATE" ||
+    session.updatedAt !== claim.sessionVersion ||
+    gateEvidence === undefined ||
+    gateEvidence.id !== claim.gateId ||
+    gateEvidence.proposal.sessionId !== session.id ||
+    policyEntry === undefined ||
+    policyEntry.proposalId !== gateEvidence.proposal.id ||
+    stableJson(policyEntry.change) !== stableJson(gateEvidence.requestedChange) ||
+    session.gateDecisions.some(({ gateId }) => gateId === claim.gateId)
+  ) {
+    throw new Error("The Human Gate session transitioned; retaining its action claim as ambiguous");
+  }
+  const current = await lstat(path);
+  if (current.dev !== before.dev || current.ino !== before.ino || current.size !== before.size) {
+    throw new Error("The Human Gate action claim changed before safe release");
+  }
+  await rm(path);
+  const directoryHandle = await open(directory, constants.O_RDONLY);
+  try {
+    await directoryHandle.sync();
+  } finally {
+    await directoryHandle.close();
+  }
 }
 
 export interface MangekyoStopRequest {
@@ -1239,12 +1431,12 @@ export async function requestMangekyoStop(
   rootPath: string,
   projectId: string,
   request: MangekyoStopRequest,
-): Promise<void> {
+): Promise<MangekyoStopRequest> {
   if (!stopRequest(request)) throw new Error("Mangekyo Stop request is invalid");
   const directory = await mangekyoClaimRoot(rootPath, projectId);
-  if ((await stopRequests(directory, request.loopSessionId)).length > 0) {
-    throw new Error("Mangekyo loop was already stopped");
-  }
+  const existing = await stopRequests(directory, request.loopSessionId);
+  if (existing.length > 1) throw new Error("Mangekyo Stop request is ambiguous");
+  if (existing[0] !== undefined) return structuredClone(existing[0]);
   const digest = createHash("sha256")
     .update(`${request.loopSessionId}\0${request.sessionVersion}`)
     .digest("hex");
@@ -1254,6 +1446,7 @@ export async function requestMangekyoStop(
     request,
     "Mangekyo session version already has an action",
   );
+  return structuredClone(request);
 }
 
 export async function loadMangekyoStopRequest(

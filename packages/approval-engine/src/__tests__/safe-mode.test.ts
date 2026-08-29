@@ -1318,6 +1318,86 @@ describe("controlled mirror mutation", () => {
     });
   });
 
+  it("retains the transaction claim through source capture and rejects an interval writer", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      captureSourceRevision: async ({ requiredPaths }) => {
+        expect(requiredPaths).toEqual(["src/file.ts"]);
+        expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+        await writeFile(join(workspaceRoot, "src/file.ts"), "external interval winner\n");
+        return {
+          kind: "UNVERSIONED",
+          available: true,
+          truncated: false,
+          worktreeFingerprint: "a".repeat(64),
+          fileCount: 1,
+          requiredPathEvidence: [{
+            path: "src/file.ts",
+            state: "FILE",
+            mode: 0o644,
+            size: 25,
+            contentHash: "b".repeat(64),
+          }],
+        };
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const failure = await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    }).then(() => undefined, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      failure: {
+        targetDisposition: "RECONCILIATION_REQUIRED",
+        affectedPaths: ["src/file.ts"],
+      },
+    });
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe(
+      "external interval winner\n",
+    );
+  });
+
+  it("marks a post-application source-capture failure reconciliation-required", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      captureSourceRevision: async () => {
+        throw new Error("authenticated source capture failed");
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const failure = await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    }).then(() => undefined, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      failure: {
+        targetDisposition: "RECONCILIATION_REQUIRED",
+        affectedPaths: ["src/file.ts"],
+      },
+    });
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+  });
+
   it("fails closed when the mutation turn does not continue the exact proposal thread", async () => {
     const workspaceRoot = await temporaryWorkspace();
     await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");

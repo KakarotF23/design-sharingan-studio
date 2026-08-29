@@ -55,6 +55,14 @@ export interface MangekyoLoopDependencies {
     decision: "REJECT" | "APPROVE_ONCE" | "EXPAND_SCOPE";
     decidedAt: string;
   }): Promise<void>;
+  releaseGateDecisionClaim?(claim: {
+    loopSessionId: string;
+    sessionVersion: string;
+    gateId: string;
+    decisionId: string;
+    decision: "REJECT" | "APPROVE_ONCE" | "EXPAND_SCOPE";
+    decidedAt: string;
+  }): Promise<void>;
   loadStopRequest(session: MangekyoLoopSession): Promise<MangekyoStopRequest | undefined>;
   proposeChange(
     session: MangekyoLoopSession,
@@ -306,12 +314,7 @@ export function isFreshFinalRender(input: FreshFinalRenderInput): boolean {
     return false;
   }
   if (input.changedPaths.length === 0) return false;
-  if (revision.kind === "UNVERSIONED") return true;
-  const evidencedPaths = new Set(
-    revision.entries.flatMap(({ path, originalPath }) =>
-      originalPath === undefined ? [path] : [path, originalPath],
-    ),
-  );
+  const evidencedPaths = new Set(revision.requiredPathEvidence.map(({ path }) => path));
   return input.changedPaths.every((path) => evidencedPaths.has(path));
 }
 
@@ -728,14 +731,15 @@ export async function resolveHumanGate(
     ...(policyAfter === undefined ? {} : { policyAfter }),
   };
   if (!safeIdentifier(baseDecision.id)) throw new Error("Human gate decision id is invalid");
-  await dependencies.claimGateDecision({
+  const decisionClaim = {
     loopSessionId: session.id,
     sessionVersion: session.updatedAt,
     gateId: gate.id,
     decisionId: baseDecision.id,
     decision: baseDecision.decision,
     decidedAt: baseDecision.createdAt,
-  });
+  };
+  await dependencies.claimGateDecision(decisionClaim);
   const { stopReason: _pendingGateReason, ...sessionWithoutGateReason } = cloneSession(session);
   const decided: MangekyoLoopSession = {
     ...sessionWithoutGateReason,
@@ -752,14 +756,31 @@ export async function resolveHumanGate(
       : {}),
   };
 
-  if (resolution.decision === "REJECT") {
-    return persistAndReload(decided, dependencies, "rejected gate checkpoint");
+  let persistedDecision: MangekyoLoopSession;
+  try {
+    persistedDecision = await persistAndReload(
+      decided,
+      dependencies,
+      resolution.decision === "REJECT"
+        ? "rejected gate checkpoint"
+        : "human gate decision checkpoint",
+    );
+  } catch (checkpointError) {
+    try {
+      if (dependencies.releaseGateDecisionClaim === undefined) {
+        throw new Error("No exact gate-action release boundary is configured");
+      }
+      await dependencies.releaseGateDecisionClaim(decisionClaim);
+    } catch (releaseError) {
+      throw new AggregateError(
+        [checkpointError, releaseError],
+        "Gate decision checkpoint failed and its action claim could not be safely released",
+      );
+    }
+    throw checkpointError;
   }
-  const persistedDecision = await persistAndReload(
-    decided,
-    dependencies,
-    "human gate decision checkpoint",
-  );
+
+  if (resolution.decision === "REJECT") return persistedDecision;
 
   const pending: ProposedVisualChange = {
     proposal: gate.proposal,

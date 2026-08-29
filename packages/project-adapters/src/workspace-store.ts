@@ -22,6 +22,7 @@ import type {
   Project,
   Reference,
   RenderArtifact,
+  RenderSourcePathEvidence,
   UXImpact,
 } from "@design-sharingan/core";
 import { canTransitionLearnSession } from "@design-sharingan/core";
@@ -1792,21 +1793,40 @@ export async function saveRenderArtifact(
     !value.includes("\n") &&
     !value.includes("\r");
   const source = metadata.sourceRevision;
+  const validRequiredPathEvidence = (value: RenderSourcePathEvidence[]): boolean => Array.isArray(value) &&
+    value.length <= 128 &&
+    new Set(value.map((entry) => entry.path)).size === value.length &&
+    value.every((entry) => {
+      if (!isSafeGitPath(entry.path)) return false;
+      if (entry.state === "MISSING") return hasExactKeys(entry, ["path", "state"]);
+      return (
+        entry.state === "FILE" &&
+        hasExactKeys(entry, ["path", "state", "mode", "size", "contentHash"]) &&
+        Number.isSafeInteger(entry.mode) &&
+        entry.mode >= 0 &&
+        entry.mode <= 0o777 &&
+        Number.isSafeInteger(entry.size) &&
+        entry.size >= 0 &&
+        entry.size <= 16 * 1024 * 1024 &&
+        /^[0-9a-f]{64}$/.test(entry.contentHash)
+      );
+    });
   const allowedIndexStatusCodes = new Set([" ", "M", "T", "A", "D", "R", "C", "U"]);
   const allowedWorktreeStatusCodes = new Set([" ", "M", "T", "D", "R", "C", "U"]);
   const validSourceRevision = source.kind === "UNVERSIONED"
     ? source.available === false
       ? hasExactKeys(source, ["kind", "available", "reason"]) &&
         (source.reason === "NOT_A_GIT_WORKSPACE" || source.reason === "GIT_EVIDENCE_UNAVAILABLE")
-      : hasExactKeys(source, ["kind", "available", "truncated", "worktreeFingerprint", "fileCount"]) &&
+      : hasExactKeys(source, ["kind", "available", "truncated", "worktreeFingerprint", "fileCount", "requiredPathEvidence"]) &&
         source.available === true &&
         source.truncated === false &&
         /^[0-9a-f]{64}$/.test(source.worktreeFingerprint) &&
         Number.isSafeInteger(source.fileCount) &&
         source.fileCount >= 0 &&
-        source.fileCount <= 512
+        source.fileCount <= 512 &&
+        validRequiredPathEvidence(source.requiredPathEvidence)
     : source.kind === "GIT" &&
-      hasExactKeys(source, ["kind", "available", "head", "branch", "status", "entries", "truncated", "worktreeFingerprint", "fileCount"]) &&
+      hasExactKeys(source, ["kind", "available", "head", "branch", "status", "entries", "truncated", "worktreeFingerprint", "fileCount", "requiredPathEvidence"]) &&
       source.available === true &&
       /^[0-9a-f]{40,64}$/i.test(source.head) &&
       Buffer.byteLength(source.branch, "utf8") > 0 &&
@@ -1821,6 +1841,7 @@ export async function saveRenderArtifact(
       Array.isArray(source.entries) &&
       source.entries.length <= 512 &&
       source.fileCount >= source.entries.length &&
+      validRequiredPathEvidence(source.requiredPathEvidence) &&
       new Set(source.entries.map((entry) => entry.path)).size === source.entries.length &&
       source.entries.every((entry) => {
         const renamed = entry.index === "R" || entry.index === "C" ||

@@ -72,7 +72,8 @@ describe("analyzeRender", () => {
         entries: [{ index: " ", workingTree: "M", path: "server.mjs" }],
         truncated: false,
         worktreeFingerprint: "b".repeat(64),
-        fileCount: 2
+        fileCount: 2,
+        requiredPathEvidence: [],
       }
     };
   }

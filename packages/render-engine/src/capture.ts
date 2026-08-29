@@ -8,6 +8,7 @@ import { chromium } from "@playwright/test";
 import type {
   GitStatusEntry,
   RenderArtifact,
+  RenderSourcePathEvidence,
   RenderSourceRevision,
 } from "@design-sharingan/core";
 import {
@@ -68,6 +69,7 @@ export interface CaptureRenderOptions {
   createId?: () => string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  requiredSourcePaths?: readonly string[];
 }
 
 export interface CaptureRenderResult {
@@ -285,6 +287,117 @@ function assertSafeSourcePath(rootPath: string, path: string): string {
   return absolute;
 }
 
+function requiredSourcePaths(rootPath: string, paths: readonly string[]): string[] {
+  if (
+    paths.length > 128 ||
+    new Set(paths).size !== paths.length
+  ) {
+    throw new Error("Required source-path evidence is duplicate or exceeds its bound");
+  }
+  return paths.map((path) => {
+    safeEvidenceText(path, 1024, false);
+    assertSafeSourcePath(rootPath, path);
+    return path;
+  });
+}
+
+async function assertSafeSourceAncestors(rootPath: string, path: string): Promise<void> {
+  let current = rootPath;
+  for (const segment of path.split("/").slice(0, -1)) {
+    current = join(current, segment);
+    const entry = await lstat(current).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (entry === undefined) return;
+    if (entry.isSymbolicLink() || !entry.isDirectory()) {
+      throw new Error("Required source-path evidence has an unsafe ancestor");
+    }
+  }
+}
+
+async function captureRequiredPathEvidence(
+  rootPath: string,
+  requiredPaths: readonly string[],
+): Promise<RenderSourcePathEvidence[]> {
+  const evidence: RenderSourcePathEvidence[] = [];
+  let totalBytes = 0;
+  for (const path of requiredPaths) {
+    await assertSafeSourceAncestors(rootPath, path);
+    const absolute = assertSafeSourcePath(rootPath, path);
+    const before = await lstat(absolute).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (before === undefined) {
+      evidence.push({ path, state: "MISSING" });
+      continue;
+    }
+    if (before.isSymbolicLink()) {
+      throw new Error("Required source-path evidence refused a source symlink");
+    }
+    if (!before.isFile() || before.nlink !== 1) {
+      throw new Error("Required source-path evidence refused a non-file or hard-linked path");
+    }
+    if (
+      !Number.isSafeInteger(before.size) ||
+      before.size < 0 ||
+      before.size > MAX_SOURCE_FILE_BYTES ||
+      totalBytes + before.size > MAX_SOURCE_TOTAL_BYTES
+    ) {
+      throw new Error("Required source-path evidence exceeded its content byte bound");
+    }
+    const handle = await open(absolute, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      const opened = await handle.stat();
+      if (
+        opened.dev !== before.dev ||
+        opened.ino !== before.ino ||
+        opened.size !== before.size ||
+        opened.mode !== before.mode ||
+        opened.nlink !== 1 ||
+        !opened.isFile()
+      ) {
+        throw new Error("Required source path changed while evidence was captured");
+      }
+      const contents = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < contents.length) {
+        const read = await handle.read(contents, offset, contents.length - offset, offset);
+        if (read.bytesRead === 0) {
+          throw new Error("Required source content changed while evidence was captured");
+        }
+        offset += read.bytesRead;
+      }
+      const overflow = Buffer.alloc(1);
+      if ((await handle.read(overflow, 0, 1, contents.length)).bytesRead !== 0) {
+        throw new Error("Required source content exceeded its authenticated byte bound");
+      }
+      const after = await handle.stat();
+      if (
+        after.dev !== opened.dev ||
+        after.ino !== opened.ino ||
+        after.size !== opened.size ||
+        after.mode !== opened.mode ||
+        after.mtimeMs !== opened.mtimeMs
+      ) {
+        throw new Error("Required source content changed while evidence was captured");
+      }
+      totalBytes += contents.length;
+      evidence.push({
+        path,
+        state: "FILE",
+        mode: opened.mode & 0o777,
+        size: opened.size,
+        contentHash: createHash("sha256").update(contents).digest("hex"),
+      });
+    } finally {
+      await handle.close();
+    }
+  }
+  return evidence;
+}
+
 function hashField(hash: ReturnType<typeof createHash>, label: string, value: string | Buffer): void {
   const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
   hash.update(`${label}:${bytes.length}:`, "utf8");
@@ -373,7 +486,10 @@ const IGNORED_RENDER_INPUT_PATHSPECS = [
   ":(exclude,glob).design-sharingan/**",
 ] as const;
 
-async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSourceRevision> {
+async function captureGitSnapshot(
+  workspace: ProjectWorkspace,
+  requiredPaths: readonly string[],
+): Promise<RenderSourceRevision> {
   const inside = await requireGit(workspace.rootPath, ["rev-parse", "--is-inside-work-tree"], "Git worktree evidence");
   if (safeEvidenceText(inside.toString("utf8"), 8) !== "true") throw new Error("Project root is not a Git worktree");
   const topLevel = safeEvidenceText(
@@ -421,7 +537,7 @@ async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSo
     ),
     "Ignored render-input evidence",
   );
-  const paths = [...new Set([...ordinaryPaths, ...ignoredRenderInputs])];
+  const paths = [...new Set([...ordinaryPaths, ...ignoredRenderInputs, ...requiredPaths])];
   if (paths.length > MAX_GIT_ENTRIES) {
     throw new Error("Git source evidence exceeded the complete render-input file bound");
   }
@@ -433,6 +549,10 @@ async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSo
   const parsed = parseGitStatus(statusOutput);
   if (parsed.truncated) throw new Error("Git status evidence exceeded its complete entry bound");
   const worktreeFingerprint = await fingerprintWorktree(workspace.rootPath, paths);
+  const requiredPathEvidence = await captureRequiredPathEvidence(
+    workspace.rootPath,
+    requiredPaths,
+  );
   const headAfter = safeEvidenceText(
     (await requireGit(workspace.rootPath, ["rev-parse", "--verify", "HEAD"], "Git HEAD recheck")).toString("utf8"),
     64,
@@ -448,6 +568,7 @@ async function captureGitSnapshot(workspace: ProjectWorkspace): Promise<RenderSo
     truncated: false,
     worktreeFingerprint,
     fileCount: paths.length,
+    requiredPathEvidence,
   };
 }
 
@@ -487,23 +608,35 @@ async function unversionedSourcePaths(rootPath: string): Promise<string[]> {
   return paths;
 }
 
-async function captureUnversionedSnapshot(workspace: ProjectWorkspace): Promise<RenderSourceRevision> {
-  const paths = await unversionedSourcePaths(workspace.rootPath);
+async function captureUnversionedSnapshot(
+  workspace: ProjectWorkspace,
+  requiredPaths: readonly string[],
+): Promise<RenderSourceRevision> {
+  const paths = [...new Set([
+    ...await unversionedSourcePaths(workspace.rootPath),
+    ...requiredPaths,
+  ])];
   return {
     kind: "UNVERSIONED",
     available: true,
     truncated: false,
     worktreeFingerprint: await fingerprintWorktree(workspace.rootPath, paths),
     fileCount: paths.length,
+    requiredPathEvidence: await captureRequiredPathEvidence(
+      workspace.rootPath,
+      requiredPaths,
+    ),
   };
 }
 
 export async function captureWorkspaceSourceRevision(
   workspace: ProjectWorkspace,
+  requiredPathsInput: readonly string[] = [],
 ): Promise<RenderSourceRevision> {
+  const requiredPaths = requiredSourcePaths(workspace.rootPath, requiredPathsInput);
   if (!workspace.hasGit) {
-    const first = await captureUnversionedSnapshot(workspace);
-    const second = await captureUnversionedSnapshot(workspace);
+    const first = await captureUnversionedSnapshot(workspace, requiredPaths);
+    const second = await captureUnversionedSnapshot(workspace, requiredPaths);
     if (JSON.stringify(first) !== JSON.stringify(second)) {
       throw new Error("Unversioned source evidence changed while its coherent snapshot was captured");
     }
@@ -512,8 +645,8 @@ export async function captureWorkspaceSourceRevision(
   if (!workspace.capabilities.canUseGit) {
     throw new Error("Complete Git evidence is not authorized for this declared Git workspace");
   }
-  const first = await captureGitSnapshot(workspace);
-  const second = await captureGitSnapshot(workspace);
+  const first = await captureGitSnapshot(workspace, requiredPaths);
+  const second = await captureGitSnapshot(workspace, requiredPaths);
   if (JSON.stringify(first) !== JSON.stringify(second)) {
     throw new Error("Git source evidence changed while its coherent snapshot was captured");
   }
@@ -591,7 +724,10 @@ export async function captureRender(options: CaptureRenderOptions): Promise<Capt
     }
   };
   const target = captureUrl(options.baseUrl, options.route);
-  const beforeRevision = await stage(captureWorkspaceSourceRevision(options.workspace), "source revision");
+  const beforeRevision = await stage(
+    captureWorkspaceSourceRevision(options.workspace, options.requiredSourcePaths),
+    "source revision",
+  );
   const browserPromise = (options.browserLauncher ?? defaultBrowserLauncher).launch();
   const browser = await stage(browserPromise, "browser launch", async (lateBrowser) => {
     await cleanup(lateBrowser.close(), "late browser").catch(() => undefined);
@@ -633,7 +769,10 @@ export async function captureRender(options: CaptureRenderOptions): Promise<Capt
   if (cleanupError !== undefined) throw cleanupError;
   if (captureError !== undefined) throw captureError;
   if (screenshot === undefined) throw new Error("Render capture did not produce screenshot bytes");
-  const afterRevision = await stage(captureWorkspaceSourceRevision(options.workspace), "source revision recheck");
+  const afterRevision = await stage(
+    captureWorkspaceSourceRevision(options.workspace, options.requiredSourcePaths),
+    "source revision recheck",
+  );
   if (JSON.stringify(beforeRevision) !== JSON.stringify(afterRevision)) {
     throw new Error("Project source changed during capture; refusing stale render evidence");
   }

@@ -28,11 +28,11 @@ export async function POST(
   const { projectId } = await context.params;
   try {
     const project = await resolveProjectRequest(projectId);
-    const { references, session } = await stopMangekyoLoop(
+    const { references, session, stopRequest } = await stopMangekyoLoop(
       project,
       (body as { sessionId: string }).sessionId,
     );
-    return Response.json(mangekyoDataView(references, session));
+    return Response.json(mangekyoDataView(references, session, stopRequest));
   } catch {
     return Response.json(
       { error: "The visual loop could not be stopped from exact durable evidence." },

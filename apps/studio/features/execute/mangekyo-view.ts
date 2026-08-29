@@ -1,4 +1,9 @@
-import type { MangekyoLoopSession, Reference, RenderArtifact } from "@design-sharingan/core";
+import type {
+  MangekyoLoopSession,
+  MangekyoStopRequest,
+  Reference,
+  RenderArtifact,
+} from "@design-sharingan/core";
 import type {
   MangekyoDataView,
   MangekyoRenderView,
@@ -32,16 +37,28 @@ function activity(session: MangekyoLoopSession): string {
   }
 }
 
-function sessionView(session: MangekyoLoopSession): MangekyoSessionView {
+function sessionView(
+  session: MangekyoLoopSession,
+  stopRequest?: MangekyoStopRequest,
+): MangekyoSessionView {
   const latest = session.rounds.at(-1)?.round.afterRender ?? session.initialRender;
+  const terminal = ["COMPLETE", "BLOCKED", "FAILED"].includes(session.status);
+  const stopRequested = stopRequest !== undefined && !terminal;
   return {
     id: session.id,
-    status: session.status,
-    currentRound: session.currentGate?.roundNumber ?? Math.min(session.rounds.length + 1, session.maxRounds),
+    status: stopRequested ? "STOP_REQUESTED" : session.status,
+    durableStatus: session.status,
+    stopRequested,
+    currentRound: session.currentGate?.roundNumber ?? Math.max(
+      1,
+      Math.min(session.rounds.length + (terminal ? 0 : 1), session.maxRounds),
+    ),
     maxRounds: session.maxRounds,
     route: session.renderTarget.route,
     viewport: session.renderTarget.viewport.name,
-    activity: activity(session),
+    activity: stopRequested
+      ? "Stop requested; waiting for the next durable phase boundary"
+      : activity(session),
     ...(session.initialRender === undefined ? {} : { initialRender: renderView(session.initialRender) }),
     ...(latest === undefined ? {} : { currentRender: renderView(latest) }),
     rounds: session.rounds.map(({ round }) => ({
@@ -89,9 +106,10 @@ function sessionView(session: MangekyoLoopSession): MangekyoSessionView {
 export function mangekyoDataView(
   references: readonly Reference[],
   session?: MangekyoLoopSession,
+  stopRequest?: MangekyoStopRequest,
 ): MangekyoDataView {
   return {
     references: references.map(({ id, title }) => ({ id, title })),
-    ...(session === undefined ? {} : { session: sessionView(session) }),
+    ...(session === undefined ? {} : { session: sessionView(session, stopRequest) }),
   };
 }

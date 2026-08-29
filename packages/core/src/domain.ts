@@ -248,6 +248,19 @@ export interface GitStatusEntry {
   originalPath?: string;
 }
 
+export type RenderSourcePathEvidence =
+  | {
+      path: string;
+      state: "MISSING";
+    }
+  | {
+      path: string;
+      state: "FILE";
+      mode: number;
+      size: number;
+      contentHash: string;
+    };
+
 export type RenderSourceRevision =
   | {
       kind: "GIT";
@@ -259,6 +272,7 @@ export type RenderSourceRevision =
       truncated: boolean;
       worktreeFingerprint: string;
       fileCount: number;
+      requiredPathEvidence: RenderSourcePathEvidence[];
     }
   | {
       kind: "UNVERSIONED";
@@ -271,6 +285,7 @@ export type RenderSourceRevision =
       truncated: false;
       worktreeFingerprint: string;
       fileCount: number;
+      requiredPathEvidence: RenderSourcePathEvidence[];
     };
 
 export interface VisualRound {

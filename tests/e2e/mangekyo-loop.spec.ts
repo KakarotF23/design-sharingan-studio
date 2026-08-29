@@ -91,6 +91,7 @@ test.afterAll(async () => {
 test("allows a style round then enters a durable HUMAN_GATE before a navigation mutation", async ({
   page,
 }) => {
+  test.setTimeout(60_000);
   await page.goto("/projects?source=local");
   await page.getByLabel("Project folder path").fill(projectPath);
   await page.getByRole("button", { name: "Scan project" }).click();
@@ -133,7 +134,52 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
   await expect(
     page.getByRole("complementary", { name: "Workspace context" }).getByText("Mangekyō", { exact: true }),
   ).toBeVisible();
+  const initialStartResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith("/mangekyo/start"),
+  );
   await page.getByRole("button", { name: "Start Mangekyō loop" }).click();
+  expect((await (await initialStartResponse).json() as {
+    session?: { status?: string };
+  }).session?.status).toBe("IDLE");
+  await expect(page.getByRole("button", { name: "Stop visual loop" })).toBeVisible();
+  await page.getByRole("button", { name: "Stop visual loop" }).click();
+  await expect(
+    page.getByLabel("Current visual round").getByText("BLOCKED", { exact: true }),
+  ).toBeVisible({ timeout: 20_000 });
+  await page.reload();
+  await page.getByRole("button", { name: "Mangekyō" }).click();
+  await expect(
+    page.getByLabel("Current visual round").getByText("BLOCKED", { exact: true }),
+  ).toBeVisible();
+  expect(await readFile(join(projectPath, "styles.css"), "utf8")).toBe(stylesBeforeLoop);
+  const stoppedBeforeMutation = (
+    await Promise.all(
+      (await readdir(join(projectPath, ".design-sharingan", "sessions")))
+        .filter((file) => file.endsWith(".json"))
+        .map(async (file) => JSON.parse(
+          await readFile(join(projectPath, ".design-sharingan", "sessions", file), "utf8"),
+        ) as Record<string, unknown>),
+    )
+  ).find((record) => record.type === "MANGEKYO_LOOP" && record.status === "BLOCKED");
+  expect(stoppedBeforeMutation).toMatchObject({
+    status: "BLOCKED",
+    rounds: [],
+    stopRequest: { requestedBy: "local-user" },
+  });
+  expect(stoppedBeforeMutation).not.toHaveProperty("finalRender");
+
+  const secondStart = await page.evaluate(async ({ sourceSessionId }) => {
+    const response = await fetch(`${location.pathname}/mangekyo/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ safeSessionId: sourceSessionId }),
+    });
+    return { status: response.status, payload: await response.json() as unknown };
+  }, { sourceSessionId: (stoppedBeforeMutation as { sourceExecutionSessionId: string }).sourceExecutionSessionId });
+  expect(secondStart.status).toBe(200);
+  expect((secondStart.payload as { session?: { status?: string } }).session?.status).toBe("IDLE");
+  await page.reload();
+  await page.getByRole("button", { name: "Mangekyō" }).click();
 
   await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible({
     timeout: 20_000,
@@ -170,7 +216,7 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
           ) as Record<string, unknown>,
         ),
     )
-  ).find((record) => record.type === "MANGEKYO_LOOP");
+  ).find((record) => record.type === "MANGEKYO_LOOP" && record.status === "HUMAN_GATE");
   expect(loopRecord).toMatchObject({
     status: "HUMAN_GATE",
     rounds: [{
@@ -243,7 +289,7 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
     session?: { id?: string; status?: string };
   };
   expect(acceptedStart.session?.id).not.toBe((loopRecord as { id: string }).id);
-  expect(acceptedStart.session?.status).toBe("HUMAN_GATE");
+  expect(acceptedStart.session?.status).toBe("IDLE");
   const retainedLoops = (
     await Promise.all(
       (await readdir(join(projectPath, ".design-sharingan", "sessions")))
@@ -253,7 +299,7 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
         ) as { type?: string }),
     )
   ).filter(({ type }) => type === "MANGEKYO_LOOP");
-  expect(retainedLoops).toHaveLength(2);
+  expect(retainedLoops).toHaveLength(3);
 
   await page.reload();
   await page.getByRole("button", { name: "Mangekyō" }).click();

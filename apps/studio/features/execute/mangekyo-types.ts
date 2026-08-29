@@ -51,7 +51,9 @@ export interface MangekyoGateView {
 
 export interface MangekyoSessionView {
   id: string;
-  status: MangekyoStatus;
+  status: MangekyoStatus | "STOP_REQUESTED";
+  durableStatus: MangekyoStatus;
+  stopRequested: boolean;
   currentRound: number;
   maxRounds: number;
   route: string;

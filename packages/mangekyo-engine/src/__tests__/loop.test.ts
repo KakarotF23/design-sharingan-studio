@@ -39,6 +39,7 @@ function artifact(
       truncated: false,
       worktreeFingerprint: "a".repeat(64),
       fileCount: 2,
+      requiredPathEvidence: [],
     },
     ...overrides,
   };
@@ -195,6 +196,13 @@ function harness(
           truncated: false,
           worktreeFingerprint: String(session.rounds.length + 1).repeat(64),
           fileCount: 2,
+          requiredPathEvidence: pending.filesToModify.map((path) => ({
+            path,
+            state: "FILE" as const,
+            mode: 0o644,
+            size: 9,
+            contentHash: "e".repeat(64),
+          })),
         },
       };
     },
@@ -222,6 +230,13 @@ function harness(
           truncated: false,
           worktreeFingerprint: String(roundNumber).repeat(64),
           fileCount: 2,
+          requiredPathEvidence: mutation.filesChanged.map((path) => ({
+            path,
+            state: "FILE" as const,
+            mode: 0o644,
+            size: 9,
+            contentHash: "e".repeat(64),
+          })),
         },
         route: session.renderTarget.route,
         viewport: session.renderTarget.viewport.name,
@@ -310,6 +325,13 @@ describe("Mangekyo loop", () => {
           truncated: false,
           worktreeFingerprint: "b".repeat(64),
           fileCount: 2,
+          requiredPathEvidence: [{
+            path: "server.mjs",
+            state: "FILE" as const,
+            mode: 0o644,
+            size: 9,
+            contentHash: "e".repeat(64),
+          }],
         },
       }),
       mutationCompletedAt: "2026-08-27T01:00:04.000Z",
@@ -324,6 +346,13 @@ describe("Mangekyo loop", () => {
         truncated: false,
         worktreeFingerprint: "b".repeat(64),
         fileCount: 2,
+        requiredPathEvidence: [{
+          path: "server.mjs",
+          state: "FILE" as const,
+          mode: 0o644,
+          size: 9,
+          contentHash: "e".repeat(64),
+        }],
       },
       target: session.renderTarget,
     };
@@ -355,6 +384,13 @@ describe("Mangekyo loop", () => {
       truncated: false,
       worktreeFingerprint: "b".repeat(64),
       fileCount: 2,
+      requiredPathEvidence: [{
+        path: "server.mjs",
+        state: "FILE" as const,
+        mode: 0o644,
+        size: 9,
+        contentHash: "e".repeat(64),
+      }],
     };
 
     expect(isFreshFinalRender({
@@ -381,6 +417,13 @@ describe("Mangekyo loop", () => {
       truncated: false as const,
       worktreeFingerprint: "d".repeat(64),
       fileCount: 2,
+      requiredPathEvidence: [{
+        path: "server.mjs",
+        state: "FILE" as const,
+        mode: 0o644,
+        size: 9,
+        contentHash: "e".repeat(64),
+      }],
     };
 
     expect(isFreshFinalRender({
@@ -394,6 +437,30 @@ describe("Mangekyo loop", () => {
       changedPaths: ["server.mjs"],
       target: session.renderTarget,
     })).toBe(true);
+  });
+
+  it("rejects an unversioned final render that does not authenticate every changed path", () => {
+    const session = sessionFixture();
+    const uncoveredRevision = {
+      kind: "UNVERSIONED" as const,
+      available: true as const,
+      truncated: false as const,
+      worktreeFingerprint: "d".repeat(64),
+      fileCount: 0,
+      requiredPathEvidence: [],
+    };
+
+    expect(isFreshFinalRender({
+      artifact: artifact({
+        id: "render-uncovered-local",
+        capturedAt: "2026-08-27T01:00:05.000Z",
+        sourceRevision: uncoveredRevision,
+      }),
+      mutationCompletedAt: "2026-08-27T01:00:04.000Z",
+      mutationSourceRevision: uncoveredRevision,
+      changedPaths: ["dist/styles.css"],
+      target: session.renderTarget,
+    })).toBe(false);
   });
 
   it("fails closed when the reloaded policy checkpoint is missing or tampered", async () => {
@@ -544,6 +611,39 @@ describe("Mangekyo loop", () => {
     expect(reloaded).toEqual(stopped);
   });
 
+  it.each([
+    "IDLE",
+    "PREPARING",
+    "POLICY_CHECK",
+    "EDITING",
+    "RUNNING",
+    "CAPTURING",
+    "COMPARING",
+    "DECIDING",
+    "FIXING",
+    "HUMAN_GATE",
+  ] as const)("honors the same durable Stop at the %s phase boundary", async (status) => {
+    const { dependencies, trace, executeCalls, saved } = harness([], []);
+    dependencies.loadStopRequest = async () => ({
+      id: `stop-${status.toLowerCase()}`,
+      loopSessionId: "mangekyo-1",
+      sessionVersion: "2026-08-27T01:00:00.000Z",
+      requestedAt: "2026-08-27T01:00:01.000Z",
+      requestedBy: "local-user",
+    });
+    const checkpoint = sessionFixture();
+    checkpoint.status = status;
+
+    const stopped = await runMangekyoLoop(checkpoint, dependencies);
+
+    expect(stopped.status).toBe("BLOCKED");
+    expect(stopped.finalRender).toBeUndefined();
+    expect(stopped.rounds).toEqual(checkpoint.rounds);
+    expect(saved()).toEqual(stopped);
+    expect(trace.some((entry) => entry.startsWith("propose:") || entry.startsWith("execute:"))).toBe(false);
+    expect(executeCalls).toHaveLength(0);
+  });
+
   it("Reject blocks the pending gate without executing it", async () => {
     const { dependencies, executeCalls } = harness([], []);
     const persist = dependencies.persist;
@@ -667,6 +767,64 @@ describe("Mangekyo loop", () => {
     ).toEqual(expect.objectContaining({ message: expect.stringMatching(/already decided/i) }));
     expect(saved()?.gateDecisions).toHaveLength(1);
     expect(executeCalls.length).toBeLessThanOrEqual(1);
+  });
+
+  it("releases a claimed gate action only when its decision checkpoint fails before mutation", async () => {
+    const { dependencies, executeCalls } = harness([], [[]]);
+    const gated = sessionFixture();
+    gated.status = "HUMAN_GATE";
+    gated.updatedAt = "2026-08-27T01:00:01.000Z";
+    const pending = proposedChange(1, {
+      kind: "NAVIGATION_CHANGE",
+      files: ["server.mjs"],
+    });
+    gated.currentGate = {
+      id: "gate-1",
+      roundNumber: 1,
+      requestedChange: pending.change,
+      proposal: pending.proposal,
+      proposalThreadId: pending.proposalThreadId,
+      policyEvaluationId: "policy-navigation",
+      requestedAt: gated.updatedAt,
+      reasons: ["Navigation changes are disabled."],
+      affectedScope: pending.affectedScope,
+      impact: pending.impact,
+    };
+    gated.gates = [structuredClone(gated.currentGate)];
+    gated.policyEvaluations = [{
+      id: "policy-navigation",
+      roundNumber: 1,
+      proposalId: pending.proposal.id,
+      change: pending.change,
+      policy: gated.policy,
+      evaluation: { decision: "HUMAN_GATE", reasons: ["Navigation changes are disabled."] },
+      evaluatedAt: gated.updatedAt,
+    }];
+    const releaseClaims: unknown[] = [];
+    Object.assign(dependencies, {
+      releaseGateDecisionClaim: async (claim: unknown) => {
+        releaseClaims.push(structuredClone(claim));
+      },
+    });
+    dependencies.persist = async (checkpoint) => {
+      if (checkpoint.gateDecisions.length > 0) {
+        throw new Error("persisted decision checkpoint failed validation");
+      }
+    };
+
+    await expect(resolveHumanGate(
+      gated,
+      { decision: "APPROVE_ONCE", decidedBy: "local-user" },
+      dependencies,
+    )).rejects.toThrow(/failed validation/i);
+
+    expect(executeCalls).toHaveLength(0);
+    expect(releaseClaims).toEqual([expect.objectContaining({
+      loopSessionId: gated.id,
+      sessionVersion: gated.updatedAt,
+      gateId: "gate-1",
+      decision: "APPROVE_ONCE",
+    })]);
   });
 
   it("Approve Once authorizes only the exact pending change and records that one-use decision", async () => {

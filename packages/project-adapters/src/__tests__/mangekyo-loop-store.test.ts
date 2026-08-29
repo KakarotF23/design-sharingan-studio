@@ -19,6 +19,7 @@ import {
   saveMangekyoLoopSession,
   requestMangekyoStop,
   releaseMangekyoActiveLoop,
+  releaseMangekyoGateDecisionClaim,
 } from "../mangekyo-loop-store";
 import { ensureDesignWorkspace, saveProjectMetadata } from "../workspace-store";
 
@@ -65,6 +66,7 @@ function renderArtifact(imagePath: string): RenderArtifact {
       truncated: false,
       worktreeFingerprint: "b".repeat(64),
       fileCount: 2,
+      requiredPathEvidence: [],
     },
   };
 }
@@ -173,6 +175,13 @@ function completeSessionFixture(rootPath: string): MangekyoLoopSession {
     truncated: false,
     worktreeFingerprint: "c".repeat(64),
     fileCount: 2,
+    requiredPathEvidence: [{
+      path: "server.mjs",
+      state: "FILE" as const,
+      mode: 0o644,
+      size: 9,
+      contentHash: "d".repeat(64),
+    }],
   };
   const afterRender: RenderArtifact = {
     ...renderArtifact(join(rootPath, ".design-sharingan", "renders", "mangekyo-1", "round-1.png")),
@@ -324,6 +333,27 @@ describe("Mangekyo loop persistence", () => {
       );
       session.finalRender = structuredClone(evidence.round.afterRender);
     }],
+    ["non-permission source mode", (session: MangekyoLoopSession) => {
+      const evidence = session.rounds[0] as NonNullable<typeof session.rounds[0]>;
+      const revision = evidence.mutationSourceRevision;
+      if (revision.available && revision.requiredPathEvidence[0]?.state === "FILE") {
+        revision.requiredPathEvidence[0].mode = 0o100644;
+      }
+      (evidence.round.afterRender as RenderArtifact).sourceRevision = structuredClone(revision);
+      session.finalRender = structuredClone(evidence.round.afterRender);
+    }],
+    ["missing changed-path source coverage", (session: MangekyoLoopSession) => {
+      const evidence = session.rounds[0] as NonNullable<typeof session.rounds[0]>;
+      if (evidence.mutationSourceRevision.available) {
+        evidence.mutationSourceRevision.requiredPathEvidence = [];
+      }
+      if (evidence.round.afterRender?.sourceRevision.available) {
+        evidence.round.afterRender.sourceRevision.requiredPathEvidence = [];
+      }
+      if (session.finalRender?.sourceRevision.available) {
+        session.finalRender.sourceRevision.requiredPathEvidence = [];
+      }
+    }],
   ] as const)("rejects persisted COMPLETE evidence with tampered %s", (_label, tamper) => {
     const session = completeSessionFixture("/project");
     tamper(session);
@@ -370,6 +400,92 @@ describe("Mangekyo loop persistence", () => {
     session.stopReason = "Fabricated unresolved authorization.";
 
     expect(isMangekyoLoopSession(session)).toBe(false);
+  });
+
+  it.each(["APPROVE_ONCE", "EXPAND_SCOPE"] as const)(
+    "round-trips the exact pending %s checkpoint before its authorized round exists",
+    async (decisionKind) => {
+      const project = await projectFixture();
+      const session = sessionFixture(project.rootPath);
+      const gate = structuredClone(session.currentGate as NonNullable<typeof session.currentGate>);
+      const decision = {
+        id: `decision-${decisionKind.toLowerCase()}`,
+        gateId: gate.id,
+        decision: decisionKind,
+        decidedBy: "local-user",
+        createdAt: "2026-08-27T01:00:03.000Z",
+        ...(decisionKind === "EXPAND_SCOPE"
+          ? {
+              policyAfter: {
+                ...DEFAULT_AUTONOMY_POLICY,
+                allowNavigationChanges: true,
+                protectedPaths: [...DEFAULT_AUTONOMY_POLICY.protectedPaths],
+              },
+            }
+          : {}),
+      } as const;
+      session.status = "EDITING";
+      session.updatedAt = decision.createdAt;
+      session.currentGate = undefined;
+      session.gateDecisions = [decision];
+      session.policy = decisionKind === "EXPAND_SCOPE"
+        ? structuredClone(decision.policyAfter as NonNullable<typeof decision.policyAfter>)
+        : DEFAULT_AUTONOMY_POLICY;
+      delete session.stopReason;
+      await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+        recursive: true,
+      });
+      await writeFile(
+        session.initialRender?.imagePath as string,
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      );
+
+      await saveMangekyoLoopSession(project.rootPath, session);
+
+      await expect(
+        loadMangekyoLoopSession(project.rootPath, project.id, session.id),
+      ).resolves.toEqual(session);
+    },
+  );
+
+  it("round-trips Stop from an exact pre-mutation EDITING policy checkpoint", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    session.status = "BLOCKED";
+    session.updatedAt = "2026-08-27T01:00:04.000Z";
+    session.currentGate = undefined;
+    session.gates = [];
+    session.policyEvaluations = [{
+      id: "policy-style",
+      roundNumber: 1,
+      proposalId: "proposal-style",
+      change: { kind: "STYLE_CHANGE", files: ["styles.css"] },
+      policy: DEFAULT_AUTONOMY_POLICY,
+      evaluation: { decision: "ALLOW", reasons: [] },
+      evaluatedAt: "2026-08-27T01:00:02.000Z",
+    }];
+    session.stopRequest = {
+      id: "stop-request-editing",
+      loopSessionId: session.id,
+      sessionVersion: "2026-08-27T01:00:03.000Z",
+      requestedAt: "2026-08-27T01:00:04.000Z",
+      requestedBy: "local-user",
+    };
+    session.stopReason = "The user stopped the visual loop before completion.";
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+
+    await saveMangekyoLoopSession(project.rootPath, session);
+
+    await expect(
+      loadMangekyoLoopSession(project.rootPath, project.id, session.id),
+    ).resolves.toEqual(session);
+    expect(session.finalRender).toBeUndefined();
   });
 
   it("accepts a durable user Stop as the sole truthful resolution of a pending Human Gate", () => {
@@ -419,6 +535,77 @@ describe("Mangekyo loop persistence", () => {
     ).toEqual(expect.objectContaining({ message: expect.stringMatching(/already decided/i) }));
   });
 
+  it("releases an action claim only while the exact Human Gate session version is unchanged", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    const claim = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      gateId: session.currentGate?.id as string,
+      decisionId: "decision-approve",
+      decision: "APPROVE_ONCE" as const,
+      decidedAt: "2026-08-27T01:00:03.000Z",
+    };
+    await claimMangekyoGateDecision(project.rootPath, project.id, claim);
+
+    await releaseMangekyoGateDecisionClaim(project.rootPath, project.id, claim);
+
+    await expect(claimMangekyoGateDecision(project.rootPath, project.id, {
+      ...claim,
+      decisionId: "decision-retry",
+    })).resolves.toBeUndefined();
+  });
+
+  it("retains an action claim when the gate decision may already be persisted", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    const claim = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      gateId: session.currentGate?.id as string,
+      decisionId: "decision-approve",
+      decision: "APPROVE_ONCE" as const,
+      decidedAt: "2026-08-27T01:00:03.000Z",
+    };
+    await claimMangekyoGateDecision(project.rootPath, project.id, claim);
+    session.status = "EDITING";
+    session.updatedAt = claim.decidedAt;
+    session.currentGate = undefined;
+    session.gateDecisions = [{
+      id: claim.decisionId,
+      gateId: claim.gateId,
+      decision: claim.decision,
+      decidedBy: "local-user",
+      createdAt: claim.decidedAt,
+    }];
+    delete session.stopReason;
+    await saveMangekyoLoopSession(project.rootPath, session);
+
+    await expect(
+      releaseMangekyoGateDecisionClaim(project.rootPath, project.id, claim),
+    ).rejects.toThrow(/transitioned|ambiguous/i);
+    await expect(claimMangekyoGateDecision(project.rootPath, project.id, {
+      ...claim,
+      decisionId: "decision-retry",
+    })).rejects.toThrow(/already decided/i);
+  });
+
   it("atomically claims one active project loop and releases it only for the exact proven terminal session", async () => {
     const project = await projectFixture();
     const first = {
@@ -451,7 +638,21 @@ describe("Mangekyo loop persistence", () => {
     ).rejects.toThrow(/exact active loop|ambiguous/i);
     await releaseMangekyoActiveLoop(project.rootPath, project.id, {
       ...winner,
-      terminalStatus: "BLOCKED",
+      reservationStatus: "UNPERSISTED",
+    });
+    const terminalClaim = first;
+    await claimMangekyoActiveLoop(project.rootPath, project.id, terminalClaim);
+    const terminal = completeSessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", "mangekyo-1"), {
+      recursive: true,
+    });
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    await writeFile(terminal.initialRender?.imagePath as string, png);
+    await writeFile(terminal.finalRender?.imagePath as string, png);
+    await saveMangekyoLoopSession(project.rootPath, terminal);
+    await releaseMangekyoActiveLoop(project.rootPath, project.id, {
+      ...terminalClaim,
+      terminalStatus: "COMPLETE",
     });
     await expect(
       loadMangekyoActiveLoopClaim(project.rootPath, project.id),
@@ -465,6 +666,54 @@ describe("Mangekyo loop persistence", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("releases an exact unpersisted start reservation but retains any ambiguous partial session", async () => {
+    const project = await projectFixture();
+    const claim = {
+      loopSessionId: "mangekyo-1",
+      sourceExecutionSessionId: "safe-session-1",
+      claimedAt: "2026-08-27T01:00:00.000Z",
+    };
+    await claimMangekyoActiveLoop(project.rootPath, project.id, claim);
+    await expect(releaseMangekyoActiveLoop(project.rootPath, project.id, {
+      ...claim,
+      reservationStatus: "UNPERSISTED",
+    } as Parameters<typeof releaseMangekyoActiveLoop>[2])).resolves.toBeUndefined();
+
+    await claimMangekyoActiveLoop(project.rootPath, project.id, claim);
+    const partial = sessionFixture(project.rootPath);
+    partial.id = claim.loopSessionId;
+    partial.sourceExecutionSessionId = claim.sourceExecutionSessionId;
+    partial.createdAt = claim.claimedAt;
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", "mangekyo-1"), {
+      recursive: true,
+    });
+    await writeFile(
+      partial.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, partial);
+    await expect(releaseMangekyoActiveLoop(project.rootPath, project.id, {
+      ...claim,
+      reservationStatus: "UNPERSISTED",
+    } as Parameters<typeof releaseMangekyoActiveLoop>[2])).rejects.toThrow(/persisted|ambiguous/i);
+    await expect(loadMangekyoActiveLoopClaim(project.rootPath, project.id)).resolves.toEqual(claim);
+  });
+
+  it("refuses terminal active-loop release without the exact durable terminal session", async () => {
+    const project = await projectFixture();
+    const claim = {
+      loopSessionId: "mangekyo-1",
+      sourceExecutionSessionId: "safe-session-1",
+      claimedAt: "2026-08-27T01:00:00.000Z",
+    };
+    await claimMangekyoActiveLoop(project.rootPath, project.id, claim);
+    await expect(releaseMangekyoActiveLoop(project.rootPath, project.id, {
+      ...claim,
+      terminalStatus: "BLOCKED",
+    })).rejects.toThrow(/terminal session|ambiguous/i);
+    await expect(loadMangekyoActiveLoopClaim(project.rootPath, project.id)).resolves.toEqual(claim);
+  });
+
   it("persists and reloads one durable Stop request for an exact active session version", async () => {
     const project = await projectFixture();
     const request = {
@@ -475,14 +724,16 @@ describe("Mangekyo loop persistence", () => {
       requestedBy: "local-user",
     };
 
-    await requestMangekyoStop(project.rootPath, project.id, request);
+    await expect(
+      requestMangekyoStop(project.rootPath, project.id, request),
+    ).resolves.toEqual(request);
 
     await expect(
       loadMangekyoStopRequest(project.rootPath, project.id, request.loopSessionId),
     ).resolves.toEqual(request);
     await expect(
       requestMangekyoStop(project.rootPath, project.id, { ...request, id: "stop-request-replay" }),
-    ).rejects.toThrow(/already has an action|already stopped/i);
+    ).resolves.toEqual(request);
   });
 
   it("serializes a Stop request against a Human Gate decision for the same session version", async () => {

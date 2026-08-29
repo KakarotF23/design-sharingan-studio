@@ -34,6 +34,8 @@ import type {
   MangekyoHumanGate,
   MangekyoHumanGateDecision,
   MangekyoPolicyEvaluationEvidence,
+  RenderSourcePathEvidence,
+  RenderSourceRevision,
   SafeMutationFailureEvidence,
   SafeMutationTargetDisposition,
 } from "@design-sharingan/core";
@@ -85,6 +87,7 @@ export interface MutationResult {
   threadId: string;
   filesChanged: string[];
   git: GitMutationEvidence;
+  sourceRevision?: RenderSourceRevision;
 }
 
 interface TargetRecord {
@@ -118,6 +121,10 @@ export interface MutationExecutorOptions {
   proposalThreadId: string;
   agent: MutationAgent;
   mutationDriver?: MutationDriver;
+  captureSourceRevision?(input: {
+    workspaceRoot: string;
+    requiredPaths: string[];
+  }): Promise<RenderSourceRevision>;
 }
 
 export interface AutonomousMutationAuthorization {
@@ -142,6 +149,7 @@ export interface ExecutePolicyAuthorizedMutationInput {
   change: AutonomyChange;
   agent: MutationAgent;
   mutationDriver?: MutationDriver;
+  captureSourceRevision?: MutationExecutorOptions["captureSourceRevision"];
 }
 
 export interface ExecuteApproveOnceMutationInput {
@@ -164,6 +172,7 @@ export interface ExecuteApproveOnceMutationInput {
   }): Promise<void>;
   agent: MutationAgent;
   mutationDriver?: MutationDriver;
+  captureSourceRevision?: MutationExecutorOptions["captureSourceRevision"];
 }
 
 export interface PolicyAuthorizationStore {
@@ -885,6 +894,22 @@ function expectedAppliedTarget(
   };
 }
 
+function expectedSourcePathEvidence(deltas: readonly DeltaRecord[]): RenderSourcePathEvidence[] {
+  return deltas.map((delta) => {
+    if (delta.operation === "delete") {
+      return { path: delta.relativePath, state: "MISSING" as const };
+    }
+    const contents = delta.nextContents as Uint8Array;
+    return {
+      path: delta.relativePath,
+      state: "FILE" as const,
+      mode: delta.operation === "modify" ? delta.originalMode as number : 0o644,
+      size: contents.byteLength,
+      contentHash: createHash("sha256").update(contents).digest("hex"),
+    };
+  });
+}
+
 async function targetMatchesApplied(
   delta: AppliedDeltaRecord,
 ): Promise<boolean> {
@@ -1491,12 +1516,31 @@ export class MutationExecutor {
         this.options.mutationDriver ?? defaultMutationDriver,
       );
       targetMutationApplied = true;
+      let sourceRevision: RenderSourceRevision | undefined;
+      if (this.options.captureSourceRevision !== undefined) {
+        await validateAppliedDelta(deltas);
+        sourceRevision = await this.options.captureSourceRevision({
+          workspaceRoot: rootPath,
+          requiredPaths: deltas.map(({ relativePath }) => relativePath),
+        });
+        await validateAppliedDelta(deltas);
+        if (
+          sourceRevision.available !== true ||
+          sourceRevision.truncated ||
+          !/^[0-9a-f]{64}$/.test(sourceRevision.worktreeFingerprint) ||
+          stableJson(sourceRevision.requiredPathEvidence) !==
+            stableJson(expectedSourcePathEvidence(deltas))
+        ) {
+          throw new Error("Post-mutation source evidence does not match the exact applied bytes and modes");
+        }
+      }
       const git = await captureGitAfter(rootPath, gitBefore, deltas);
       return {
         proposalId: proposal.id,
         threadId: result.threadId,
         filesChanged: deltas.map((delta) => delta.relativePath),
         git,
+        ...(sourceRevision === undefined ? {} : { sourceRevision }),
       };
     } catch (error) {
       if (error instanceof SafeMutationExecutionError) throw error;
@@ -1585,6 +1629,9 @@ export async function executePolicyAuthorizedMutation(
     ...(input.mutationDriver === undefined
       ? {}
       : { mutationDriver: input.mutationDriver }),
+    ...(input.captureSourceRevision === undefined
+      ? {}
+      : { captureSourceRevision: input.captureSourceRevision }),
   }).applyAutonomous({
     proposal: input.proposal,
     authorization: persisted as AutonomousMutationAuthorization,
@@ -1609,5 +1656,8 @@ export async function executeApproveOnceMutation(
     proposalThreadId: input.proposalThreadId,
     agent: input.agent,
     ...(input.mutationDriver === undefined ? {} : { mutationDriver: input.mutationDriver }),
+    ...(input.captureSourceRevision === undefined
+      ? {}
+      : { captureSourceRevision: input.captureSourceRevision }),
   }).applyApproveOnce(input);
 }

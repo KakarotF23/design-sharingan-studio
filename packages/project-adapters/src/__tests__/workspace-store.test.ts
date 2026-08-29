@@ -1574,6 +1574,7 @@ it("validates complete render evidence at the persistence boundary", async () =>
       truncated: false,
       worktreeFingerprint: "b".repeat(64),
       fileCount: 1,
+      requiredPathEvidence: [],
     },
   };
   const png = pngBytes();
@@ -1597,6 +1598,7 @@ it("validates complete render evidence at the persistence boundary", async () =>
       truncated: false,
       worktreeFingerprint: "b".repeat(64),
       fileCount: 1,
+      requiredPathEvidence: [],
     },
   }, png)).rejects.toThrow(/source revision/i);
   await expect(saveRenderArtifact(rootPath, metadata, new Uint8Array([1, 2, 3]))).rejects.toThrow(/PNG/i);
@@ -1613,6 +1615,7 @@ it("validates complete render evidence at the persistence boundary", async () =>
       truncated: false,
       worktreeFingerprint: "b".repeat(64),
       fileCount: 1,
+      requiredPathEvidence: [],
     },
   }, png)).rejects.toThrow(/source revision/i);
 
@@ -1628,6 +1631,7 @@ it("validates complete render evidence at the persistence boundary", async () =>
       truncated: false,
       worktreeFingerprint: "b".repeat(64),
       fileCount: 1,
+      requiredPathEvidence: [],
     },
   }, png)).rejects.toThrow(/source revision/i);
 
@@ -1654,6 +1658,7 @@ it("validates complete render evidence at the persistence boundary", async () =>
         truncated: false,
         worktreeFingerprint: "b".repeat(64),
         fileCount: 1,
+        requiredPathEvidence: [],
       },
     }, png)).rejects.toThrow(/source revision/i);
   }
@@ -1675,6 +1680,7 @@ it("validates complete render evidence at the persistence boundary", async () =>
       truncated: true,
       worktreeFingerprint: "b".repeat(64),
       fileCount: 2,
+      requiredPathEvidence: [],
     },
   }, png)).rejects.toThrow(/source revision/i);
 
@@ -1713,6 +1719,7 @@ it("rejects duplicate or undersized represented Git status evidence", async () =
     {
       kind: "GIT", available: true, head: "a".repeat(40), branch: "main", status: "CLEAN",
       entries: [], truncated: false, worktreeFingerprint: "b".repeat(64), fileCount: 0,
+      requiredPathEvidence: [],
     },
     {
       kind: "GIT", available: true, head: "a".repeat(40), branch: "main", status: "DIRTY",
@@ -1721,6 +1728,7 @@ it("rejects duplicate or undersized represented Git status evidence", async () =
         { index: "?", workingTree: "?", path: "duplicate.txt" },
       ],
       truncated: false, worktreeFingerprint: "b".repeat(64), fileCount: 2,
+      requiredPathEvidence: [],
     },
     {
       kind: "GIT", available: true, head: "a".repeat(40), branch: "main", status: "DIRTY",
@@ -1729,6 +1737,7 @@ it("rejects duplicate or undersized represented Git status evidence", async () =
         { index: "?", workingTree: "?", path: "two.txt" },
       ],
       truncated: false, worktreeFingerprint: "b".repeat(64), fileCount: 1,
+      requiredPathEvidence: [],
     },
   ];
   for (const [index, sourceRevision] of revisions.entries()) {

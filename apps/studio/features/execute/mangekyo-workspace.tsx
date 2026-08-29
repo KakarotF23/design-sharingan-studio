@@ -39,6 +39,27 @@ export function MangekyoWorkspace({
       .finally(() => setLoaded(true));
   }, [load]);
 
+  const session = data.session;
+  const durableWorking = session !== undefined && [
+    "IDLE",
+    "PREPARING",
+    "POLICY_CHECK",
+    "EDITING",
+    "RUNNING",
+    "CAPTURING",
+    "COMPARING",
+    "DECIDING",
+    "FIXING",
+  ].includes(session.durableStatus);
+
+  useEffect(() => {
+    if (!durableWorking && !session?.stopRequested) return;
+    const timer = window.setInterval(() => {
+      void load().catch(() => undefined);
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, [durableWorking, load, session?.stopRequested]);
+
   async function action(path: string, body: Record<string, unknown>) {
     if (busy) return;
     setBusy(true);
@@ -60,10 +81,9 @@ export function MangekyoWorkspace({
     }
   }
 
-  const session = data.session;
   const latestFindings = findings(session);
   return (
-    <div className="execute-workspace mangekyo-workspace" aria-busy={busy}>
+    <div className="execute-workspace mangekyo-workspace" aria-busy={busy || durableWorking}>
       <WorkspaceHeader
         eyebrow={`POLICY-BOUNDED LOOP / ${project.name.toUpperCase()}`}
         title="Mangekyō visual loop"
@@ -100,16 +120,16 @@ export function MangekyoWorkspace({
               <p className="utility-label">CURRENT ROUND</p>
               <strong>{String(Math.max(1, session.currentRound)).padStart(2, "0")}</strong>
               <span>/ {String(session.maxRounds).padStart(2, "0")}</span>
-              {session.status !== "COMPLETE" &&
-              session.status !== "BLOCKED" &&
-              session.status !== "FAILED" ? (
+              {session.durableStatus !== "COMPLETE" &&
+              session.durableStatus !== "BLOCKED" &&
+              session.durableStatus !== "FAILED" ? (
                 <button
                   className="mangekyo-stop"
                   type="button"
-                  disabled={busy}
+                  disabled={busy || session.stopRequested}
                   onClick={() => void action("stop", { sessionId: session.id })}
                 >
-                  Stop visual loop
+                  {session.stopRequested ? "Stop requested" : "Stop visual loop"}
                 </button>
               ) : null}
             </div>
@@ -143,7 +163,7 @@ export function MangekyoWorkspace({
           {session.currentGate ? (
             <AutonomyBoundaryCard
               gate={session.currentGate}
-              busy={busy}
+              busy={busy || session.stopRequested}
               onDecision={(decision) => void action("decision", { sessionId: session.id, decision })}
             />
           ) : null}

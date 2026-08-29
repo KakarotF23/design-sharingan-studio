@@ -9,6 +9,7 @@ import {
 } from "@design-sharingan/approval-engine";
 import type {
   MangekyoLoopSession,
+  MangekyoStopRequest,
   Project,
   Reference,
 } from "@design-sharingan/core";
@@ -34,6 +35,7 @@ import {
   loadMangekyoStopRequest,
   loadSafeExecutionState,
   releaseMangekyoActiveLoop,
+  releaseMangekyoGateDecisionClaim,
   requestMangekyoStop,
   saveMangekyoAuthorization,
   saveMangekyoLoopSession,
@@ -58,6 +60,9 @@ const RENDER_TARGET = {
   route: "/",
   viewport: { name: "desktop", width: 1280, height: 720 },
 } as const;
+const START_STOP_WINDOW_MS = 1_000;
+
+const mangekyoWorkers = new Map<string, Promise<void>>();
 
 function truncateUtf8(value: string, maximumBytes: number): string {
   let result = "";
@@ -167,12 +172,20 @@ async function releaseTerminalClaim(
 export async function loadMangekyoContext(project: Project): Promise<{
   references: Reference[];
   session?: MangekyoLoopSession;
+  stopRequest?: MangekyoStopRequest;
 }> {
   const [references, session] = await Promise.all([
     listReferences(project.rootPath, project.id),
     currentLoop(project),
   ]);
-  return { references, ...(session === undefined ? {} : { session }) };
+  const stopRequest = session === undefined || isTerminalStatus(session.status)
+    ? session?.stopRequest
+    : await loadMangekyoStopRequest(project.rootPath, project.id, session.id);
+  return {
+    references,
+    ...(session === undefined ? {} : { session }),
+    ...(stopRequest === undefined ? {} : { stopRequest }),
+  };
 }
 
 async function captureBaseline(
@@ -225,6 +238,11 @@ async function loopDependencies(input: {
     createId: randomUUID,
     now: () => new Date(),
     claimGateDecision: (claim) => claimMangekyoGateDecision(
+      input.project.rootPath,
+      input.project.id,
+      claim,
+    ),
+    releaseGateDecisionClaim: (claim) => releaseMangekyoGateDecisionClaim(
       input.project.rootPath,
       input.project.id,
       claim,
@@ -318,15 +336,19 @@ async function loopDependencies(input: {
             claim,
           ),
           agent: createMangekyoMutationAgent(),
+          captureSourceRevision: ({ requiredPaths }) =>
+            captureWorkspaceSourceRevision(input.workspace, requiredPaths),
         });
         const completedAt = new Date().toISOString();
-        const sourceRevision = await captureWorkspaceSourceRevision(input.workspace);
+        if (mutation.sourceRevision === undefined) {
+          throw new Error("The mutation transaction did not establish exact source evidence");
+        }
         return {
           proposalId: mutation.proposalId,
           threadId: mutation.threadId,
           filesChanged: [...mutation.filesChanged],
           completedAt,
-          sourceRevision,
+          sourceRevision: mutation.sourceRevision,
         };
       }
       const result = await executePolicyAuthorizedMutation(
@@ -338,6 +360,8 @@ async function loopDependencies(input: {
           policy: session.policy,
           change,
           agent: createMangekyoMutationAgent(),
+          captureSourceRevision: ({ requiredPaths }) =>
+            captureWorkspaceSourceRevision(input.workspace, requiredPaths),
         },
         {
           createId: randomUUID,
@@ -358,13 +382,15 @@ async function loopDependencies(input: {
         throw new Error("Persisted loop policy no longer authorizes the pending mutation");
       }
       const completedAt = new Date().toISOString();
-      const sourceRevision = await captureWorkspaceSourceRevision(input.workspace);
+      if (result.mutation.sourceRevision === undefined) {
+        throw new Error("The mutation transaction did not establish exact source evidence");
+      }
       return {
         proposalId: result.mutation.proposalId,
         threadId: result.mutation.threadId,
         filesChanged: [...result.mutation.filesChanged],
         completedAt,
-        sourceRevision,
+        sourceRevision: result.mutation.sourceRevision,
       };
     },
     async runProject() {
@@ -378,7 +404,7 @@ async function loopDependencies(input: {
         timeoutMs: 30_000,
       });
     },
-    async capture({ session, roundNumber }) {
+    async capture({ session, roundNumber, mutation }) {
       if (devServer === undefined || baseUrl === undefined) {
         throw new Error("The loop-owned project process is not ready for capture");
       }
@@ -389,6 +415,7 @@ async function loopDependencies(input: {
         viewport: session.renderTarget.viewport,
         sessionId: session.id,
         roundId: `round-${roundNumber}`,
+        requiredSourcePaths: mutation.filesChanged,
       })).artifact;
     },
     async analyze({ session, render }) {
@@ -436,6 +463,83 @@ async function loopDependencies(input: {
   };
 }
 
+async function runPersistedMangekyoLoop(input: {
+  project: Project;
+  workspace: ProjectWorkspace;
+  safe: SafeExecutionEditingSession;
+  references: Reference[];
+  session: MangekyoLoopSession;
+}): Promise<void> {
+  let analysisPath: string | undefined;
+  try {
+    analysisPath = await createAnalysisStagingDirectory(input.project.rootPath);
+    await writeFile(
+      join(analysisPath, "loop-context.json"),
+      `${JSON.stringify({
+        project: {
+          name: input.project.name,
+          routes: input.workspace.routes,
+          components: input.workspace.componentDirectories,
+        },
+        approvedDirection: input.session.approvedDirection,
+        renderTarget: input.session.renderTarget,
+        referenceIds: input.session.referenceIds,
+      }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const dependencies = await loopDependencies({
+      project: input.project,
+      workspace: input.workspace,
+      safe: input.safe,
+      references: input.references,
+      analysisPath,
+    });
+    const completed = await runMangekyoLoop(input.session, dependencies);
+    await releaseTerminalClaim(input.project, completed);
+  } catch (error) {
+    try {
+      const persisted = await loadMangekyoLoopSession(
+        input.project.rootPath,
+        input.project.id,
+        input.session.id,
+      );
+      if (!isTerminalStatus(persisted.status)) {
+        const failed: MangekyoLoopSession = {
+          ...persisted,
+          status: "FAILED",
+          updatedAt: new Date().toISOString(),
+          stopReason: truncateUtf8(
+            `Loop orchestration failed: ${error instanceof Error ? error.message : "unknown failure"}`,
+            1_000,
+          ),
+        };
+        await saveMangekyoLoopSession(input.project.rootPath, failed);
+        await releaseTerminalClaim(input.project, failed);
+      }
+    } catch {
+      // Retain the durable claim when persistence or reconciliation is ambiguous.
+    }
+  } finally {
+    if (analysisPath !== undefined) {
+      await rm(analysisPath, { force: true, recursive: true }).catch(() => undefined);
+    }
+  }
+}
+
+function scheduleMangekyoLoop(input: Parameters<typeof runPersistedMangekyoLoop>[0]): void {
+  const key = `${input.project.id}:${input.session.id}`;
+  if (mangekyoWorkers.has(key)) return;
+  let worker: Promise<void>;
+  worker = new Promise<void>((resolve) => {
+    setTimeout(() => {
+      void runPersistedMangekyoLoop(input).finally(() => resolve());
+    }, START_STOP_WINDOW_MS);
+  }).finally(() => {
+    if (mangekyoWorkers.get(key) === worker) mangekyoWorkers.delete(key);
+  });
+  mangekyoWorkers.set(key, worker);
+}
+
 export async function startMangekyoLoop(
   project: Project,
   safeSessionId: string,
@@ -462,58 +566,58 @@ export async function startMangekyoLoop(
   }
   const sessionId = randomUUID();
   const createdAt = new Date().toISOString();
-  await claimMangekyoActiveLoop(project.rootPath, project.id, {
+  const reservation = {
     loopSessionId: sessionId,
     sourceExecutionSessionId: safe.id,
     claimedAt: createdAt,
-  });
-  const initialRender = await captureBaseline(workspace, sessionId);
-  const session: MangekyoLoopSession = {
-    id: sessionId,
-    projectId: project.id,
-    type: "MANGEKYO_LOOP",
-    status: "IDLE",
-    createdAt,
-    updatedAt: initialRender.capturedAt,
-    sourceExecutionSessionId: safe.id,
-    sourceDesignSessionId: safe.sourceSessionId,
-    approvedApproachId: safe.approvedApproachId,
-    directionApprovalId: safe.approvalId,
-    approvedDirection: approvedDirection(safe),
-    initialPolicy: { ...DEFAULT_AUTONOMY_POLICY, protectedPaths: [...DEFAULT_AUTONOMY_POLICY.protectedPaths] },
-    policy: { ...DEFAULT_AUTONOMY_POLICY, protectedPaths: [...DEFAULT_AUTONOMY_POLICY.protectedPaths] },
-    renderTarget: RENDER_TARGET,
-    referenceIds: references.map(({ id }) => id),
-    maxRounds: 5,
-    importantThreshold: 2,
-    claimedScreens: [RENDER_TARGET.route],
-    inspectedScreens: [],
-    rounds: [],
-    policyEvaluations: [],
-    gates: [],
-    gateDecisions: [],
-    initialRender,
   };
-  await saveMangekyoLoopSession(project.rootPath, session);
-  const analysisPath = await createAnalysisStagingDirectory(project.rootPath);
+  await claimMangekyoActiveLoop(project.rootPath, project.id, reservation);
+  let session: MangekyoLoopSession;
   try {
-    await writeFile(
-      join(analysisPath, "loop-context.json"),
-      `${JSON.stringify({
-        project: { name: project.name, routes: workspace.routes, components: workspace.componentDirectories },
-        approvedDirection: session.approvedDirection,
-        renderTarget: session.renderTarget,
-        referenceIds: session.referenceIds,
-      }, null, 2)}\n`,
-      { mode: 0o600 },
-    );
-    const dependencies = await loopDependencies({ project, workspace, safe, references, analysisPath });
-    const completed = await runMangekyoLoop(session, dependencies);
-    await releaseTerminalClaim(project, completed);
-    return { references: allReferences, session: completed };
-  } finally {
-    await rm(analysisPath, { force: true, recursive: true });
+    const initialRender = await captureBaseline(workspace, sessionId);
+    session = {
+      id: sessionId,
+      projectId: project.id,
+      type: "MANGEKYO_LOOP",
+      status: "IDLE",
+      createdAt,
+      updatedAt: initialRender.capturedAt,
+      sourceExecutionSessionId: safe.id,
+      sourceDesignSessionId: safe.sourceSessionId,
+      approvedApproachId: safe.approvedApproachId,
+      directionApprovalId: safe.approvalId,
+      approvedDirection: approvedDirection(safe),
+      initialPolicy: { ...DEFAULT_AUTONOMY_POLICY, protectedPaths: [...DEFAULT_AUTONOMY_POLICY.protectedPaths] },
+      policy: { ...DEFAULT_AUTONOMY_POLICY, protectedPaths: [...DEFAULT_AUTONOMY_POLICY.protectedPaths] },
+      renderTarget: RENDER_TARGET,
+      referenceIds: references.map(({ id }) => id),
+      maxRounds: 5,
+      importantThreshold: 2,
+      claimedScreens: [RENDER_TARGET.route],
+      inspectedScreens: [],
+      rounds: [],
+      policyEvaluations: [],
+      gates: [],
+      gateDecisions: [],
+      initialRender,
+    };
+    await saveMangekyoLoopSession(project.rootPath, session);
+  } catch (error) {
+    try {
+      await releaseMangekyoActiveLoop(project.rootPath, project.id, {
+        ...reservation,
+        reservationStatus: "UNPERSISTED",
+      });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Mangekyo start reservation could not be safely reconciled",
+      );
+    }
+    throw error;
   }
+  scheduleMangekyoLoop({ project, workspace, safe, references, session });
+  return { references: allReferences, session };
 }
 
 export async function decideMangekyoGate(
@@ -557,9 +661,20 @@ export async function decideMangekyoGate(
 export async function stopMangekyoLoop(
   project: Project,
   sessionId: string,
-): Promise<{ references: Reference[]; session: MangekyoLoopSession }> {
+): Promise<{
+  references: Reference[];
+  session: MangekyoLoopSession;
+  stopRequest: MangekyoStopRequest;
+}> {
   const session = await loadMangekyoLoopSession(project.rootPath, project.id, sessionId);
   if (isTerminalStatus(session.status)) {
+    if (session.status === "BLOCKED" && session.stopRequest !== undefined) {
+      return {
+        references: await listReferences(project.rootPath, project.id),
+        session,
+        stopRequest: session.stopRequest,
+      };
+    }
     throw new Error("Mangekyo loop is already terminal");
   }
   await requireActiveClaim(project, session);
@@ -575,24 +690,14 @@ export async function stopMangekyoLoop(
   ) {
     throw new Error("Mangekyo reference evidence is missing or stale");
   }
-  await requestMangekyoStop(project.rootPath, project.id, {
+  const stopRequest = await requestMangekyoStop(project.rootPath, project.id, {
     id: randomUUID(),
     loopSessionId: session.id,
     sessionVersion: session.updatedAt,
     requestedAt: new Date().toISOString(),
     requestedBy: "local-user",
   });
-  if (session.status !== "HUMAN_GATE") {
-    return { references: allReferences, session };
-  }
   const workspace = await workspaceFor(project);
-  const analysisPath = await createAnalysisStagingDirectory(project.rootPath);
-  try {
-    const dependencies = await loopDependencies({ project, workspace, safe, references, analysisPath });
-    const stopped = await runMangekyoLoop(session, dependencies);
-    await releaseTerminalClaim(project, stopped);
-    return { references: allReferences, session: stopped };
-  } finally {
-    await rm(analysisPath, { force: true, recursive: true });
-  }
+  scheduleMangekyoLoop({ project, workspace, safe, references, session });
+  return { references: allReferences, session, stopRequest };
 }

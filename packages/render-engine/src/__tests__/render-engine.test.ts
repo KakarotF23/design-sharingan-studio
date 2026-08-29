@@ -1,13 +1,14 @@
 import { EventEmitter } from "node:events";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProjectWorkspace } from "@design-sharingan/project-adapters";
 import { describe, expect, it } from "vitest";
 import {
   captureRender,
+  captureWorkspaceSourceRevision,
   defaultProcessRunner,
   startDevServer,
   waitForReadiness,
@@ -642,6 +643,7 @@ it("binds Git renders to a bounded structured HEAD and dirty status snapshot", a
     truncated: false,
     worktreeFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
     fileCount: 3,
+    requiredPathEvidence: [],
   });
 });
 
@@ -853,6 +855,50 @@ it("excludes .design-sharingan runtime artifacts from Git status and source fing
       : "unreachable",
   });
 });
+
+it.each(["dist/styles.css", "build/client.js"])(
+  "authenticates excluded changed path %s in an unversioned source revision",
+  async (changedPath) => {
+    const active = await workspace();
+    await mkdir(join(active.rootPath, changedPath.split("/")[0] as string), { recursive: true });
+    await writeFile(join(active.rootPath, changedPath), "approved\n");
+
+    const revision = await captureWorkspaceSourceRevision(active, [changedPath]);
+
+    expect(revision).toMatchObject({
+      kind: "UNVERSIONED",
+      available: true,
+      requiredPathEvidence: [{
+        path: changedPath,
+        state: "FILE",
+        size: 9,
+        contentHash: "7f8518f7db5e9a55049f49c4ea6d6e8f509695231e60cbd607bcb36c88a75a14",
+      }],
+    });
+  },
+);
+
+it.each(["symlink", "hardlink", "oversized"] as const)(
+  "rejects %s coverage for an excluded required source path",
+  async (kind) => {
+    const active = await workspace();
+    await mkdir(join(active.rootPath, "dist"), { recursive: true });
+    const requiredPath = join(active.rootPath, "dist", "styles.css");
+    if (kind === "symlink") {
+      await writeFile(join(active.rootPath, "source.css"), "approved\n");
+      await symlink(join(active.rootPath, "source.css"), requiredPath);
+    } else if (kind === "hardlink") {
+      await writeFile(join(active.rootPath, "source.css"), "approved\n");
+      await link(join(active.rootPath, "source.css"), requiredPath);
+    } else {
+      await writeFile(requiredPath, Buffer.alloc(16 * 1024 * 1024 + 1, 1));
+    }
+
+    await expect(
+      captureWorkspaceSourceRevision(active, ["dist/styles.css"]),
+    ).rejects.toThrow(/symlink|hard.?link|byte bound|size|oversized/i);
+  },
+);
 
 // Production break caught: parsing a byte-truncated NUL status field can claim a partial filename as truthful source evidence.
 it("fails closed when bounded Git status evidence is truncated", async () => {
