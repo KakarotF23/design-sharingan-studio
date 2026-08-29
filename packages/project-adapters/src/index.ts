@@ -3,6 +3,7 @@ export * from "./git";
 export * from "./github-project-adapter";
 export * from "./local-project-adapter";
 export * from "./mangekyo-loop-store";
+export * from "./mangekyo-worker-owner";
 export * from "./path-policy";
 export * from "./safe-execution-store";
 export * from "./types";

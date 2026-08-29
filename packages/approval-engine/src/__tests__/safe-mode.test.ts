@@ -388,6 +388,119 @@ describe("Safe Mode mutation gate", () => {
 });
 
 describe("Mangekyo policy-authorized mutation gate", () => {
+  it("rechecks worker ownership after a long isolated turn before touching the target", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    const ownershipChecks: string[] = [];
+    let ownerReplaced = false;
+    let persisted: AutonomousMutationAuthorization | undefined;
+
+    await expect(executePolicyAuthorizedMutation(
+      {
+        workspaceRoot,
+        loopSessionId: "mangekyo-session-1",
+        proposal: proposalFixture({
+          sessionId: "mangekyo-session-1",
+          filesToModify: ["src/file.ts"],
+        }),
+        proposalThreadId: "thread-proposal-1",
+        policy: DEFAULT_AUTONOMY_POLICY,
+        change: { kind: "STYLE_CHANGE", files: ["src/file.ts"] },
+        assertWorkerOwnership: async (boundary: "AUTHORIZATION" | "MUTATION_EXECUTION") => {
+          ownershipChecks.push(boundary);
+          if (ownerReplaced) throw new Error("Durable worker owner was replaced");
+        },
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            await writeFile(join(input.workingDirectory, "src/file.ts"), "after\n", "utf8");
+            ownerReplaced = true;
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      },
+      {
+        createId: () => "authorization-owned",
+        now: () => new Date("2026-08-27T01:00:00.000Z"),
+        persistAuthorization: async (authorization) => {
+          persisted = structuredClone(authorization);
+        },
+        loadAuthorization: async () => structuredClone(persisted),
+      },
+    )).rejects.toThrow(/worker owner was replaced/i);
+
+    expect(ownershipChecks).toEqual(["AUTHORIZATION", "MUTATION_EXECUTION"]);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("before\n");
+  });
+
+  it("checks worker ownership before consuming an Approve Once authorization", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    const proposal = proposalFixture({
+      sessionId: "mangekyo-session-1",
+      filesToModify: ["src/file.ts"],
+    });
+    let consumed = false;
+    let agentRuns = 0;
+
+    await expect(executeApproveOnceMutation({
+      workspaceRoot,
+      loopSessionId: "mangekyo-session-1",
+      sessionVersion: "2026-08-27T01:00:01.000Z",
+      proposal,
+      proposalThreadId: "thread-proposal-1",
+      change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+      gate: {
+        id: "gate-1",
+        roundNumber: 1,
+        requestedChange: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        proposal,
+        proposalThreadId: "thread-proposal-1",
+        policyEvaluationId: "policy-navigation",
+        requestedAt: "2026-08-27T01:00:00.000Z",
+        reasons: ["Navigation changes require a Human Gate."],
+        affectedScope: ["/"],
+        impact: "Changes navigation.",
+      },
+      policyEvaluation: {
+        id: "policy-navigation",
+        roundNumber: 1,
+        proposalId: proposal.id,
+        change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        policy: DEFAULT_AUTONOMY_POLICY,
+        evaluation: {
+          decision: "HUMAN_GATE",
+          reasons: ["Navigation changes require a Human Gate."],
+        },
+        evaluatedAt: "2026-08-27T01:00:00.000Z",
+      },
+      decision: {
+        id: "gate-decision-1",
+        gateId: "gate-1",
+        decision: "APPROVE_ONCE",
+        decidedBy: "local-user",
+        createdAt: "2026-08-27T01:00:01.000Z",
+      },
+      now: new Date("2026-08-27T01:00:02.000Z"),
+      assertWorkerOwnership: async () => {
+        throw new Error("Approve Once worker owner is missing");
+      },
+      consumeAuthorization: async () => {
+        consumed = true;
+      },
+      agent: {
+        async run<TStructured>() {
+          agentRuns += 1;
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    })).rejects.toThrow(/worker owner is missing/i);
+    expect(consumed).toBe(false);
+    expect(agentRuns).toBe(0);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("before\n");
+  });
+
   it("reuses the controlled transaction only for the exact persisted Approve Once gate", async () => {
     const workspaceRoot = await temporaryWorkspace();
     await mkdir(join(workspaceRoot, "src"));

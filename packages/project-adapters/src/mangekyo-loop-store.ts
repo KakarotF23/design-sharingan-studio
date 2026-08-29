@@ -1683,6 +1683,50 @@ async function readWorkerLease(path: string): Promise<MangekyoWorkerLease | unde
   }
 }
 
+async function replaceWorkerLease(
+  directory: string,
+  path: string,
+  expected: MangekyoWorkerLease,
+  replacement: MangekyoWorkerLease,
+): Promise<void> {
+  const authenticated = await readWorkerLease(path);
+  if (authenticated === undefined || stableJson(authenticated) !== stableJson(expected)) {
+    throw new Error("The exact durable Mangekyo worker lease was replaced before renewal");
+  }
+  const temporary = assertPathInsideWorkspace(
+    directory,
+    join(directory, `.worker-lease.${randomUUID()}.tmp`),
+  );
+  const serialized = `${JSON.stringify(replacement)}\n`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    await handle.writeFile(serialized, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    const current = await readWorkerLease(path);
+    if (current === undefined || stableJson(current) !== stableJson(expected)) {
+      throw new Error("The exact durable Mangekyo worker lease changed during renewal");
+    }
+    await rename(temporary, path);
+    const directoryHandle = await open(directory, constants.O_RDONLY);
+    try {
+      await directoryHandle.sync();
+    } finally {
+      await directoryHandle.close();
+    }
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function loadMangekyoWorkerLease(
   rootPath: string,
   projectId: string,
@@ -1729,6 +1773,45 @@ export async function claimMangekyoWorkerLease(
   try {
     const existing = await readWorkerLease(path);
     if (existing !== undefined && stableJson(existing) === stableJson(lease)) return;
+    if (
+      existing !== undefined &&
+      existing.loopSessionId === lease.loopSessionId &&
+      existing.workerId === lease.workerId
+    ) {
+      const session = await loadMangekyoLoopSession(
+        rootPath,
+        projectId,
+        lease.loopSessionId,
+      );
+      const preservesDurableVersion =
+        lease.sessionVersion === existing.sessionVersion &&
+        session.updatedAt === existing.sessionVersion;
+      const advancesToDurableVersion =
+        Date.parse(lease.sessionVersion) > Date.parse(existing.sessionVersion) &&
+        session.updatedAt === lease.sessionVersion;
+      if (
+        Date.parse(existing.expiresAt) <= Date.parse(observedAt) ||
+        Date.parse(lease.acquiredAt) <= Date.parse(existing.acquiredAt) ||
+        Date.parse(lease.expiresAt) <= Date.parse(existing.expiresAt) ||
+        (!preservesDurableVersion && !advancesToDurableVersion)
+      ) {
+        throw new Error("The exact durable Mangekyo worker lease cannot be renewed");
+      }
+      const active = await loadMangekyoActiveLoopClaim(rootPath, projectId);
+      if (
+        ["COMPLETE", "BLOCKED", "FAILED"].includes(session.status) ||
+        active === undefined ||
+        active.loopSessionId !== session.id ||
+        active.sourceExecutionSessionId !== session.sourceExecutionSessionId ||
+        active.claimedAt !== session.createdAt
+      ) {
+        throw new Error(
+          "The durable Mangekyo worker lease does not match the exact active session version",
+        );
+      }
+      await replaceWorkerLease(directory, path, existing, lease);
+      return;
+    }
     if (existing !== undefined && Date.parse(existing.expiresAt) > Date.parse(observedAt)) {
       throw new Error("A live durable Mangekyo worker lease already owns this loop");
     }
@@ -1744,13 +1827,16 @@ export async function claimMangekyoWorkerLease(
     ) {
       throw new Error("The durable Mangekyo worker lease does not match the exact active session version");
     }
-    if (existing !== undefined) await removeExactClaimFile(directory, path, existing);
-    await writeExclusiveClaim(
-      directory,
-      "worker-lease.claim",
-      lease,
-      "A durable Mangekyo worker lease already owns this loop",
-    );
+    if (existing === undefined) {
+      await writeExclusiveClaim(
+        directory,
+        "worker-lease.claim",
+        lease,
+        "A durable Mangekyo worker lease already owns this loop",
+      );
+    } else {
+      await replaceWorkerLease(directory, path, existing, lease);
+    }
   } finally {
     await removeExactClaimFile(directory, lockPath, lease);
   }

@@ -125,7 +125,10 @@ export interface MutationExecutorOptions {
     workspaceRoot: string;
     requiredPaths: string[];
   }): Promise<RenderSourceRevision>;
+  assertWorkerOwnership?(): Promise<void>;
 }
+
+export type MangekyoWorkerOwnershipBoundary = "AUTHORIZATION" | "MUTATION_EXECUTION";
 
 export interface AutonomousMutationAuthorization {
   kind: "AUTONOMOUS_POLICY_ALLOW";
@@ -150,6 +153,7 @@ export interface ExecutePolicyAuthorizedMutationInput {
   agent: MutationAgent;
   mutationDriver?: MutationDriver;
   captureSourceRevision?: MutationExecutorOptions["captureSourceRevision"];
+  assertWorkerOwnership?(boundary: MangekyoWorkerOwnershipBoundary): Promise<void>;
 }
 
 export interface ExecuteApproveOnceMutationInput {
@@ -173,6 +177,7 @@ export interface ExecuteApproveOnceMutationInput {
   agent: MutationAgent;
   mutationDriver?: MutationDriver;
   captureSourceRevision?: MutationExecutorOptions["captureSourceRevision"];
+  assertWorkerOwnership?(boundary: MangekyoWorkerOwnershipBoundary): Promise<void>;
 }
 
 export interface PolicyAuthorizationStore {
@@ -1504,6 +1509,7 @@ export class MutationExecutor {
       }
       const mirrorAfter = await snapshotMirror(canonicalMirror);
       const deltas = validateMirrorDelta(targetRecords, mirrorAfter);
+      await this.options.assertWorkerOwnership?.();
       // Reject a stale target only after the isolated mutation turn has
       // completed, immediately before the first active-workspace write.
       for (const record of targetRecords) {
@@ -1618,6 +1624,7 @@ export async function executePolicyAuthorizedMutation(
     expiresAt: new Date(evaluatedAt.getTime() + 5 * 60_000).toISOString(),
   };
   validateAutonomousGate(input.proposal, authorization, evaluatedAt);
+  await input.assertWorkerOwnership?.("AUTHORIZATION");
   await store.persistAuthorization(authorization);
   const persisted = await store.loadAuthorization(authorization.id);
   if (stableJson(persisted) !== stableJson(authorization)) {
@@ -1639,6 +1646,12 @@ export async function executePolicyAuthorizedMutation(
     ...(input.captureSourceRevision === undefined
       ? {}
       : { captureSourceRevision: input.captureSourceRevision }),
+    ...(input.assertWorkerOwnership === undefined
+      ? {}
+      : {
+          assertWorkerOwnership: () =>
+            input.assertWorkerOwnership?.("MUTATION_EXECUTION") ?? Promise.resolve(),
+        }),
   }).applyAutonomous({
     proposal: input.proposal,
     authorization: persisted as AutonomousMutationAuthorization,
@@ -1651,6 +1664,7 @@ export async function executeApproveOnceMutation(
   input: ExecuteApproveOnceMutationInput,
 ): Promise<MutationResult> {
   validateApproveOnceGate(input);
+  await input.assertWorkerOwnership?.("AUTHORIZATION");
   await input.consumeAuthorization({
     loopSessionId: input.loopSessionId,
     sessionVersion: input.sessionVersion,
@@ -1666,5 +1680,11 @@ export async function executeApproveOnceMutation(
     ...(input.captureSourceRevision === undefined
       ? {}
       : { captureSourceRevision: input.captureSourceRevision }),
+    ...(input.assertWorkerOwnership === undefined
+      ? {}
+      : {
+          assertWorkerOwnership: () =>
+            input.assertWorkerOwnership?.("MUTATION_EXECUTION") ?? Promise.resolve(),
+        }),
   }).applyApproveOnce(input);
 }

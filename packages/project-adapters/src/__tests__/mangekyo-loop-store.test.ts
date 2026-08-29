@@ -25,6 +25,7 @@ import {
   releaseMangekyoGateDecisionClaim,
   releaseMangekyoWorkerLease,
 } from "../mangekyo-loop-store";
+import { createMangekyoWorkerLeaseOwner } from "../mangekyo-worker-owner";
 import { ensureDesignWorkspace, saveProjectMetadata } from "../workspace-store";
 
 const roots: string[] = [];
@@ -924,6 +925,331 @@ describe("Mangekyo loop persistence", () => {
       project.id,
       afterOrphanedRecoveryLock,
     );
+  });
+
+  it("atomically renews a still-live exact worker so the old expiry cannot trigger takeover", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    await claimMangekyoActiveLoop(project.rootPath, project.id, {
+      loopSessionId: session.id,
+      sourceExecutionSessionId: session.sourceExecutionSessionId,
+      claimedAt: session.createdAt,
+    });
+    const initial = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      workerId: "worker-long-running",
+      acquiredAt: "2026-08-27T01:00:03.000Z",
+      expiresAt: "2026-08-27T01:01:03.000Z",
+    };
+    await claimMangekyoWorkerLease(project.rootPath, project.id, initial, initial.acquiredAt);
+
+    const renewed = {
+      ...initial,
+      acquiredAt: "2026-08-27T01:00:43.000Z",
+      expiresAt: "2026-08-27T01:01:43.000Z",
+    };
+    await expect(
+      claimMangekyoWorkerLease(project.rootPath, project.id, renewed, renewed.acquiredAt),
+    ).resolves.toBeUndefined();
+
+    const recoveryAtOldExpiry = {
+      ...initial,
+      workerId: "worker-recovery-at-old-expiry",
+      acquiredAt: "2026-08-27T01:01:04.000Z",
+      expiresAt: "2026-08-27T01:02:04.000Z",
+    };
+    await expect(
+      claimMangekyoWorkerLease(
+        project.rootPath,
+        project.id,
+        recoveryAtOldExpiry,
+        recoveryAtOldExpiry.acquiredAt,
+      ),
+    ).rejects.toThrow(/live.*worker lease/i);
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toEqual(renewed);
+    await releaseMangekyoWorkerLease(project.rootPath, project.id, renewed);
+  });
+
+  it("advances only the exact live owner's lease to the newly persisted session version", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    await claimMangekyoActiveLoop(project.rootPath, project.id, {
+      loopSessionId: session.id,
+      sourceExecutionSessionId: session.sourceExecutionSessionId,
+      claimedAt: session.createdAt,
+    });
+    const initial = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      workerId: "worker-version-owner",
+      acquiredAt: "2026-08-27T01:00:03.000Z",
+      expiresAt: "2026-08-27T01:01:03.000Z",
+    };
+    await claimMangekyoWorkerLease(project.rootPath, project.id, initial, initial.acquiredAt);
+    const nextSession = {
+      ...session,
+      updatedAt: "2026-08-27T01:00:04.000Z",
+    };
+    await saveMangekyoLoopSession(project.rootPath, nextSession);
+    const advanced = {
+      ...initial,
+      sessionVersion: nextSession.updatedAt,
+      acquiredAt: "2026-08-27T01:00:05.000Z",
+      expiresAt: "2026-08-27T01:01:05.000Z",
+    };
+
+    await expect(
+      claimMangekyoWorkerLease(project.rootPath, project.id, advanced, advanced.acquiredAt),
+    ).resolves.toBeUndefined();
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toEqual(advanced);
+    await releaseMangekyoWorkerLease(project.rootPath, project.id, advanced);
+  });
+
+  it("rejects a replaced owner's late renewal without changing the takeover lease", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    await claimMangekyoActiveLoop(project.rootPath, project.id, {
+      loopSessionId: session.id,
+      sourceExecutionSessionId: session.sourceExecutionSessionId,
+      claimedAt: session.createdAt,
+    });
+    const expired = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      workerId: "worker-expired",
+      acquiredAt: "2026-08-27T01:00:03.000Z",
+      expiresAt: "2026-08-27T01:00:04.000Z",
+    };
+    await claimMangekyoWorkerLease(project.rootPath, project.id, expired, expired.acquiredAt);
+    const replacement = {
+      ...expired,
+      workerId: "worker-takeover",
+      acquiredAt: "2026-08-27T01:00:05.000Z",
+      expiresAt: "2026-08-27T01:01:05.000Z",
+    };
+    await claimMangekyoWorkerLease(
+      project.rootPath,
+      project.id,
+      replacement,
+      replacement.acquiredAt,
+    );
+    const lateRenewal = {
+      ...expired,
+      acquiredAt: "2026-08-27T01:00:06.000Z",
+      expiresAt: "2026-08-27T01:01:06.000Z",
+    };
+
+    await expect(
+      claimMangekyoWorkerLease(project.rootPath, project.id, lateRenewal, lateRenewal.acquiredAt),
+    ).rejects.toThrow(/live.*worker lease/i);
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toEqual(replacement);
+    await releaseMangekyoWorkerLease(project.rootPath, project.id, replacement);
+  });
+
+  it("heartbeats through long agent, render, and mutation intervals then clears its timer", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    await claimMangekyoActiveLoop(project.rootPath, project.id, {
+      loopSessionId: session.id,
+      sourceExecutionSessionId: session.sourceExecutionSessionId,
+      claimedAt: session.createdAt,
+    });
+    const initialAcquiredAt = Date.now();
+    const initial = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      workerId: "worker-heartbeat",
+      acquiredAt: new Date(initialAcquiredAt).toISOString(),
+      expiresAt: new Date(initialAcquiredAt + 1_000).toISOString(),
+    };
+    await claimMangekyoWorkerLease(project.rootPath, project.id, initial, initial.acquiredAt);
+    const owner = createMangekyoWorkerLeaseOwner({
+      rootPath: project.rootPath,
+      projectId: project.id,
+      lease: initial,
+      leaseDurationMs: 1_000,
+      heartbeatIntervalMs: 250,
+    });
+
+    let durable = await loadMangekyoWorkerLease(project.rootPath, project.id);
+    const heartbeatDeadline = Date.now() + 3_000;
+    while (
+      durable !== undefined &&
+      Date.parse(durable.acquiredAt) < initialAcquiredAt + 1_250 &&
+      Date.now() < heartbeatDeadline
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      durable = await loadMangekyoWorkerLease(project.rootPath, project.id);
+    }
+    expect(Date.parse(durable?.acquiredAt ?? "")).toBeGreaterThanOrEqual(
+      initialAcquiredAt + 1_250,
+    );
+    const attemptedTakeoverAt = initialAcquiredAt + 1_300;
+    const recoveryDuringLongWork = {
+      ...initial,
+      workerId: "worker-improper-takeover",
+      acquiredAt: new Date(attemptedTakeoverAt).toISOString(),
+      expiresAt: new Date(attemptedTakeoverAt + 1_000).toISOString(),
+    };
+    await expect(
+      claimMangekyoWorkerLease(
+        project.rootPath,
+        project.id,
+        recoveryDuringLongWork,
+        recoveryDuringLongWork.acquiredAt,
+      ),
+    ).rejects.toThrow(/worker lease/i);
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toMatchObject({
+      loopSessionId: session.id,
+      workerId: initial.workerId,
+    });
+
+    await owner.close({ release: true });
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toBeUndefined();
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_100));
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toBeUndefined();
+  });
+
+  it("binds every owned persistence checkpoint to the exact durable session version", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    await claimMangekyoActiveLoop(project.rootPath, project.id, {
+      loopSessionId: session.id,
+      sourceExecutionSessionId: session.sourceExecutionSessionId,
+      claimedAt: session.createdAt,
+    });
+    const lease = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      workerId: "worker-persistence-owner",
+      acquiredAt: "2026-08-27T01:00:03.000Z",
+      expiresAt: "2026-08-27T01:00:04.000Z",
+    };
+    await claimMangekyoWorkerLease(project.rootPath, project.id, lease, lease.acquiredAt);
+    const owner = createMangekyoWorkerLeaseOwner({
+      rootPath: project.rootPath,
+      projectId: project.id,
+      lease,
+      leaseDurationMs: 1_000,
+      heartbeatIntervalMs: 400,
+      now: () => new Date("2026-08-27T01:00:03.500Z"),
+    });
+    const checkpoint = {
+      ...session,
+      updatedAt: "2026-08-27T01:00:03.250Z",
+    };
+
+    await owner.persist(checkpoint);
+    await expect(
+      loadMangekyoLoopSession(project.rootPath, project.id, session.id),
+    ).resolves.toEqual(checkpoint);
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toMatchObject({
+      loopSessionId: session.id,
+      sessionVersion: checkpoint.updatedAt,
+      workerId: lease.workerId,
+    });
+    await owner.close({ release: true });
+  });
+
+  it("aborts a replaced owner before persistence and clears its failing heartbeat", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    await claimMangekyoActiveLoop(project.rootPath, project.id, {
+      loopSessionId: session.id,
+      sourceExecutionSessionId: session.sourceExecutionSessionId,
+      claimedAt: session.createdAt,
+    });
+    const expired = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      workerId: "worker-replaced-owner",
+      acquiredAt: "2026-08-27T01:00:03.000Z",
+      expiresAt: "2026-08-27T01:00:04.000Z",
+    };
+    await claimMangekyoWorkerLease(project.rootPath, project.id, expired, expired.acquiredAt);
+    const owner = createMangekyoWorkerLeaseOwner({
+      rootPath: project.rootPath,
+      projectId: project.id,
+      lease: expired,
+      leaseDurationMs: 1_000,
+      heartbeatIntervalMs: 500,
+      now: () => new Date("2026-08-27T01:00:05.500Z"),
+    });
+    const replacement = {
+      ...expired,
+      workerId: "worker-new-owner",
+      acquiredAt: "2026-08-27T01:00:05.000Z",
+      expiresAt: "2026-08-27T01:00:06.000Z",
+    };
+    await claimMangekyoWorkerLease(
+      project.rootPath,
+      project.id,
+      replacement,
+      replacement.acquiredAt,
+    );
+
+    await expect(owner.assertOwnership(session.updatedAt)).rejects.toThrow(/live.*worker lease/i);
+    await expect(owner.persist({
+      ...session,
+      updatedAt: "2026-08-27T01:00:05.750Z",
+    })).rejects.toThrow(/live.*worker lease/i);
+    await expect(
+      loadMangekyoLoopSession(project.rootPath, project.id, session.id),
+    ).resolves.toEqual(session);
+
+    await releaseMangekyoWorkerLease(project.rootPath, project.id, replacement);
+    await new Promise<void>((resolve) => setTimeout(resolve, 550));
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toBeUndefined();
+    await expect(owner.close({ release: false })).rejects.toThrow(/live.*worker lease/i);
   });
 
   it("durably and immutably consumes one exact Approve Once authorization", async () => {
