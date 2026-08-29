@@ -77,6 +77,72 @@ function sessionFixture(): MangekyoLoopSession {
   };
 }
 
+type InterruptedStatus = "EDITING" | "RUNNING" | "CAPTURING" | "COMPARING";
+
+function interruptedCheckpoint(status: InterruptedStatus): MangekyoLoopSession {
+  const checkpoint = sessionFixture();
+  checkpoint.status = status;
+  checkpoint.updatedAt = "2026-08-27T01:00:01.000Z";
+  checkpoint.policyEvaluations = [{
+    id: "policy-recovery-1",
+    roundNumber: 1,
+    proposalId: "proposal-recovery-1",
+    change: { kind: "STYLE_CHANGE", files: ["styles.css"] },
+    policy: checkpoint.policy,
+    evaluation: { decision: "ALLOW", reasons: [] },
+    evaluatedAt: checkpoint.updatedAt,
+  }];
+  return checkpoint;
+}
+
+const invalidInterruptedEvidence = [
+  {
+    name: "missing",
+    mutate: (session: MangekyoLoopSession) => {
+      session.policyEvaluations = [];
+    },
+  },
+  {
+    name: "empty paths",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) latest.change.files = [];
+    },
+  },
+  {
+    name: "orphan round",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) latest.roundNumber = 2;
+    },
+  },
+  {
+    name: "duplicate paths",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) latest.change.files = ["styles.css", "styles.css"];
+    },
+  },
+  {
+    name: "duplicate current evaluation",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) {
+        session.policyEvaluations.push({ ...structuredClone(latest), id: "policy-recovery-2" });
+      }
+    },
+  },
+  {
+    name: "tampered policy result",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) {
+        latest.policy = { ...latest.policy, allowStyleChanges: false };
+      }
+    },
+  },
+] as const;
+
 function proposal(
   id: string,
   files: string[],
@@ -693,18 +759,7 @@ describe("Mangekyo loop", () => {
     "fails closed when a replacement worker recovers the durable %s checkpoint without resumable mutation evidence",
     async (status) => {
       const { dependencies, trace, executeCalls, saved } = harness([], []);
-      const checkpoint = sessionFixture();
-      checkpoint.status = status;
-      checkpoint.updatedAt = "2026-08-27T01:00:01.000Z";
-      checkpoint.policyEvaluations = [{
-        id: "policy-recovery-1",
-        roundNumber: 1,
-        proposalId: "proposal-recovery-1",
-        change: { kind: "STYLE_CHANGE", files: ["styles.css"] },
-        policy: checkpoint.policy,
-        evaluation: { decision: "ALLOW", reasons: [] },
-        evaluatedAt: checkpoint.updatedAt,
-      }];
+      const checkpoint = interruptedCheckpoint(status);
 
       const recovered = await runMangekyoLoop(checkpoint, dependencies);
 
@@ -729,6 +784,27 @@ describe("Mangekyo loop", () => {
       );
       expect(reloaded).toEqual(recovered);
       expect(trace).toEqual(["persist:FAILED"]);
+      expect(executeCalls).toHaveLength(0);
+    },
+  );
+
+  it.each(
+    (["EDITING", "RUNNING", "CAPTURING", "COMPARING"] as const).flatMap((status) =>
+      invalidInterruptedEvidence.map((invalid) => ({ status, ...invalid }))
+    ),
+  )(
+    "retains fail-closed ownership for $status recovery with $name policy evidence",
+    async ({ status, mutate }) => {
+      const { dependencies, trace, executeCalls, saved } = harness([], []);
+      const checkpoint = interruptedCheckpoint(status);
+      mutate(checkpoint);
+
+      await expect(runMangekyoLoop(checkpoint, dependencies)).rejects.toThrow(
+        /interrupted.*recovery evidence.*missing|empty|ambiguous|tampered/i,
+      );
+
+      expect(saved()).toBeUndefined();
+      expect(trace).toEqual([]);
       expect(executeCalls).toHaveLength(0);
     },
   );

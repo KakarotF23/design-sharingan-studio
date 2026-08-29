@@ -185,6 +185,54 @@ function interruptedSessionFixture(
   return session;
 }
 
+const invalidInterruptedSessionEvidence = [
+  {
+    name: "missing",
+    mutate: (session: MangekyoLoopSession) => {
+      session.policyEvaluations = [];
+    },
+  },
+  {
+    name: "empty paths",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) latest.change.files = [];
+    },
+  },
+  {
+    name: "orphan round",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) latest.roundNumber = 2;
+    },
+  },
+  {
+    name: "duplicate paths",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) latest.change.files = ["server.mjs", "server.mjs"];
+    },
+  },
+  {
+    name: "duplicate current evaluation",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) {
+        session.policyEvaluations.push({ ...structuredClone(latest), id: "policy-interrupted-2" });
+      }
+    },
+  },
+  {
+    name: "tampered policy result",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) {
+        latest.policy = { ...latest.policy, allowStyleChanges: false };
+      }
+    },
+  },
+] as const;
+
 function completeSessionFixture(rootPath: string): MangekyoLoopSession {
   const session = sessionFixture(rootPath);
   const proposal = structuredClone(session.currentGate?.proposal as NonNullable<typeof session.currentGate>["proposal"]);
@@ -1274,6 +1322,83 @@ describe("Mangekyo loop persistence", () => {
     await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toBeUndefined();
     await expect(owner.close({ release: false })).rejects.toThrow(/live.*worker lease/i);
   });
+
+  it.each(
+    (["EDITING", "RUNNING", "CAPTURING", "COMPARING"] as const).flatMap((status) =>
+      invalidInterruptedSessionEvidence.map((invalid) => ({ status, ...invalid }))
+    ),
+  )(
+    "rejects $status interrupted checkpoints with $name policy evidence before persistence",
+    async ({ status, mutate }) => {
+      const project = await projectFixture();
+      const interrupted = interruptedSessionFixture(project.rootPath, status);
+      mutate(interrupted);
+
+      expect(isMangekyoLoopSession(interrupted)).toBe(false);
+      await expect(saveMangekyoLoopSession(project.rootPath, interrupted)).rejects.toThrow(
+        /invalid Mangekyo loop/i,
+      );
+    },
+  );
+
+  it.each([
+    "EDITING",
+    "RUNNING",
+    "CAPTURING",
+    "COMPARING",
+  ] as const)(
+    "retains exact worker and active-loop ownership when %s recovery evidence becomes ambiguous",
+    async (status) => {
+      const project = await projectFixture();
+      const interrupted = interruptedSessionFixture(project.rootPath, status);
+      await mkdir(join(project.rootPath, ".design-sharingan", "renders", interrupted.id), {
+        recursive: true,
+      });
+      await writeFile(
+        interrupted.initialRender?.imagePath as string,
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      );
+      await saveMangekyoLoopSession(project.rootPath, interrupted);
+      const activeClaim = {
+        loopSessionId: interrupted.id,
+        sourceExecutionSessionId: interrupted.sourceExecutionSessionId,
+        claimedAt: interrupted.createdAt,
+      };
+      await claimMangekyoActiveLoop(project.rootPath, project.id, activeClaim);
+      const lease = {
+        loopSessionId: interrupted.id,
+        sessionVersion: interrupted.updatedAt,
+        workerId: `worker-ambiguous-${status.toLowerCase()}`,
+        acquiredAt: "2026-08-27T01:00:04.000Z",
+        expiresAt: "2026-08-27T01:00:05.000Z",
+      };
+      await claimMangekyoWorkerLease(project.rootPath, project.id, lease, lease.acquiredAt);
+      const owner = createMangekyoWorkerLeaseOwner({
+        rootPath: project.rootPath,
+        projectId: project.id,
+        lease,
+        leaseDurationMs: 1_000,
+        heartbeatIntervalMs: 400,
+        now: () => new Date("2026-08-27T01:00:04.500Z"),
+      });
+      const ambiguous = structuredClone(interrupted);
+      ambiguous.policyEvaluations = [];
+
+      await expect(owner.persist(ambiguous)).rejects.toThrow(/invalid Mangekyo loop/i);
+      await expect(owner.close({ release: true })).rejects.toThrow(/invalid Mangekyo loop/i);
+      await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toMatchObject({
+        loopSessionId: interrupted.id,
+        sessionVersion: interrupted.updatedAt,
+        workerId: lease.workerId,
+      });
+      await expect(loadMangekyoActiveLoopClaim(project.rootPath, project.id)).resolves.toEqual(
+        activeClaim,
+      );
+      await expect(
+        loadMangekyoLoopSession(project.rootPath, project.id, interrupted.id),
+      ).resolves.toEqual(interrupted);
+    },
+  );
 
   it.each([
     "EDITING",

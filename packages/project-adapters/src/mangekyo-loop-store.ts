@@ -544,6 +544,69 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
     ...value.filesToModify,
     ...value.filesToDelete,
   ];
+  if (["EDITING", "RUNNING", "CAPTURING", "COMPARING"].includes(session.status)) {
+    const roundNumber = session.rounds.length + 1;
+    const latest = session.policyEvaluations.at(-1);
+    const currentEvaluations = session.policyEvaluations.filter(
+      (entry) => entry.roundNumber === roundNumber,
+    );
+    const latestGate = latest === undefined
+      ? undefined
+      : session.gates.find(({ policyEvaluationId }) => policyEvaluationId === latest.id);
+    const latestDecision = latestGate === undefined
+      ? undefined
+      : session.gateDecisions.find(({ gateId }) => gateId === latestGate.id);
+    const currentAllowEvaluations = latest === undefined
+      ? []
+      : currentEvaluations.filter(
+          (entry) =>
+            entry.evaluation.decision === "ALLOW" &&
+            entry.proposalId === latest.proposalId &&
+            stableJson(entry.change) === stableJson(latest.change),
+        );
+    const priorCurrentEvaluationsLinked = currentEvaluations.every(
+      (entry) =>
+        entry.id === latest?.id ||
+        session.gates.some(({ policyEvaluationId }) => policyEvaluationId === entry.id) ||
+        session.rounds.some(({ policyEvaluationId }) => policyEvaluationId === entry.id),
+    );
+    const exactPendingGate = latest !== undefined &&
+      latestGate !== undefined &&
+      latestDecision !== undefined &&
+      latestGate.roundNumber === roundNumber &&
+      latestGate.proposal.sessionId === session.id &&
+      latestGate.proposal.id === latest.proposalId &&
+      stableJson(latestGate.requestedChange) === stableJson(latest.change) &&
+      stableJson(proposalFiles(latestGate.proposal)) === stableJson(latest.change.files) &&
+      session.rounds.every(({ gateDecisionId }) => gateDecisionId !== latestDecision.id) &&
+      (
+        (
+          latestDecision.decision === "APPROVE_ONCE" &&
+          stableJson(latest.policy) === stableJson(session.policy)
+        ) ||
+        (
+          latestDecision.decision === "EXPAND_SCOPE" &&
+          latestDecision.policyAfter !== undefined &&
+          stableJson(latestDecision.policyAfter) === stableJson(session.policy)
+        )
+      );
+    const exactLatestRelation = latest?.evaluation.decision === "ALLOW"
+      ? currentAllowEvaluations.length === 1 &&
+        latestGate === undefined &&
+        stableJson(latest.policy) === stableJson(session.policy)
+      : latest?.evaluation.decision === "HUMAN_GATE" && exactPendingGate;
+    if (
+      latest === undefined ||
+      latest.roundNumber !== roundNumber ||
+      Date.parse(latest.evaluatedAt) > Date.parse(session.updatedAt) ||
+      stableJson(evaluateAutonomyPolicy(latest.policy, latest.change)) !==
+        stableJson(latest.evaluation) ||
+      !priorCurrentEvaluationsLinked ||
+      !exactLatestRelation
+    ) {
+      return false;
+    }
+  }
   if (
     session.initialRender !== undefined && (
       Date.parse(session.initialRender.capturedAt) < Date.parse(session.createdAt) ||

@@ -162,6 +162,94 @@ function cloneSession(session: MangekyoLoopSession): MangekyoLoopSession {
   return structuredClone(session);
 }
 
+function interruptedRecoveryPaths(session: MangekyoLoopSession): string[] {
+  const roundNumber = session.rounds.length + 1;
+  const latest = session.policyEvaluations.at(-1);
+  const currentEvaluations = session.policyEvaluations.filter(
+    (entry) => entry.roundNumber === roundNumber,
+  );
+  const paths = latest?.change.files ?? [];
+  const latestGate = latest === undefined
+    ? undefined
+    : session.gates.find(({ policyEvaluationId }) => policyEvaluationId === latest.id);
+  const latestDecision = latestGate === undefined
+    ? undefined
+    : session.gateDecisions.find(({ gateId }) => gateId === latestGate.id);
+  const proposalPaths = latestGate === undefined
+    ? []
+    : [
+        ...latestGate.proposal.filesToCreate,
+        ...latestGate.proposal.filesToModify,
+        ...latestGate.proposal.filesToDelete,
+      ];
+  const currentAllowEvaluations = latest === undefined
+    ? []
+    : currentEvaluations.filter(
+        (entry) =>
+          entry.evaluation.decision === "ALLOW" &&
+          entry.proposalId === latest.proposalId &&
+          stableJson(entry.change) === stableJson(latest.change),
+      );
+  const priorCurrentEvaluationsLinked = currentEvaluations.every(
+    (entry) =>
+      entry.id === latest?.id ||
+      session.gates.some(({ policyEvaluationId }) => policyEvaluationId === entry.id) ||
+      session.rounds.some(({ policyEvaluationId }) => policyEvaluationId === entry.id),
+  );
+  const exactPendingGate = latest !== undefined &&
+    latestGate !== undefined &&
+    latestDecision !== undefined &&
+    latestGate.roundNumber === roundNumber &&
+    latestGate.proposal.sessionId === session.id &&
+    latestGate.proposal.id === latest.proposalId &&
+    stableJson(latestGate.requestedChange) === stableJson(latest.change) &&
+    stableJson(proposalPaths) === stableJson(paths) &&
+    session.rounds.every(({ gateDecisionId }) => gateDecisionId !== latestDecision.id) &&
+    (
+      (
+        latestDecision.decision === "APPROVE_ONCE" &&
+        stableJson(latest.policy) === stableJson(session.policy)
+      ) ||
+      (
+        latestDecision.decision === "EXPAND_SCOPE" &&
+        latestDecision.policyAfter !== undefined &&
+        stableJson(latestDecision.policyAfter) === stableJson(session.policy)
+      )
+    );
+  const exactLatestRelation = latest?.evaluation.decision === "ALLOW"
+    ? currentAllowEvaluations.length === 1 &&
+      latestGate === undefined &&
+      stableJson(latest.policy) === stableJson(session.policy)
+    : latest?.evaluation.decision === "HUMAN_GATE" && exactPendingGate;
+
+  if (
+    latest === undefined ||
+    latest.roundNumber !== roundNumber ||
+    !safeIdentifier(latest.id) ||
+    !safeIdentifier(latest.proposalId) ||
+    paths.length === 0 ||
+    paths.length > 128 ||
+    new Set(paths).size !== paths.length ||
+    paths.some(
+      (path) =>
+        typeof path !== "string" ||
+        path.trim().length === 0 ||
+        new TextEncoder().encode(path).byteLength > 512,
+    ) ||
+    !iso(latest.evaluatedAt) ||
+    Date.parse(latest.evaluatedAt) > Date.parse(session.updatedAt) ||
+    stableJson(evaluateAutonomyPolicy(latest.policy, latest.change)) !==
+      stableJson(latest.evaluation) ||
+    !priorCurrentEvaluationsLinked ||
+    !exactLatestRelation
+  ) {
+    throw new Error(
+      `Interrupted ${session.status} recovery evidence is missing, empty, ambiguous, or tampered; retaining fail-closed ownership`,
+    );
+  }
+  return [...paths];
+}
+
 function timestamp(dependencies: MangekyoLoopDependencies): string {
   const value = dependencies.now();
   if (!Number.isFinite(value.getTime())) throw new Error("Mangekyo clock is invalid");
@@ -678,24 +766,14 @@ export async function runMangekyoLoop(
   if (stopped !== undefined) return stopped;
   if (["EDITING", "RUNNING", "CAPTURING", "COMPARING"].includes(working.status)) {
     const interruptedStatus = working.status;
-    const policyEvidence = working.policyEvaluations.at(-1);
-    const affectedPaths = policyEvidence !== undefined &&
-      policyEvidence.roundNumber === working.rounds.length + 1
-      ? [...new Set(policyEvidence.change.files)]
-      : [];
+    const affectedPaths = interruptedRecoveryPaths(working);
     const failed: MangekyoLoopSession = {
       ...withStatus(working, "FAILED", dependencies),
-      stopReason: affectedPaths.length > 0
-        ? `${interruptedStatus} recovery cannot safely resume: the mutation may have changed target bytes, but exact post-mutation source evidence was not durably linked. Reconcile the recorded affected paths before another change.`
-        : `${interruptedStatus} recovery cannot safely resume: the mutation may have changed target bytes, but authenticated affected paths and exact post-mutation source evidence were not durably linked. Reconciliation is required before another change.`,
-      ...(affectedPaths.length === 0
-        ? {}
-        : {
-            mutationFailure: {
-              targetDisposition: "RECONCILIATION_REQUIRED" as const,
-              affectedPaths,
-            },
-          }),
+      stopReason: `${interruptedStatus} recovery cannot safely resume: the mutation may have changed target bytes, but exact post-mutation source evidence was not durably linked. Reconcile the recorded affected paths before another change.`,
+      mutationFailure: {
+        targetDisposition: "RECONCILIATION_REQUIRED",
+        affectedPaths,
+      },
     };
     return persistAndReload(failed, dependencies, "interrupted mutation recovery checkpoint");
   }
