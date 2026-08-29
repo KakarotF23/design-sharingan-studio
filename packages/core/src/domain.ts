@@ -335,10 +335,18 @@ export interface MangekyoRenderTarget {
   };
 }
 
+export interface MangekyoProposalDelta {
+  filesToCreate: string[];
+  filesToModify: string[];
+  filesToDelete: string[];
+}
+
 export interface MangekyoPolicyEvaluationEvidence {
   id: string;
   roundNumber: number;
   proposalId: string;
+  proposalThreadId?: string;
+  proposalDelta?: MangekyoProposalDelta;
   change: AutonomyChange;
   policy: AutonomyPolicy;
   evaluation: AutonomyPolicyEvaluation;
@@ -387,6 +395,14 @@ export interface MangekyoRoundEvidence {
   gateDecisionId?: string;
 }
 
+export interface MangekyoPendingChangeEvidence {
+  roundNumber: number;
+  proposal: ChangeProposal;
+  proposalThreadId: string;
+  policyEvaluationId: string;
+  recordedAt: ISODateTime;
+}
+
 export interface MangekyoLoopSession extends DesignSession {
   type: "MANGEKYO_LOOP";
   status: MangekyoStatus;
@@ -407,6 +423,7 @@ export interface MangekyoLoopSession extends DesignSession {
   policyEvaluations: MangekyoPolicyEvaluationEvidence[];
   gates: MangekyoHumanGate[];
   gateDecisions: MangekyoHumanGateDecision[];
+  pendingChange?: MangekyoPendingChangeEvidence;
   currentGate?: MangekyoHumanGate;
   initialRender?: RenderArtifact;
   finalRender?: RenderArtifact;

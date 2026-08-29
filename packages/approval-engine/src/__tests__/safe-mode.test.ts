@@ -467,6 +467,12 @@ describe("Mangekyo policy-authorized mutation gate", () => {
         id: "policy-navigation",
         roundNumber: 1,
         proposalId: proposal.id,
+        proposalThreadId: "thread-proposal-1",
+        proposalDelta: {
+          filesToCreate: [],
+          filesToModify: ["src/file.ts"],
+          filesToDelete: [],
+        },
         change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
         policy: DEFAULT_AUTONOMY_POLICY,
         evaluation: {
@@ -533,6 +539,12 @@ describe("Mangekyo policy-authorized mutation gate", () => {
         id: "policy-navigation",
         roundNumber: 1,
         proposalId: proposal.id,
+        proposalThreadId: "thread-proposal-1",
+        proposalDelta: {
+          filesToCreate: [],
+          filesToModify: ["src/file.ts"],
+          filesToDelete: [],
+        },
         change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
         policy: DEFAULT_AUTONOMY_POLICY,
         evaluation: { decision: "HUMAN_GATE", reasons: ["Navigation changes require a Human Gate."] },
@@ -594,6 +606,12 @@ describe("Mangekyo policy-authorized mutation gate", () => {
         id: "policy-navigation",
         roundNumber: 1,
         proposalId: proposal.id,
+        proposalThreadId: "thread-proposal-1",
+        proposalDelta: {
+          filesToCreate: [],
+          filesToModify: ["src/file.ts"],
+          filesToDelete: [],
+        },
         change: { kind: "NAVIGATION_CHANGE" as const, files: ["src/file.ts"] },
         policy: DEFAULT_AUTONOMY_POLICY,
         evaluation: {

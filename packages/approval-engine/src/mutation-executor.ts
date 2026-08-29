@@ -457,12 +457,19 @@ function validateApproveOnceGate(input: ExecuteApproveOnceMutationInput): void {
     stableJson(gate.proposal) !== stableJson(input.proposal) ||
     stableJson(gate.requestedChange) !== stableJson(input.change) ||
     !exactObject(evidence, [
-      "id", "roundNumber", "proposalId", "change", "policy", "evaluation", "evaluatedAt",
+      "id", "roundNumber", "proposalId", "proposalThreadId", "proposalDelta",
+      "change", "policy", "evaluation", "evaluatedAt",
     ]) ||
     !safeIdentifier(evidence.id) ||
     gate.policyEvaluationId !== evidence.id ||
     evidence.roundNumber !== gate.roundNumber ||
     evidence.proposalId !== input.proposal.id ||
+    evidence.proposalThreadId !== input.proposalThreadId ||
+    stableJson(evidence.proposalDelta) !== stableJson({
+      filesToCreate: input.proposal.filesToCreate,
+      filesToModify: input.proposal.filesToModify,
+      filesToDelete: input.proposal.filesToDelete,
+    }) ||
     evidence.evaluation.decision !== "HUMAN_GATE" ||
     evidence.evaluation.reasons.length === 0 ||
     !validAutonomyPolicy(evidence.policy) ||

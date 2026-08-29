@@ -162,6 +162,40 @@ function cloneSession(session: MangekyoLoopSession): MangekyoLoopSession {
   return structuredClone(session);
 }
 
+function proposalPaths(proposal: ChangeProposal): string[] {
+  return [
+    ...proposal.filesToCreate,
+    ...proposal.filesToModify,
+    ...proposal.filesToDelete,
+  ];
+}
+
+function proposalDelta(proposal: ChangeProposal): {
+  filesToCreate: string[];
+  filesToModify: string[];
+  filesToDelete: string[];
+} {
+  return {
+    filesToCreate: [...proposal.filesToCreate],
+    filesToModify: [...proposal.filesToModify],
+    filesToDelete: [...proposal.filesToDelete],
+  };
+}
+
+function pendingChangeEvidence(
+  roundNumber: number,
+  pending: ProposedVisualChange,
+  policyEvaluation: MangekyoPolicyEvaluationEvidence,
+): NonNullable<MangekyoLoopSession["pendingChange"]> {
+  return {
+    roundNumber,
+    proposal: structuredClone(pending.proposal),
+    proposalThreadId: pending.proposalThreadId,
+    policyEvaluationId: policyEvaluation.id,
+    recordedAt: policyEvaluation.evaluatedAt,
+  };
+}
+
 function interruptedRecoveryPaths(session: MangekyoLoopSession): string[] {
   const roundNumber = session.rounds.length + 1;
   const latest = session.policyEvaluations.at(-1);
@@ -169,13 +203,15 @@ function interruptedRecoveryPaths(session: MangekyoLoopSession): string[] {
     (entry) => entry.roundNumber === roundNumber,
   );
   const paths = latest?.change.files ?? [];
+  const pending = session.pendingChange;
+  const pendingPaths = pending === undefined ? [] : proposalPaths(pending.proposal);
   const latestGate = latest === undefined
     ? undefined
     : session.gates.find(({ policyEvaluationId }) => policyEvaluationId === latest.id);
   const latestDecision = latestGate === undefined
     ? undefined
     : session.gateDecisions.find(({ gateId }) => gateId === latestGate.id);
-  const proposalPaths = latestGate === undefined
+  const gateProposalPaths = latestGate === undefined
     ? []
     : [
         ...latestGate.proposal.filesToCreate,
@@ -203,7 +239,7 @@ function interruptedRecoveryPaths(session: MangekyoLoopSession): string[] {
     latestGate.proposal.sessionId === session.id &&
     latestGate.proposal.id === latest.proposalId &&
     stableJson(latestGate.requestedChange) === stableJson(latest.change) &&
-    stableJson(proposalPaths) === stableJson(paths) &&
+    stableJson(gateProposalPaths) === stableJson(paths) &&
     session.rounds.every(({ gateDecisionId }) => gateDecisionId !== latestDecision.id) &&
     (
       (
@@ -219,7 +255,18 @@ function interruptedRecoveryPaths(session: MangekyoLoopSession): string[] {
   const exactLatestRelation = latest?.evaluation.decision === "ALLOW"
     ? currentAllowEvaluations.length === 1 &&
       latestGate === undefined &&
-      stableJson(latest.policy) === stableJson(session.policy)
+      stableJson(latest.policy) === stableJson(session.policy) &&
+      pending !== undefined &&
+      pending.roundNumber === roundNumber &&
+      pending.policyEvaluationId === latest.id &&
+      pending.proposal.id === latest.proposalId &&
+      pending.proposal.sessionId === session.id &&
+      latest.proposalThreadId === pending.proposalThreadId &&
+      stableJson(latest.proposalDelta) === stableJson(proposalDelta(pending.proposal)) &&
+      pending.proposalThreadId.trim().length > 0 &&
+      new TextEncoder().encode(pending.proposalThreadId).byteLength <= 256 &&
+      pending.recordedAt === latest.evaluatedAt &&
+      stableJson(pendingPaths) === stableJson(paths)
     : latest?.evaluation.decision === "HUMAN_GATE" && exactPendingGate;
 
   if (
@@ -247,7 +294,7 @@ function interruptedRecoveryPaths(session: MangekyoLoopSession): string[] {
       `Interrupted ${session.status} recovery evidence is missing, empty, ambiguous, or tampered; retaining fail-closed ownership`,
     );
   }
-  return [...paths];
+  return latest.evaluation.decision === "ALLOW" ? [...pendingPaths] : [...paths];
 }
 
 function timestamp(dependencies: MangekyoLoopDependencies): string {
@@ -430,7 +477,10 @@ async function executeRound(
   dependencies: MangekyoLoopDependencies,
 ): Promise<MangekyoLoopSession> {
   let working = cloneSession(session);
-  working = withStatus(working, "EDITING", dependencies);
+  working = {
+    ...withStatus(working, "EDITING", dependencies),
+    pendingChange: pendingChangeEvidence(roundNumber, pending, policyEvaluation),
+  };
   working.currentGate = undefined;
   working = await persistAndReload(working, dependencies, "editing checkpoint");
   const stoppedBeforeMutation = await stopCheckpoint(working, dependencies);
@@ -453,11 +503,7 @@ async function executeRound(
     };
     return persistAndReload(failed, dependencies, "mutation failure checkpoint");
   }
-  const expectedFiles = [
-    ...pending.proposal.filesToCreate,
-    ...pending.proposal.filesToModify,
-    ...pending.proposal.filesToDelete,
-  ];
+  const expectedFiles = proposalPaths(pending.proposal);
   if (
     mutation.proposalId !== pending.proposal.id ||
     mutation.threadId !== pending.proposalThreadId ||
@@ -564,8 +610,9 @@ async function executeRound(
       : { genomeEvidenceVersion: analysis.genomeEvidenceVersion }),
     status: "DECIDING",
   };
+  const { pendingChange: _completedPendingChange, ...completedWorking } = working;
   const deciding: MangekyoLoopSession = {
-    ...working,
+    ...completedWorking,
     status: "DECIDING",
     updatedAt: completedAt,
     inspectedScreens,
@@ -696,6 +743,8 @@ async function processPendingChange(
     id: dependencies.createId(),
     roundNumber,
     proposalId: pending.proposal.id,
+    proposalThreadId: pending.proposalThreadId,
+    proposalDelta: proposalDelta(pending.proposal),
     change: { kind: pending.change.kind, files: [...pending.change.files] },
     policy: { ...session.policy, protectedPaths: [...session.policy.protectedPaths] },
     evaluation: {
@@ -710,6 +759,7 @@ async function processPendingChange(
   let checked: MangekyoLoopSession = {
     ...withStatus(session, "POLICY_CHECK", dependencies),
     policyEvaluations: [...session.policyEvaluations, policyEvaluation],
+    pendingChange: pendingChangeEvidence(roundNumber, pending, policyEvaluation),
     currentGate: undefined,
   };
   checked = await persistAndReload(checked, dependencies, "policy checkpoint");
@@ -729,8 +779,9 @@ async function processPendingChange(
       impact: pending.impact,
     };
     if (!safeIdentifier(gate.id)) throw new Error("Human gate identity is invalid");
+    const { pendingChange: _pendingChange, ...checkedWithoutPending } = checked;
     const gated: MangekyoLoopSession = {
-      ...withStatus(checked, "HUMAN_GATE", dependencies),
+      ...withStatus(checkedWithoutPending, "HUMAN_GATE", dependencies),
       gates: [...checked.gates, gate],
       currentGate: gate,
       stopReason: "A policy boundary requires a human decision.",
@@ -876,6 +927,20 @@ export async function resolveHumanGate(
     decidedAt: baseDecision.createdAt,
   };
   await dependencies.claimGateDecision(decisionClaim);
+  const gatePolicyEvaluation = session.policyEvaluations.find(
+    ({ id }) => id === gate.policyEvaluationId,
+  );
+  if (gatePolicyEvaluation === undefined) {
+    throw new Error("Human gate is missing its exact policy evaluation");
+  }
+  const gatePending: ProposedVisualChange = {
+    proposal: gate.proposal,
+    proposalThreadId: gate.proposalThreadId,
+    change: gate.requestedChange,
+    objective: gate.proposal.summary,
+    affectedScope: gate.affectedScope,
+    impact: gate.impact,
+  };
   const { stopReason: _pendingGateReason, ...sessionWithoutGateReason } = cloneSession(session);
   const decided: MangekyoLoopSession = {
     ...sessionWithoutGateReason,
@@ -887,6 +952,15 @@ export async function resolveHumanGate(
       : [...session.gates, gate],
     gateDecisions: [...session.gateDecisions, baseDecision],
     currentGate: undefined,
+    ...(resolution.decision === "REJECT"
+      ? {}
+      : {
+          pendingChange: pendingChangeEvidence(
+            gate.roundNumber,
+            gatePending,
+            gatePolicyEvaluation,
+          ),
+        }),
     ...(resolution.decision === "REJECT"
       ? { stopReason: "The pending policy-boundary change was rejected." }
       : {}),
@@ -918,14 +992,7 @@ export async function resolveHumanGate(
 
   if (resolution.decision === "REJECT") return persistedDecision;
 
-  const pending: ProposedVisualChange = {
-    proposal: gate.proposal,
-    proposalThreadId: gate.proposalThreadId,
-    change: gate.requestedChange,
-    objective: gate.proposal.summary,
-    affectedScope: gate.affectedScope,
-    impact: gate.impact,
-  };
+  const pending = gatePending;
   if (resolution.decision === "EXPAND_SCOPE") {
     return processPendingChange(persistedDecision, gate.roundNumber, pending, dependencies);
   }

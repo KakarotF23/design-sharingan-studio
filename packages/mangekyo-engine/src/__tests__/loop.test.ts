@@ -87,11 +87,28 @@ function interruptedCheckpoint(status: InterruptedStatus): MangekyoLoopSession {
     id: "policy-recovery-1",
     roundNumber: 1,
     proposalId: "proposal-recovery-1",
+    proposalThreadId: "thread-recovery-1",
+    proposalDelta: {
+      filesToCreate: [],
+      filesToModify: ["styles.css"],
+      filesToDelete: [],
+    },
     change: { kind: "STYLE_CHANGE", files: ["styles.css"] },
     policy: checkpoint.policy,
     evaluation: { decision: "ALLOW", reasons: [] },
     evaluatedAt: checkpoint.updatedAt,
   }];
+  checkpoint.pendingChange = {
+    roundNumber: 1,
+    proposal: proposal(
+      "proposal-recovery-1",
+      ["styles.css"],
+      "Recover the exact pending style proposal",
+    ),
+    proposalThreadId: "thread-recovery-1",
+    policyEvaluationId: "policy-recovery-1",
+    recordedAt: checkpoint.updatedAt,
+  };
   return checkpoint;
 }
 
@@ -138,6 +155,60 @@ const invalidInterruptedEvidence = [
       const latest = session.policyEvaluations.at(-1);
       if (latest !== undefined) {
         latest.policy = { ...latest.policy, allowStyleChanges: false };
+      }
+    },
+  },
+  {
+    name: "substituted policy-allowed path",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) latest.change.files = ["substituted.css"];
+    },
+  },
+  {
+    name: "missing pending proposal",
+    mutate: (session: MangekyoLoopSession) => {
+      delete session.pendingChange;
+    },
+  },
+  {
+    name: "substituted pending proposal",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.proposal.id = "proposal-substituted";
+      }
+    },
+  },
+  {
+    name: "substituted pending thread",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.proposalThreadId = "thread-substituted";
+      }
+    },
+  },
+  {
+    name: "substituted pending delta category",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.proposal.filesToCreate = ["styles.css"];
+        session.pendingChange.proposal.filesToModify = [];
+      }
+    },
+  },
+  {
+    name: "orphan pending policy link",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.policyEvaluationId = "policy-orphan";
+      }
+    },
+  },
+  {
+    name: "duplicate pending delta path",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.proposal.filesToCreate = ["styles.css"];
       }
     },
   },
@@ -599,15 +670,41 @@ describe("Mangekyo loop", () => {
       [[]],
     );
     const execute = dependencies.executeChange;
+    const persist = dependencies.persist;
+    const pendingCheckpoints: MangekyoLoopSession[] = [];
+    dependencies.persist = async (checkpoint) => {
+      if (checkpoint.status === "POLICY_CHECK" || checkpoint.status === "EDITING") {
+        pendingCheckpoints.push(structuredClone(checkpoint));
+      }
+      await persist(checkpoint);
+    };
     let statusAtMutation: MangekyoLoopSession["status"] | undefined;
+    let pendingAtMutation: MangekyoLoopSession["pendingChange"];
     dependencies.executeChange = async (input) => {
       statusAtMutation = saved()?.status;
+      pendingAtMutation = structuredClone(saved()?.pendingChange);
       return execute(input);
     };
 
     const result = await runMangekyoLoop(sessionFixture(), dependencies);
     expect(result.status).toBe("COMPLETE");
     expect(statusAtMutation).toBe("EDITING");
+    expect(pendingCheckpoints).toHaveLength(2);
+    expect(pendingCheckpoints[0]?.pendingChange).toEqual(pendingCheckpoints[1]?.pendingChange);
+    expect(pendingAtMutation).toMatchObject({
+      roundNumber: 1,
+      proposal: {
+        id: "proposal-style-1",
+        sessionId: "mangekyo-1",
+        filesToCreate: [],
+        filesToModify: ["server.mjs"],
+        filesToDelete: [],
+      },
+      proposalThreadId: "thread-style-1",
+      policyEvaluationId: expect.any(String),
+      recordedAt: expect.any(String),
+    });
+    expect(result.pendingChange).toBeUndefined();
   });
 
   it("persists the completed round in DECIDING before transition and resumes it after a crash", async () => {

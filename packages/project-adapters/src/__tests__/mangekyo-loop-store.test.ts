@@ -176,11 +176,37 @@ function interruptedSessionFixture(
     id: "policy-interrupted-1",
     roundNumber: 1,
     proposalId: "proposal-interrupted-1",
+    proposalThreadId: "thread-interrupted-1",
+    proposalDelta: {
+      filesToCreate: [],
+      filesToModify: ["server.mjs"],
+      filesToDelete: [],
+    },
     change: { kind: "STYLE_CHANGE", files: ["server.mjs"] },
     policy: DEFAULT_AUTONOMY_POLICY,
     evaluation: { decision: "ALLOW", reasons: [] },
     evaluatedAt: "2026-08-27T01:00:02.000Z",
   }];
+  const pendingProposal = structuredClone(
+    sessionFixture(rootPath).currentGate?.proposal as NonNullable<
+      MangekyoLoopSession["currentGate"]
+    >["proposal"],
+  );
+  pendingProposal.id = "proposal-interrupted-1";
+  pendingProposal.summary = "Recover the exact pending style proposal.";
+  pendingProposal.reason = "The interrupted worker may have changed the approved style path.";
+  pendingProposal.filesToCreate = [];
+  pendingProposal.filesToModify = ["server.mjs"];
+  pendingProposal.filesToDelete = [];
+  pendingProposal.policyViolations = [];
+  pendingProposal.riskLevel = "LOW";
+  session.pendingChange = {
+    roundNumber: 1,
+    proposal: pendingProposal,
+    proposalThreadId: "thread-interrupted-1",
+    policyEvaluationId: "policy-interrupted-1",
+    recordedAt: "2026-08-27T01:00:02.000Z",
+  };
   delete session.stopReason;
   return session;
 }
@@ -231,7 +257,71 @@ const invalidInterruptedSessionEvidence = [
       }
     },
   },
+  {
+    name: "substituted policy-allowed path",
+    mutate: (session: MangekyoLoopSession) => {
+      const latest = session.policyEvaluations.at(-1);
+      if (latest !== undefined) latest.change.files = ["substituted.mjs"];
+    },
+  },
+  {
+    name: "missing pending proposal",
+    mutate: (session: MangekyoLoopSession) => {
+      delete session.pendingChange;
+    },
+  },
+  {
+    name: "substituted pending proposal",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.proposal.id = "proposal-substituted";
+      }
+    },
+  },
+  {
+    name: "substituted pending thread",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.proposalThreadId = "thread-substituted";
+      }
+    },
+  },
+  {
+    name: "substituted pending delta category",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.proposal.filesToCreate = ["server.mjs"];
+        session.pendingChange.proposal.filesToModify = [];
+      }
+    },
+  },
+  {
+    name: "orphan pending policy link",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.policyEvaluationId = "policy-orphan";
+      }
+    },
+  },
+  {
+    name: "duplicate pending delta path",
+    mutate: (session: MangekyoLoopSession) => {
+      if (session.pendingChange !== undefined) {
+        session.pendingChange.proposal.filesToCreate = ["server.mjs"];
+      }
+    },
+  },
 ] as const;
+
+const claimRetainedPendingEvidence = invalidInterruptedSessionEvidence.filter(({ name }) => [
+  "substituted policy-allowed path",
+  "missing pending proposal",
+  "substituted pending proposal",
+  "substituted pending thread",
+  "substituted pending delta category",
+  "orphan pending policy link",
+  "duplicate pending delta path",
+].includes(name));
 
 function completeSessionFixture(rootPath: string): MangekyoLoopSession {
   const session = sessionFixture(rootPath);
@@ -1341,14 +1431,13 @@ describe("Mangekyo loop persistence", () => {
     },
   );
 
-  it.each([
-    "EDITING",
-    "RUNNING",
-    "CAPTURING",
-    "COMPARING",
-  ] as const)(
-    "retains exact worker and active-loop ownership when %s recovery evidence becomes ambiguous",
-    async (status) => {
+  it.each(
+    (["EDITING", "RUNNING", "CAPTURING", "COMPARING"] as const).flatMap((status) =>
+      claimRetainedPendingEvidence.map((invalid) => ({ status, ...invalid }))
+    ),
+  )(
+    "retains exact worker and active-loop ownership when $status has $name recovery evidence",
+    async ({ status, mutate }) => {
       const project = await projectFixture();
       const interrupted = interruptedSessionFixture(project.rootPath, status);
       await mkdir(join(project.rootPath, ".design-sharingan", "renders", interrupted.id), {
@@ -1382,7 +1471,7 @@ describe("Mangekyo loop persistence", () => {
         now: () => new Date("2026-08-27T01:00:04.500Z"),
       });
       const ambiguous = structuredClone(interrupted);
-      ambiguous.policyEvaluations = [];
+      mutate(ambiguous);
 
       await expect(owner.persist(ambiguous)).rejects.toThrow(/invalid Mangekyo loop/i);
       await expect(owner.close({ release: true })).rejects.toThrow(/invalid Mangekyo loop/i);

@@ -135,6 +135,31 @@ function change(value: unknown): value is AutonomyChange {
   );
 }
 
+function proposalDelta(value: unknown): value is {
+  filesToCreate: string[];
+  filesToModify: string[];
+  filesToDelete: string[];
+} {
+  if (!exact(value, ["filesToCreate", "filesToModify", "filesToDelete"])) return false;
+  if (
+    !texts(value.filesToCreate, 64, 512) ||
+    !texts(value.filesToModify, 64, 512) ||
+    !texts(value.filesToDelete, 64, 512)
+  ) {
+    return false;
+  }
+  const paths = [
+    ...value.filesToCreate,
+    ...value.filesToModify,
+    ...value.filesToDelete,
+  ];
+  return (
+    paths.length > 0 &&
+    paths.length <= 128 &&
+    new Set(paths).size === paths.length
+  );
+}
+
 function evaluation(value: unknown): value is AutonomyPolicyEvaluation {
   return (
     exact(value, ["decision", "reasons"]) &&
@@ -440,11 +465,17 @@ function visualRound(value: unknown, session: MangekyoLoopSession): value is Vis
 }
 
 function policyEvidence(value: unknown): value is MangekyoPolicyEvaluationEvidence {
+  const hasProposalThread = value !== null && typeof value === "object" && !Array.isArray(value) &&
+    Object.hasOwn(value, "proposalThreadId");
+  const hasProposalDelta = value !== null && typeof value === "object" && !Array.isArray(value) &&
+    Object.hasOwn(value, "proposalDelta");
   return (
     exact(value, [
       "id",
       "roundNumber",
       "proposalId",
+      ...(hasProposalThread ? ["proposalThreadId"] : []),
+      ...(hasProposalDelta ? ["proposalDelta"] : []),
       "change",
       "policy",
       "evaluation",
@@ -455,6 +486,9 @@ function policyEvidence(value: unknown): value is MangekyoPolicyEvaluationEviden
     (value.roundNumber as number) >= 1 &&
     (value.roundNumber as number) <= 5 &&
     identifier(value.proposalId) &&
+    hasProposalThread === hasProposalDelta &&
+    (!hasProposalThread || text(value.proposalThreadId, 256)) &&
+    (!hasProposalDelta || proposalDelta(value.proposalDelta)) &&
     change(value.change) &&
     policy(value.policy) &&
     evaluation(value.evaluation) &&
@@ -488,6 +522,28 @@ function gate(value: unknown, sessionId: string): value is MangekyoHumanGate {
     texts(value.reasons, 32, 1_000, true) &&
     texts(value.affectedScope, 64, 512, true) &&
     text(value.impact, 2_000)
+  );
+}
+
+function pendingChangeEvidence(
+  value: unknown,
+  sessionId: string,
+): value is NonNullable<MangekyoLoopSession["pendingChange"]> {
+  return (
+    exact(value, [
+      "roundNumber",
+      "proposal",
+      "proposalThreadId",
+      "policyEvaluationId",
+      "recordedAt",
+    ]) &&
+    Number.isSafeInteger(value.roundNumber) &&
+    (value.roundNumber as number) >= 1 &&
+    (value.roundNumber as number) <= 5 &&
+    proposal(value.proposal, sessionId) &&
+    text(value.proposalThreadId, 256) &&
+    identifier(value.policyEvaluationId) &&
+    iso(value.recordedAt)
   );
 }
 
@@ -544,6 +600,31 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
     ...value.filesToModify,
     ...value.filesToDelete,
   ];
+  if (session.pendingChange !== undefined) {
+    const pendingPolicy = session.policyEvaluations.find(
+      ({ id }) => id === session.pendingChange?.policyEvaluationId,
+    );
+    if (
+      pendingPolicy === undefined ||
+      session.pendingChange.roundNumber !== session.rounds.length + 1 ||
+      pendingPolicy.roundNumber !== session.pendingChange.roundNumber ||
+      pendingPolicy.id !== session.policyEvaluations.at(-1)?.id ||
+      pendingPolicy.proposalId !== session.pendingChange.proposal.id ||
+      session.pendingChange.proposal.sessionId !== session.id ||
+      pendingPolicy.proposalThreadId !== session.pendingChange.proposalThreadId ||
+      stableJson(pendingPolicy.proposalDelta) !== stableJson({
+        filesToCreate: session.pendingChange.proposal.filesToCreate,
+        filesToModify: session.pendingChange.proposal.filesToModify,
+        filesToDelete: session.pendingChange.proposal.filesToDelete,
+      }) ||
+      session.pendingChange.recordedAt !== pendingPolicy.evaluatedAt ||
+      Date.parse(session.pendingChange.recordedAt) > Date.parse(session.updatedAt) ||
+      stableJson(proposalFiles(session.pendingChange.proposal)) !==
+        stableJson(pendingPolicy.change.files)
+    ) {
+      return false;
+    }
+  }
   if (["EDITING", "RUNNING", "CAPTURING", "COMPARING"].includes(session.status)) {
     const roundNumber = session.rounds.length + 1;
     const latest = session.policyEvaluations.at(-1);
@@ -593,7 +674,9 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
     const exactLatestRelation = latest?.evaluation.decision === "ALLOW"
       ? currentAllowEvaluations.length === 1 &&
         latestGate === undefined &&
-        stableJson(latest.policy) === stableJson(session.policy)
+        stableJson(latest.policy) === stableJson(session.policy) &&
+        session.pendingChange !== undefined &&
+        session.pendingChange.policyEvaluationId === latest.id
       : latest?.evaluation.decision === "HUMAN_GATE" && exactPendingGate;
     if (
       latest === undefined ||
@@ -821,6 +904,7 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
 export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSession {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const optional = [
+    ...(Object.hasOwn(value, "pendingChange") ? ["pendingChange"] : []),
     ...(Object.hasOwn(value, "currentGate") ? ["currentGate"] : []),
     ...(Object.hasOwn(value, "initialRender") ? ["initialRender"] : []),
     ...(Object.hasOwn(value, "finalRender") ? ["finalRender"] : []),
@@ -902,6 +986,7 @@ export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSess
     session.gateDecisions.length <= 16 &&
     session.gateDecisions.every(gateDecision) &&
     new Set(session.gateDecisions.map(({ id }) => id)).size === session.gateDecisions.length &&
+    (session.pendingChange === undefined || pendingChangeEvidence(session.pendingChange, session.id)) &&
     session.gateDecisions.every((decision) => session.gates.some(({ id }) => id === decision.gateId)) &&
     session.gates.every((historicalGate) => {
       const decisions = session.gateDecisions.filter(({ gateId }) => gateId === historicalGate.id);
