@@ -676,6 +676,29 @@ export async function runMangekyoLoop(
   if (["COMPLETE", "BLOCKED", "FAILED"].includes(working.status)) return working;
   const stopped = await stopCheckpoint(working, dependencies);
   if (stopped !== undefined) return stopped;
+  if (["EDITING", "RUNNING", "CAPTURING", "COMPARING"].includes(working.status)) {
+    const interruptedStatus = working.status;
+    const policyEvidence = working.policyEvaluations.at(-1);
+    const affectedPaths = policyEvidence !== undefined &&
+      policyEvidence.roundNumber === working.rounds.length + 1
+      ? [...new Set(policyEvidence.change.files)]
+      : [];
+    const failed: MangekyoLoopSession = {
+      ...withStatus(working, "FAILED", dependencies),
+      stopReason: affectedPaths.length > 0
+        ? `${interruptedStatus} recovery cannot safely resume: the mutation may have changed target bytes, but exact post-mutation source evidence was not durably linked. Reconcile the recorded affected paths before another change.`
+        : `${interruptedStatus} recovery cannot safely resume: the mutation may have changed target bytes, but authenticated affected paths and exact post-mutation source evidence were not durably linked. Reconciliation is required before another change.`,
+      ...(affectedPaths.length === 0
+        ? {}
+        : {
+            mutationFailure: {
+              targetDisposition: "RECONCILIATION_REQUIRED" as const,
+              affectedPaths,
+            },
+          }),
+    };
+    return persistAndReload(failed, dependencies, "interrupted mutation recovery checkpoint");
+  }
   if (working.status === "IDLE") {
     working = await persistAndReload(
       withStatus(working, "PREPARING", dependencies),

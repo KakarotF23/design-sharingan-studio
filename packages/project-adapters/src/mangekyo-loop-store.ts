@@ -890,6 +890,9 @@ export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSess
         session.mutationFailure.targetDisposition,
       ) &&
       texts(session.mutationFailure.affectedPaths, 128, 512, true) &&
+      session.policyEvaluations.at(-1) !== undefined &&
+      stableJson(session.mutationFailure.affectedPaths) ===
+        stableJson(session.policyEvaluations.at(-1)?.change.files) &&
       session.status === "FAILED"
     )) &&
     (session.stopRequest === undefined || (

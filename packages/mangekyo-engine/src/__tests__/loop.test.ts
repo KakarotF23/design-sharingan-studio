@@ -684,6 +684,99 @@ describe("Mangekyo loop", () => {
     expect(executeCalls).toHaveLength(0);
   });
 
+  it.each([
+    "EDITING",
+    "RUNNING",
+    "CAPTURING",
+    "COMPARING",
+  ] as const)(
+    "fails closed when a replacement worker recovers the durable %s checkpoint without resumable mutation evidence",
+    async (status) => {
+      const { dependencies, trace, executeCalls, saved } = harness([], []);
+      const checkpoint = sessionFixture();
+      checkpoint.status = status;
+      checkpoint.updatedAt = "2026-08-27T01:00:01.000Z";
+      checkpoint.policyEvaluations = [{
+        id: "policy-recovery-1",
+        roundNumber: 1,
+        proposalId: "proposal-recovery-1",
+        change: { kind: "STYLE_CHANGE", files: ["styles.css"] },
+        policy: checkpoint.policy,
+        evaluation: { decision: "ALLOW", reasons: [] },
+        evaluatedAt: checkpoint.updatedAt,
+      }];
+
+      const recovered = await runMangekyoLoop(checkpoint, dependencies);
+
+      expect(recovered).toMatchObject({
+        status: "FAILED",
+        mutationFailure: {
+          targetDisposition: "RECONCILIATION_REQUIRED",
+          affectedPaths: ["styles.css"],
+        },
+        stopReason: expect.stringMatching(
+          new RegExp(`${status}.*mutation may have changed.*source evidence.*not durably`, "i"),
+        ),
+      });
+      expect(recovered.finalRender).toBeUndefined();
+      expect(saved()).toEqual(recovered);
+      expect(trace).toEqual(["persist:FAILED"]);
+      expect(executeCalls).toHaveLength(0);
+
+      const reloaded = await runMangekyoLoop(
+        structuredClone(saved() as MangekyoLoopSession),
+        dependencies,
+      );
+      expect(reloaded).toEqual(recovered);
+      expect(trace).toEqual(["persist:FAILED"]);
+      expect(executeCalls).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    "EDITING",
+    "RUNNING",
+    "CAPTURING",
+    "COMPARING",
+  ] as const)(
+    "lets an exact durable Stop outrank interrupted %s reconciliation without duplicate work",
+    async (status) => {
+      const { dependencies, trace, executeCalls, saved } = harness([], []);
+      const checkpoint = sessionFixture();
+      checkpoint.status = status;
+      checkpoint.updatedAt = "2026-08-27T01:00:01.000Z";
+      checkpoint.policyEvaluations = [{
+        id: "policy-stopped-recovery-1",
+        roundNumber: 1,
+        proposalId: "proposal-stopped-recovery-1",
+        change: { kind: "STYLE_CHANGE", files: ["styles.css"] },
+        policy: checkpoint.policy,
+        evaluation: { decision: "ALLOW", reasons: [] },
+        evaluatedAt: checkpoint.updatedAt,
+      }];
+      dependencies.loadStopRequest = async () => ({
+        id: `stop-${status.toLowerCase()}-recovery`,
+        loopSessionId: checkpoint.id,
+        sessionVersion: checkpoint.updatedAt,
+        requestedAt: "2026-08-27T01:00:02.000Z",
+        requestedBy: "local-user",
+      });
+
+      const stopped = await runMangekyoLoop(checkpoint, dependencies);
+
+      expect(stopped).toMatchObject({
+        status: "BLOCKED",
+        stopRequest: { id: `stop-${status.toLowerCase()}-recovery` },
+        stopReason: expect.stringMatching(/user stopped/i),
+      });
+      expect(stopped.mutationFailure).toBeUndefined();
+      expect(stopped.finalRender).toBeUndefined();
+      expect(saved()).toEqual(stopped);
+      expect(trace).toEqual(["persist:BLOCKED"]);
+      expect(executeCalls).toHaveLength(0);
+    },
+  );
+
   it("Reject blocks the pending gate without executing it", async () => {
     const { dependencies, executeCalls } = harness([], []);
     const persist = dependencies.persist;
