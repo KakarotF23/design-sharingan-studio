@@ -173,6 +173,11 @@ function harness(
       savedSession = structuredClone(session);
     },
     load: async () => structuredClone(savedSession),
+    commitTerminalTransition: async ({ session }) => {
+      trace.push(`persist:${session.status}`);
+      savedSession = structuredClone(session);
+      return { outcome: "COMMITTED", session: structuredClone(session) };
+    },
     executeChange: async ({ session, proposal: pending, authorization }) => {
       trace.push(`execute:${pending.id}`);
       executeCalls.push({ authorization: authorization.kind, proposalId: pending.id });
@@ -306,6 +311,41 @@ describe("Mangekyo loop", () => {
       kind: "GIT",
       worktreeFingerprint: "1".repeat(64),
     });
+  });
+
+  it("lets an exact same-version durable Stop win after the final Stop read but before terminal commit", async () => {
+    const { dependencies } = harness(
+      [proposedChange(1, { kind: "STYLE_CHANGE", files: ["server.mjs"] })],
+      [[]],
+    );
+    let terminalAttempts = 0;
+    Object.assign(dependencies, {
+      commitTerminalTransition: async (input: {
+        expectedVersion: string;
+        session: MangekyoLoopSession;
+      }) => {
+        terminalAttempts += 1;
+        return {
+          outcome: "STOP_WON" as const,
+          stopRequest: {
+            id: "stop-final-race",
+            loopSessionId: input.session.id,
+            sessionVersion: input.expectedVersion,
+            requestedAt: "2026-08-27T01:00:20.000Z",
+            requestedBy: "local-user",
+          },
+        };
+      },
+    });
+
+    const result = await runMangekyoLoop(sessionFixture(), dependencies);
+
+    expect(terminalAttempts).toBe(1);
+    expect(result).toMatchObject({
+      status: "BLOCKED",
+      stopRequest: { id: "stop-final-race" },
+    });
+    expect(result.finalRender).toBeUndefined();
   });
 
   it("rejects a render that is not newer than the final mutation or omits a changed path", () => {
@@ -702,7 +742,7 @@ describe("Mangekyo loop", () => {
     const { dependencies, executeCalls, saved } = harness([], [[]]);
     const gated = sessionFixture();
     gated.status = "HUMAN_GATE";
-    gated.updatedAt = "2026-08-27T01:00:01.000Z";
+    gated.updatedAt = "2026-08-27T01:00:01.100Z";
     const pending = proposedChange(1, {
       kind: "NAVIGATION_CHANGE",
       files: ["server.mjs"],
@@ -728,12 +768,13 @@ describe("Mangekyo loop", () => {
         change: pending.change,
         policy: gated.policy,
         evaluation: { decision: "HUMAN_GATE", reasons: ["Navigation changes are disabled."] },
-        evaluatedAt: gated.updatedAt,
+        evaluatedAt: "2026-08-27T01:00:01.000Z",
       },
     ];
     let claimed = false;
     const observed: unknown[] = [];
     Object.assign(dependencies, {
+      now: () => new Date("2026-08-27T01:00:02.000Z"),
       claimGateDecision: async (claim: unknown) => {
         observed.push(structuredClone(claim));
         if (claimed) throw new Error("Mangekyo Human Gate was already decided");
@@ -759,7 +800,7 @@ describe("Mangekyo loop", () => {
     expect(observed).toHaveLength(2);
     expect(observed[0]).toMatchObject({
       loopSessionId: "mangekyo-1",
-      sessionVersion: "2026-08-27T01:00:01.000Z",
+      sessionVersion: "2026-08-27T01:00:01.100Z",
       gateId: "gate-1",
     });
     expect(
@@ -773,6 +814,7 @@ describe("Mangekyo loop", () => {
     const { dependencies, executeCalls } = harness([], [[]]);
     const gated = sessionFixture();
     gated.status = "HUMAN_GATE";
+    gated.updatedAt = "2026-08-27T01:00:01.100Z";
     gated.updatedAt = "2026-08-27T01:00:01.000Z";
     const pending = proposedChange(1, {
       kind: "NAVIGATION_CHANGE",
@@ -842,7 +884,7 @@ describe("Mangekyo loop", () => {
       proposal: pending.proposal,
       proposalThreadId: pending.proposalThreadId,
       policyEvaluationId: "policy-navigation",
-      requestedAt: "2026-08-27T01:00:01.000Z",
+      requestedAt: gated.updatedAt,
       reasons: ["Navigation changes are disabled."],
       affectedScope: pending.affectedScope,
       impact: pending.impact,
@@ -858,6 +900,7 @@ describe("Mangekyo loop", () => {
         evaluatedAt: "2026-08-27T01:00:01.000Z",
       },
     ];
+    dependencies.now = () => new Date("2026-08-27T01:00:02.000Z");
 
     const result = await resolveHumanGate(
       gated,
@@ -884,6 +927,7 @@ describe("Mangekyo loop", () => {
     const { dependencies, executeCalls } = harness([], [[]]);
     const gated = sessionFixture();
     gated.status = "HUMAN_GATE";
+    gated.updatedAt = "2026-08-27T01:00:01.100Z";
     const pending = proposedChange(1, {
       kind: "NAVIGATION_CHANGE",
       files: ["server.mjs"],
@@ -895,7 +939,7 @@ describe("Mangekyo loop", () => {
       proposal: pending.proposal,
       proposalThreadId: pending.proposalThreadId,
       policyEvaluationId: "policy-navigation",
-      requestedAt: "2026-08-27T01:00:01.000Z",
+      requestedAt: gated.updatedAt,
       reasons: ["Navigation changes are disabled."],
       affectedScope: pending.affectedScope,
       impact: pending.impact,
@@ -911,6 +955,7 @@ describe("Mangekyo loop", () => {
         evaluatedAt: "2026-08-27T01:00:01.000Z",
       },
     ];
+    dependencies.now = () => new Date("2026-08-27T01:00:02.000Z");
 
     const result = await resolveHumanGate(
       gated,

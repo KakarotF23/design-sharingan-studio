@@ -878,6 +878,25 @@ it.each(["dist/styles.css", "build/client.js"])(
   },
 );
 
+it("bounds the complete unversioned union after required-path dedupe", async () => {
+  const active = await workspace();
+  for (let index = 0; index < 512; index += 1) {
+    await writeFile(
+      join(active.rootPath, `source-${String(index).padStart(3, "0")}.txt`),
+      "x",
+    );
+  }
+  await mkdir(join(active.rootPath, "dist"));
+  await writeFile(join(active.rootPath, "dist", "styles.css"), "approved\n");
+
+  await expect(
+    captureWorkspaceSourceRevision(active, ["dist/styles.css"]),
+  ).rejects.toThrow(/complete render-input file bound/i);
+
+  const duplicate = await captureWorkspaceSourceRevision(active, ["source-000.txt"]);
+  expect(duplicate).toMatchObject({ kind: "UNVERSIONED", fileCount: 512 });
+});
+
 it.each(["symlink", "hardlink", "oversized"] as const)(
   "rejects %s coverage for an excluded required source path",
   async (kind) => {

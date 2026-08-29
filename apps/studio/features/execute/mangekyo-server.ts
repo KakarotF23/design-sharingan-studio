@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   executeApproveOnceMutation,
   executePolicyAuthorizedMutation,
@@ -25,6 +26,8 @@ import {
 import {
   claimMangekyoActiveLoop,
   claimMangekyoGateDecision,
+  claimMangekyoWorkerLease,
+  commitMangekyoTerminalTransition,
   consumeMangekyoApproveOnceAuthorization,
   detectProject,
   listReferences,
@@ -33,9 +36,11 @@ import {
   loadMangekyoActiveLoopClaim,
   loadMangekyoLoopSession,
   loadMangekyoStopRequest,
+  loadMangekyoWorkerLease,
   loadSafeExecutionState,
   releaseMangekyoActiveLoop,
   releaseMangekyoGateDecisionClaim,
+  releaseMangekyoWorkerLease,
   requestMangekyoStop,
   saveMangekyoAuthorization,
   saveMangekyoLoopSession,
@@ -61,6 +66,7 @@ const RENDER_TARGET = {
   viewport: { name: "desktop", width: 1280, height: 720 },
 } as const;
 const START_STOP_WINDOW_MS = 1_000;
+const WORKER_LEASE_MS = 60_000;
 
 const mangekyoWorkers = new Map<string, Promise<void>>();
 
@@ -181,6 +187,13 @@ export async function loadMangekyoContext(project: Project): Promise<{
   const stopRequest = session === undefined || isTerminalStatus(session.status)
     ? session?.stopRequest
     : await loadMangekyoStopRequest(project.rootPath, project.id, session.id);
+  if (
+    session !== undefined &&
+    !isTerminalStatus(session.status) &&
+    session.status !== "HUMAN_GATE"
+  ) {
+    await recoverMangekyoLoop(project, references, session);
+  }
   return {
     references,
     ...(session === undefined ? {} : { session }),
@@ -302,6 +315,11 @@ async function loopDependencies(input: {
       input.project.id,
       sessionId,
     ).catch(() => undefined),
+    commitTerminalTransition: ({ expectedVersion, session }) =>
+      commitMangekyoTerminalTransition(input.project.rootPath, input.project.id, {
+        expectedVersion,
+        session,
+      }),
     async executeChange({ session, proposal, proposalThreadId, change, authorization }) {
       if (authorization.kind === "APPROVE_ONCE") {
         const persistedDecision = session.gateDecisions.find(
@@ -313,7 +331,7 @@ async function loopDependencies(input: {
         );
         if (
           persistedDecision === undefined ||
-          JSON.stringify(persistedDecision) !== JSON.stringify(authorization.decision) ||
+          !isDeepStrictEqual(persistedDecision, authorization.decision) ||
           gate === undefined ||
           policyEvaluation === undefined
         ) {
@@ -469,9 +487,14 @@ async function runPersistedMangekyoLoop(input: {
   safe: SafeExecutionEditingSession;
   references: Reference[];
   session: MangekyoLoopSession;
-}): Promise<void> {
+}): Promise<boolean> {
   let analysisPath: string | undefined;
   try {
+    const durableSession = await loadMangekyoLoopSession(
+      input.project.rootPath,
+      input.project.id,
+      input.session.id,
+    );
     analysisPath = await createAnalysisStagingDirectory(input.project.rootPath);
     await writeFile(
       join(analysisPath, "loop-context.json"),
@@ -481,9 +504,9 @@ async function runPersistedMangekyoLoop(input: {
           routes: input.workspace.routes,
           components: input.workspace.componentDirectories,
         },
-        approvedDirection: input.session.approvedDirection,
-        renderTarget: input.session.renderTarget,
-        referenceIds: input.session.referenceIds,
+        approvedDirection: durableSession.approvedDirection,
+        renderTarget: durableSession.renderTarget,
+        referenceIds: durableSession.referenceIds,
       }, null, 2)}\n`,
       { mode: 0o600 },
     );
@@ -494,8 +517,9 @@ async function runPersistedMangekyoLoop(input: {
       references: input.references,
       analysisPath,
     });
-    const completed = await runMangekyoLoop(input.session, dependencies);
+    const completed = await runMangekyoLoop(durableSession, dependencies);
     await releaseTerminalClaim(input.project, completed);
+    return completed.status === "HUMAN_GATE" || isTerminalStatus(completed.status);
   } catch (error) {
     try {
       const persisted = await loadMangekyoLoopSession(
@@ -515,9 +539,12 @@ async function runPersistedMangekyoLoop(input: {
         };
         await saveMangekyoLoopSession(input.project.rootPath, failed);
         await releaseTerminalClaim(input.project, failed);
+        return true;
       }
+      return true;
     } catch {
       // Retain the durable claim when persistence or reconciliation is ambiguous.
+      return false;
     }
   } finally {
     if (analysisPath !== undefined) {
@@ -526,18 +553,64 @@ async function runPersistedMangekyoLoop(input: {
   }
 }
 
-function scheduleMangekyoLoop(input: Parameters<typeof runPersistedMangekyoLoop>[0]): void {
+async function scheduleMangekyoLoop(
+  input: Parameters<typeof runPersistedMangekyoLoop>[0],
+): Promise<void> {
   const key = `${input.project.id}:${input.session.id}`;
   if (mangekyoWorkers.has(key)) return;
+  const acquiredAt = new Date().toISOString();
+  const lease = {
+    loopSessionId: input.session.id,
+    sessionVersion: input.session.updatedAt,
+    workerId: randomUUID(),
+    acquiredAt,
+    expiresAt: new Date(Date.parse(acquiredAt) + WORKER_LEASE_MS).toISOString(),
+  };
+  const leaseReady = claimMangekyoWorkerLease(
+    input.project.rootPath,
+    input.project.id,
+    lease,
+    acquiredAt,
+  );
   let worker: Promise<void>;
-  worker = new Promise<void>((resolve) => {
-    setTimeout(() => {
-      void runPersistedMangekyoLoop(input).finally(() => resolve());
-    }, START_STOP_WINDOW_MS);
-  }).finally(() => {
+  worker = leaseReady.then(async () => {
+    await new Promise<void>((resolve) => setTimeout(resolve, START_STOP_WINDOW_MS));
+    const safelyStopped = await runPersistedMangekyoLoop(input);
+    if (safelyStopped) {
+      await releaseMangekyoWorkerLease(input.project.rootPath, input.project.id, lease);
+    }
+  }).catch(() => undefined).finally(() => {
     if (mangekyoWorkers.get(key) === worker) mangekyoWorkers.delete(key);
   });
   mangekyoWorkers.set(key, worker);
+  await leaseReady;
+}
+
+async function recoverMangekyoLoop(
+  project: Project,
+  allReferences: Reference[],
+  session: MangekyoLoopSession,
+): Promise<void> {
+  const key = `${project.id}:${session.id}`;
+  if (mangekyoWorkers.has(key)) return;
+  await requireActiveClaim(project, session);
+  const safe = await loadSafeExecutionState(project.rootPath, project.id);
+  if (safe.id !== session.sourceExecutionSessionId || safe.status !== "EDITING") {
+    throw new Error("Mangekyo recovery source execution evidence is stale");
+  }
+  const references = allReferences.filter(({ id }) => session.referenceIds.includes(id));
+  if (
+    references.length !== session.referenceIds.length ||
+    references.some(({ imagePath }) => typeof imagePath !== "string")
+  ) {
+    throw new Error("Mangekyo recovery reference evidence is missing or stale");
+  }
+  const workspace = await workspaceFor(project);
+  const liveLease = await loadMangekyoWorkerLease(project.rootPath, project.id);
+  if (liveLease !== undefined && Date.parse(liveLease.expiresAt) > Date.now()) {
+    throw new Error("A live durable Mangekyo worker lease is not owned by this server process");
+  }
+  await scheduleMangekyoLoop({ project, workspace, safe, references, session });
 }
 
 export async function startMangekyoLoop(
@@ -616,7 +689,7 @@ export async function startMangekyoLoop(
     }
     throw error;
   }
-  scheduleMangekyoLoop({ project, workspace, safe, references, session });
+  await scheduleMangekyoLoop({ project, workspace, safe, references, session });
   return { references: allReferences, session };
 }
 
@@ -640,8 +713,34 @@ export async function decideMangekyoGate(
     throw new Error("Mangekyo reference evidence is missing or stale");
   }
   const workspace = await workspaceFor(project);
+  const key = `${project.id}:${session.id}`;
+  if (mangekyoWorkers.has(key)) {
+    throw new Error("Mangekyo loop work is already active for this session");
+  }
+  const acquiredAt = new Date().toISOString();
+  const lease = {
+    loopSessionId: session.id,
+    sessionVersion: session.updatedAt,
+    workerId: randomUUID(),
+    acquiredAt,
+    expiresAt: new Date(Date.parse(acquiredAt) + WORKER_LEASE_MS).toISOString(),
+  };
   const analysisPath = await createAnalysisStagingDirectory(project.rootPath);
+  let finishOwner: () => void = () => undefined;
+  const owner = new Promise<void>((resolve) => {
+    finishOwner = resolve;
+  });
+  mangekyoWorkers.set(key, owner);
+  let leaseClaimed = false;
+  let completed: MangekyoLoopSession | undefined;
   try {
+    await claimMangekyoWorkerLease(
+      project.rootPath,
+      project.id,
+      lease,
+      acquiredAt,
+    );
+    leaseClaimed = true;
     const dependencies = await loopDependencies({ project, workspace, safe, references, analysisPath });
     const resolution: HumanGateResolution = decision === "EXPAND_SCOPE"
       ? {
@@ -650,12 +749,30 @@ export async function decideMangekyoGate(
           expandKind: session.currentGate.requestedChange.kind,
         }
       : { decision, decidedBy: "local-user" };
-    const completed = await resolveHumanGate(session, resolution, dependencies);
+    completed = await resolveHumanGate(session, resolution, dependencies);
     await releaseTerminalClaim(project, completed);
-    return { references: allReferences, session: completed };
   } finally {
-    await rm(analysisPath, { force: true, recursive: true });
+    const cleanupErrors: unknown[] = [];
+    await rm(analysisPath, { force: true, recursive: true }).catch((error: unknown) => {
+      cleanupErrors.push(error);
+    });
+    if (leaseClaimed && completed !== undefined) {
+      await releaseMangekyoWorkerLease(project.rootPath, project.id, lease).catch(
+        (error: unknown) => cleanupErrors.push(error),
+      );
+    }
+    finishOwner();
+    if (mangekyoWorkers.get(key) === owner) mangekyoWorkers.delete(key);
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(cleanupErrors, "Mangekyo worker cleanup is ambiguous");
+    }
   }
+  if (completed === undefined) throw new Error("Mangekyo gate resolution did not persist a result");
+  if (!isTerminalStatus(completed.status) && completed.status !== "HUMAN_GATE") {
+    await scheduleMangekyoLoop({ project, workspace, safe, references, session: completed });
+  }
+  return { references: allReferences, session: completed };
 }
 
 export async function stopMangekyoLoop(
@@ -698,6 +815,6 @@ export async function stopMangekyoLoop(
     requestedBy: "local-user",
   });
   const workspace = await workspaceFor(project);
-  scheduleMangekyoLoop({ project, workspace, safe, references, session });
+  await scheduleMangekyoLoop({ project, workspace, safe, references, session });
   return { references: allReferences, session, stopRequest };
 }

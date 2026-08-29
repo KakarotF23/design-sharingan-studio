@@ -616,6 +616,9 @@ async function captureUnversionedSnapshot(
     ...await unversionedSourcePaths(workspace.rootPath),
     ...requiredPaths,
   ])];
+  if (paths.length > MAX_GIT_ENTRIES) {
+    throw new Error("Unversioned source evidence exceeded the complete render-input file bound");
+  }
   return {
     kind: "UNVERSIONED",
     available: true,

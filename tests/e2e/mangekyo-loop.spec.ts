@@ -304,6 +304,27 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
   await page.reload();
   await page.getByRole("button", { name: "Mangekyō" }).click();
   await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible();
+  const approveResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith("/mangekyo/decision"),
+  );
+  await page.getByRole("button", { name: "Approve Once" }).click();
+  const approveResult = await approveResponse;
+  const approvePayload = await approveResult.json() as { session?: { id?: string; status?: string } };
+  expect({ status: approveResult.status(), payload: approvePayload }).toMatchObject({
+    status: 200,
+    payload: { session: { status: "FIXING" } },
+  });
+  await expect(
+    page.getByLabel("Current visual round").getByText("FIXING", { exact: true }),
+  ).toBeVisible({ timeout: 20_000 });
+  await page.reload();
+  await page.getByRole("button", { name: "Mangekyō" }).click();
+  await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible({
+    timeout: 20_000,
+  });
+  expect(await readFile(join(projectPath, "server.mjs"), "utf8")).toContain(
+    "data-mangekyo-navigation=\"approved\"",
+  );
   await expect(page.getByRole("button", { name: "Stop visual loop" })).toBeVisible();
   await page.getByRole("button", { name: "Stop visual loop" }).click();
   await expect(page.getByText("BLOCKED", { exact: true })).toBeVisible();

@@ -1516,6 +1516,11 @@ export class MutationExecutor {
         this.options.mutationDriver ?? defaultMutationDriver,
       );
       targetMutationApplied = true;
+      // Git is observational evidence and may await an external process. Gather
+      // it before the transaction's final authenticated source snapshot and
+      // applied-byte verification so no asynchronous interval remains after
+      // the exact mutation evidence is established.
+      const git = await captureGitAfter(rootPath, gitBefore, deltas);
       let sourceRevision: RenderSourceRevision | undefined;
       if (this.options.captureSourceRevision !== undefined) {
         await validateAppliedDelta(deltas);
@@ -1528,13 +1533,15 @@ export class MutationExecutor {
           sourceRevision.available !== true ||
           sourceRevision.truncated ||
           !/^[0-9a-f]{64}$/.test(sourceRevision.worktreeFingerprint) ||
+          !Number.isSafeInteger(sourceRevision.fileCount) ||
+          sourceRevision.fileCount < sourceRevision.requiredPathEvidence.length ||
+          sourceRevision.fileCount > 512 ||
           stableJson(sourceRevision.requiredPathEvidence) !==
             stableJson(expectedSourcePathEvidence(deltas))
         ) {
           throw new Error("Post-mutation source evidence does not match the exact applied bytes and modes");
         }
       }
-      const git = await captureGitAfter(rootPath, gitBefore, deltas);
       return {
         proposalId: proposal.id,
         threadId: result.threadId,

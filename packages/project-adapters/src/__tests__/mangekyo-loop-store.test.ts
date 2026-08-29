@@ -8,10 +8,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   claimMangekyoGateDecision,
   claimMangekyoActiveLoop,
+  claimMangekyoWorkerLease,
+  commitMangekyoTerminalTransition,
   consumeMangekyoApproveOnceAuthorization,
   isMangekyoLoopSession,
   loadMangekyoActiveLoopClaim,
   loadMangekyoStopRequest,
+  loadMangekyoWorkerLease,
   loadMangekyoAuthorization,
   loadMangekyoLoopSession,
   loadMangekyoRenderImage,
@@ -20,6 +23,7 @@ import {
   requestMangekyoStop,
   releaseMangekyoActiveLoop,
   releaseMangekyoGateDecisionClaim,
+  releaseMangekyoWorkerLease,
 } from "../mangekyo-loop-store";
 import { ensureDesignWorkspace, saveProjectMetadata } from "../workspace-store";
 
@@ -237,6 +241,16 @@ function completeSessionFixture(rootPath: string): MangekyoLoopSession {
   return session;
 }
 
+function decidingSessionFixture(rootPath: string): MangekyoLoopSession {
+  const session = completeSessionFixture(rootPath);
+  session.status = "DECIDING";
+  session.updatedAt = "2026-08-27T01:00:05.000Z";
+  session.rounds[0]!.round.status = "DECIDING";
+  delete session.finalRender;
+  delete session.stopReason;
+  return session;
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { force: true, recursive: true })));
 });
@@ -408,6 +422,9 @@ describe("Mangekyo loop persistence", () => {
       const project = await projectFixture();
       const session = sessionFixture(project.rootPath);
       const gate = structuredClone(session.currentGate as NonNullable<typeof session.currentGate>);
+      session.policyEvaluations[0]!.evaluatedAt = "2026-08-27T01:00:02.000Z";
+      gate.requestedAt = "2026-08-27T01:00:02.100Z";
+      session.gates = [structuredClone(gate)];
       const decision = {
         id: `decision-${decisionKind.toLowerCase()}`,
         gateId: gate.id,
@@ -736,6 +753,67 @@ describe("Mangekyo loop persistence", () => {
     ).resolves.toEqual(request);
   });
 
+  it("rejects a late Stop after the exact terminal session commit without leaving Stop evidence", async () => {
+    const project = await projectFixture();
+    const deciding = decidingSessionFixture(project.rootPath);
+    const terminal = completeSessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", terminal.id), {
+      recursive: true,
+    });
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    await writeFile(terminal.initialRender?.imagePath as string, png);
+    await writeFile(terminal.finalRender?.imagePath as string, png);
+    await saveMangekyoLoopSession(project.rootPath, deciding);
+    await expect(commitMangekyoTerminalTransition(project.rootPath, project.id, {
+      expectedVersion: deciding.updatedAt,
+      session: terminal,
+    })).resolves.toEqual({ outcome: "COMMITTED", session: terminal });
+
+    await expect(requestMangekyoStop(project.rootPath, project.id, {
+      id: "late-stop",
+      loopSessionId: terminal.id,
+      sessionVersion: deciding.updatedAt,
+      requestedAt: "2026-08-27T01:00:07.000Z",
+      requestedBy: "local-user",
+    })).rejects.toThrow(/already terminal/i);
+    await expect(loadMangekyoStopRequest(
+      project.rootPath,
+      project.id,
+      terminal.id,
+    )).resolves.toBeUndefined();
+  });
+
+  it("lets an exact Stop claim win the durable post-read terminal CAS", async () => {
+    const project = await projectFixture();
+    const deciding = decidingSessionFixture(project.rootPath);
+    const terminal = completeSessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", deciding.id), {
+      recursive: true,
+    });
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    await writeFile(deciding.initialRender?.imagePath as string, png);
+    await writeFile(deciding.rounds[0]?.round.afterRender?.imagePath as string, png);
+    await saveMangekyoLoopSession(project.rootPath, deciding);
+    const stopRequest = {
+      id: "stop-wins-terminal-cas",
+      loopSessionId: deciding.id,
+      sessionVersion: deciding.updatedAt,
+      requestedAt: "2026-08-27T01:00:05.500Z",
+      requestedBy: "local-user",
+    };
+    await requestMangekyoStop(project.rootPath, project.id, stopRequest);
+
+    await expect(commitMangekyoTerminalTransition(project.rootPath, project.id, {
+      expectedVersion: deciding.updatedAt,
+      session: terminal,
+    })).resolves.toEqual({ outcome: "STOP_WON", stopRequest });
+    await expect(loadMangekyoLoopSession(
+      project.rootPath,
+      project.id,
+      deciding.id,
+    )).resolves.toEqual(deciding);
+  });
+
   it("serializes a Stop request against a Human Gate decision for the same session version", async () => {
     const project = await projectFixture();
     const outcomes = await Promise.allSettled([
@@ -758,6 +836,94 @@ describe("Mangekyo loop persistence", () => {
 
     expect(outcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
     expect(outcomes.filter(({ status }) => status === "rejected")).toHaveLength(1);
+  });
+
+  it("recovers one exact expired durable worker lease without duplicating a live owner or blocking Stop", async () => {
+    const project = await projectFixture();
+    const session = sessionFixture(project.rootPath);
+    await mkdir(join(project.rootPath, ".design-sharingan", "renders", session.id), {
+      recursive: true,
+    });
+    await writeFile(
+      session.initialRender?.imagePath as string,
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    );
+    await saveMangekyoLoopSession(project.rootPath, session);
+    await claimMangekyoActiveLoop(project.rootPath, project.id, {
+      loopSessionId: session.id,
+      sourceExecutionSessionId: session.sourceExecutionSessionId,
+      claimedAt: session.createdAt,
+    });
+    const first = {
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      workerId: "worker-before-restart",
+      acquiredAt: "2026-08-27T01:00:03.000Z",
+      expiresAt: "2026-08-27T01:00:04.000Z",
+    };
+    await claimMangekyoWorkerLease(project.rootPath, project.id, first, first.acquiredAt);
+    await expect(
+      claimMangekyoWorkerLease(project.rootPath, project.id, first, first.acquiredAt),
+    ).resolves.toBeUndefined();
+    await expect(claimMangekyoWorkerLease(project.rootPath, project.id, {
+      ...first,
+      workerId: "duplicate-live-worker",
+      acquiredAt: "2026-08-27T01:00:03.500Z",
+      expiresAt: "2026-08-27T01:00:04.500Z",
+    }, "2026-08-27T01:00:03.500Z")).rejects.toThrow(/live.*worker lease/i);
+
+    const stop = {
+      id: "stop-during-lost-worker",
+      loopSessionId: session.id,
+      sessionVersion: session.updatedAt,
+      requestedAt: "2026-08-27T01:00:03.600Z",
+      requestedBy: "local-user",
+    };
+    await expect(requestMangekyoStop(project.rootPath, project.id, stop)).resolves.toEqual(stop);
+
+    const recovered = {
+      ...first,
+      workerId: "worker-after-restart",
+      acquiredAt: "2026-08-27T01:00:05.000Z",
+      expiresAt: "2026-08-27T01:00:06.000Z",
+    };
+    await claimMangekyoWorkerLease(
+      project.rootPath,
+      project.id,
+      recovered,
+      recovered.acquiredAt,
+    );
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toEqual(recovered);
+    await releaseMangekyoWorkerLease(project.rootPath, project.id, recovered);
+    await expect(loadMangekyoWorkerLease(project.rootPath, project.id)).resolves.toBeUndefined();
+
+    await writeFile(
+      join(
+        project.rootPath,
+        ".design-sharingan",
+        "cache",
+        "mangekyo-claims",
+        "worker-lease.lock",
+      ),
+      `${JSON.stringify(first)}\n`,
+    );
+    const afterOrphanedRecoveryLock = {
+      ...first,
+      workerId: "worker-after-orphaned-recovery-lock",
+      acquiredAt: "2026-08-27T01:00:07.000Z",
+      expiresAt: "2026-08-27T01:00:08.000Z",
+    };
+    await expect(claimMangekyoWorkerLease(
+      project.rootPath,
+      project.id,
+      afterOrphanedRecoveryLock,
+      afterOrphanedRecoveryLock.acquiredAt,
+    )).resolves.toBeUndefined();
+    await releaseMangekyoWorkerLease(
+      project.rootPath,
+      project.id,
+      afterOrphanedRecoveryLock,
+    );
   });
 
   it("durably and immutably consumes one exact Approve Once authorization", async () => {

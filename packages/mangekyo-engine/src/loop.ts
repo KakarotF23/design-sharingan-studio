@@ -70,6 +70,13 @@ export interface MangekyoLoopDependencies {
   ): Promise<ProposedVisualChange>;
   persist(session: MangekyoLoopSession): Promise<void>;
   load(sessionId: string): Promise<MangekyoLoopSession | undefined>;
+  commitTerminalTransition(input: {
+    expectedVersion: string;
+    session: MangekyoLoopSession;
+  }): Promise<
+    | { outcome: "COMMITTED"; session: MangekyoLoopSession }
+    | { outcome: "STOP_WON"; stopRequest: MangekyoStopRequest }
+  >;
   executeChange(input: {
     session: MangekyoLoopSession;
     proposal: ChangeProposal;
@@ -557,6 +564,34 @@ async function finalizeDecidingRound(
     ...(stop.pass ? { finalRender: afterRender } : {}),
     ...(stop.stop || stop.pass ? { stopReason: stop.reason } : {}),
   };
+  if (["COMPLETE", "BLOCKED", "FAILED"].includes(nextStatus) && stopRequest === undefined) {
+    const transition = await dependencies.commitTerminalTransition({
+      expectedVersion: session.updatedAt,
+      session: cloneSession(finalized),
+    });
+    if (transition.outcome === "COMMITTED") return cloneSession(transition.session);
+    if (
+      transition.stopRequest.sessionVersion !== session.updatedAt ||
+      !validStopRequest(transition.stopRequest, session)
+    ) {
+      throw new Error("The terminal transition lost to stale or ambiguous Stop evidence");
+    }
+    const { finalRender: _finalRender, ...withoutFinalPass } = finalized;
+    return persistAndReload(
+      {
+        ...withoutFinalPass,
+        status: "BLOCKED",
+        updatedAt: timestamp(dependencies),
+        rounds: finalized.rounds.map((entry, index) => index === finalized.rounds.length - 1
+          ? { ...structuredClone(entry), round: { ...structuredClone(entry.round), status: "BLOCKED" } }
+          : structuredClone(entry)),
+        stopRequest: structuredClone(transition.stopRequest),
+        stopReason: "The user stopped the visual loop before completion.",
+      },
+      dependencies,
+      "terminal Stop checkpoint",
+    );
+  }
   return persistAndReload(finalized, dependencies, "visual round checkpoint");
 }
 

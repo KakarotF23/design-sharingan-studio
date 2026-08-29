@@ -641,6 +641,7 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
   }
   for (const decision of session.gateDecisions) {
     const historicalGate = session.gates.find(({ id }) => id === decision.gateId);
+    const latestPolicyEvaluation = session.policyEvaluations.at(-1);
     const linkedRounds = session.rounds.filter(
       ({ gateDecisionId }) => gateDecisionId === decision.id,
     );
@@ -648,8 +649,8 @@ function semanticSessionRelations(session: MangekyoLoopSession): boolean {
     const exactPendingGate = historicalGate !== undefined &&
       historicalGate.roundNumber === session.rounds.length + 1 &&
       historicalGate.proposal.sessionId === session.id &&
-      session.policyEvaluations.at(-1)?.id === historicalGate.policyEvaluationId &&
-      historicalGate.requestedAt === session.policyEvaluations.at(-1)?.evaluatedAt &&
+      latestPolicyEvaluation?.id === historicalGate.policyEvaluationId &&
+      Date.parse(historicalGate.requestedAt) >= Date.parse(latestPolicyEvaluation.evaluatedAt) &&
       Date.parse(decision.createdAt) >= Date.parse(historicalGate.requestedAt) &&
       session.currentGate === undefined &&
       isLatestDecision;
@@ -1275,7 +1276,10 @@ function gateDecisionClaim(value: unknown): value is MangekyoGateDecisionClaim {
   );
 }
 
-function gateActionClaimPath(directory: string, claim: MangekyoGateDecisionClaim): string {
+function actionClaimPath(
+  directory: string,
+  claim: { loopSessionId: string; sessionVersion: string },
+): string {
   const digest = createHash("sha256")
     .update(`${claim.loopSessionId}\0${claim.sessionVersion}`)
     .digest("hex");
@@ -1291,7 +1295,7 @@ export async function claimMangekyoGateDecision(
     throw new Error("Mangekyo Human Gate claim is invalid");
   }
   const directory = await mangekyoClaimRoot(rootPath, projectId);
-  const path = gateActionClaimPath(directory, claim);
+  const path = actionClaimPath(directory, claim);
   await writeExclusiveClaim(
     directory,
     path.slice(directory.length + 1),
@@ -1307,7 +1311,7 @@ export async function releaseMangekyoGateDecisionClaim(
 ): Promise<void> {
   if (!gateDecisionClaim(claim)) throw new Error("Mangekyo Human Gate claim is invalid");
   const directory = await mangekyoClaimRoot(rootPath, projectId);
-  const path = gateActionClaimPath(directory, claim);
+  const path = actionClaimPath(directory, claim);
   const before = await lstat(path).catch(() => undefined);
   if (
     before === undefined ||
@@ -1386,6 +1390,76 @@ function stopRequest(value: unknown): value is MangekyoStopRequest {
   );
 }
 
+interface MangekyoTerminalTransitionClaim {
+  kind: "TERMINAL_TRANSITION";
+  loopSessionId: string;
+  sessionVersion: string;
+  terminalVersion: string;
+  terminalStatus: "COMPLETE" | "BLOCKED" | "FAILED";
+}
+
+function terminalTransitionClaim(value: unknown): value is MangekyoTerminalTransitionClaim {
+  return (
+    exact(value, [
+      "kind",
+      "loopSessionId",
+      "sessionVersion",
+      "terminalVersion",
+      "terminalStatus",
+    ]) &&
+    value.kind === "TERMINAL_TRANSITION" &&
+    identifier(value.loopSessionId) &&
+    iso(value.sessionVersion) &&
+    iso(value.terminalVersion) &&
+    Date.parse(value.terminalVersion as string) > Date.parse(value.sessionVersion as string) &&
+    ["COMPLETE", "BLOCKED", "FAILED"].includes(value.terminalStatus as string)
+  );
+}
+
+async function removeExactClaimFile(
+  directory: string,
+  path: string,
+  expected: unknown,
+): Promise<void> {
+  const before = await lstat(path).catch(() => undefined);
+  if (
+    before === undefined ||
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.nlink !== 1 ||
+    before.size < 2 ||
+    before.size > MAX_CLAIM_BYTES
+  ) {
+    throw new Error("The exact Mangekyo action claim is missing or ambiguous");
+  }
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    const parsed = JSON.parse(await handle.readFile("utf8")) as unknown;
+    if (
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      stableJson(parsed) !== stableJson(expected)
+    ) {
+      throw new Error("The exact Mangekyo action claim is missing or ambiguous");
+    }
+  } finally {
+    await handle.close();
+  }
+  const current = await lstat(path);
+  if (current.dev !== before.dev || current.ino !== before.ino || current.size !== before.size) {
+    throw new Error("The Mangekyo action claim changed before safe release");
+  }
+  await rm(path);
+  const directoryHandle = await open(directory, constants.O_RDONLY);
+  try {
+    await directoryHandle.sync();
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
 async function stopRequests(
   directory: string,
   loopSessionId: string,
@@ -1427,6 +1501,82 @@ async function stopRequests(
   return requests;
 }
 
+export async function commitMangekyoTerminalTransition(
+  rootPath: string,
+  projectId: string,
+  input: {
+    expectedVersion: string;
+    session: MangekyoLoopSession;
+  },
+): Promise<
+  | { outcome: "COMMITTED"; session: MangekyoLoopSession }
+  | { outcome: "STOP_WON"; stopRequest: MangekyoStopRequest }
+> {
+  if (
+    !exact(input, ["expectedVersion", "session"]) ||
+    !iso(input.expectedVersion) ||
+    !isMangekyoLoopSession(input.session) ||
+    input.session.projectId !== projectId ||
+    !["COMPLETE", "BLOCKED", "FAILED"].includes(input.session.status) ||
+    input.session.stopRequest !== undefined
+  ) {
+    throw new Error("Mangekyo terminal transition is invalid");
+  }
+  const claim: MangekyoTerminalTransitionClaim = {
+    kind: "TERMINAL_TRANSITION",
+    loopSessionId: input.session.id,
+    sessionVersion: input.expectedVersion,
+    terminalVersion: input.session.updatedAt,
+    terminalStatus: input.session.status as MangekyoTerminalTransitionClaim["terminalStatus"],
+  };
+  if (!terminalTransitionClaim(claim)) {
+    throw new Error("Mangekyo terminal transition is invalid");
+  }
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const path = actionClaimPath(directory, claim);
+  try {
+    await writeExclusiveClaim(
+      directory,
+      path.slice(directory.length + 1),
+      claim,
+      "Mangekyo session version already has an action",
+    );
+  } catch (error) {
+    const requests = await stopRequests(directory, claim.loopSessionId);
+    if (requests.length === 1 && requests[0]?.sessionVersion === claim.sessionVersion) {
+      return { outcome: "STOP_WON", stopRequest: structuredClone(requests[0]) };
+    }
+    throw error;
+  }
+
+  const current = await loadMangekyoLoopSession(rootPath, projectId, claim.loopSessionId);
+  const projectedCurrent = structuredClone(input.session);
+  projectedCurrent.status = "DECIDING";
+  projectedCurrent.updatedAt = input.expectedVersion;
+  projectedCurrent.finalRender = undefined;
+  projectedCurrent.stopReason = current.stopReason;
+  projectedCurrent.rounds = projectedCurrent.rounds.map((entry, index) =>
+    index === projectedCurrent.rounds.length - 1
+      ? { ...entry, round: { ...entry.round, status: "DECIDING" } }
+      : entry,
+  );
+  if (
+    current.status !== "DECIDING" ||
+    current.updatedAt !== input.expectedVersion ||
+    stableJson(current) !== stableJson(projectedCurrent)
+  ) {
+    throw new Error("The durable Mangekyo session changed before terminal commit");
+  }
+
+  await saveMangekyoLoopSession(rootPath, input.session);
+  const committed = await loadMangekyoLoopSession(rootPath, projectId, input.session.id);
+  if (stableJson(committed) !== stableJson(input.session)) {
+    throw new Error("The durable Mangekyo terminal commit is ambiguous");
+  }
+  await removeExactClaimFile(directory, path, claim);
+  return { outcome: "COMMITTED", session: committed };
+}
+
 export async function requestMangekyoStop(
   rootPath: string,
   projectId: string,
@@ -1437,15 +1587,28 @@ export async function requestMangekyoStop(
   const existing = await stopRequests(directory, request.loopSessionId);
   if (existing.length > 1) throw new Error("Mangekyo Stop request is ambiguous");
   if (existing[0] !== undefined) return structuredClone(existing[0]);
-  const digest = createHash("sha256")
-    .update(`${request.loopSessionId}\0${request.sessionVersion}`)
-    .digest("hex");
+  const path = actionClaimPath(directory, request);
   await writeExclusiveClaim(
     directory,
-    `action-${digest}.claim`,
+    path.slice(directory.length + 1),
     request,
     "Mangekyo session version already has an action",
   );
+  const durable = await loadMangekyoLoopSession(
+    rootPath,
+    projectId,
+    request.loopSessionId,
+  ).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (
+    durable !== undefined &&
+    ["COMPLETE", "BLOCKED", "FAILED"].includes(durable.status)
+  ) {
+    await removeExactClaimFile(directory, path, request);
+    throw new Error("Mangekyo loop is already terminal");
+  }
   return structuredClone(request);
 }
 
@@ -1459,6 +1622,157 @@ export async function loadMangekyoStopRequest(
   const requests = await stopRequests(directory, loopSessionId);
   if (requests.length > 1) throw new Error("Mangekyo Stop request is ambiguous");
   return requests[0];
+}
+
+export interface MangekyoWorkerLease {
+  loopSessionId: string;
+  sessionVersion: string;
+  workerId: string;
+  acquiredAt: string;
+  expiresAt: string;
+}
+
+function workerLease(value: unknown): value is MangekyoWorkerLease {
+  return (
+    exact(value, ["loopSessionId", "sessionVersion", "workerId", "acquiredAt", "expiresAt"]) &&
+    identifier(value.loopSessionId) &&
+    iso(value.sessionVersion) &&
+    identifier(value.workerId) &&
+    iso(value.acquiredAt) &&
+    iso(value.expiresAt) &&
+    Date.parse(value.acquiredAt as string) >= Date.parse(value.sessionVersion as string) &&
+    Date.parse(value.expiresAt as string) > Date.parse(value.acquiredAt as string) &&
+    Date.parse(value.expiresAt as string) - Date.parse(value.acquiredAt as string) <= 120_000
+  );
+}
+
+async function readWorkerLease(path: string): Promise<MangekyoWorkerLease | undefined> {
+  const before = await lstat(path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (before === undefined) return undefined;
+  if (
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.nlink !== 1 ||
+    before.size < 2 ||
+    before.size > MAX_CLAIM_BYTES
+  ) {
+    throw new Error("The durable Mangekyo worker lease is invalid or ambiguous");
+  }
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    const parsed = JSON.parse(await handle.readFile("utf8")) as unknown;
+    const after = await lstat(path);
+    if (
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      !workerLease(parsed)
+    ) {
+      throw new Error("The durable Mangekyo worker lease changed while it was authenticated");
+    }
+    return parsed;
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function loadMangekyoWorkerLease(
+  rootPath: string,
+  projectId: string,
+): Promise<MangekyoWorkerLease | undefined> {
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  return readWorkerLease(assertPathInsideWorkspace(directory, join(directory, "worker-lease.claim")));
+}
+
+export async function claimMangekyoWorkerLease(
+  rootPath: string,
+  projectId: string,
+  lease: MangekyoWorkerLease,
+  observedAt: string,
+): Promise<void> {
+  if (!workerLease(lease) || !iso(observedAt) || lease.acquiredAt !== observedAt) {
+    throw new Error("Mangekyo worker lease is invalid");
+  }
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const path = assertPathInsideWorkspace(directory, join(directory, "worker-lease.claim"));
+  const lockPath = assertPathInsideWorkspace(directory, join(directory, "worker-lease.lock"));
+  try {
+    await writeExclusiveClaim(
+      directory,
+      "worker-lease.lock",
+      lease,
+      "Mangekyo worker lease recovery is already in progress",
+    );
+  } catch (error) {
+    const orphanedLock = await readWorkerLease(lockPath);
+    if (
+      orphanedLock === undefined ||
+      Date.parse(orphanedLock.expiresAt) > Date.parse(observedAt)
+    ) {
+      throw error;
+    }
+    await removeExactClaimFile(directory, lockPath, orphanedLock);
+    await writeExclusiveClaim(
+      directory,
+      "worker-lease.lock",
+      lease,
+      "Mangekyo worker lease recovery is already in progress",
+    );
+  }
+  try {
+    const existing = await readWorkerLease(path);
+    if (existing !== undefined && stableJson(existing) === stableJson(lease)) return;
+    if (existing !== undefined && Date.parse(existing.expiresAt) > Date.parse(observedAt)) {
+      throw new Error("A live durable Mangekyo worker lease already owns this loop");
+    }
+    const session = await loadMangekyoLoopSession(rootPath, projectId, lease.loopSessionId);
+    const active = await loadMangekyoActiveLoopClaim(rootPath, projectId);
+    if (
+      ["COMPLETE", "BLOCKED", "FAILED"].includes(session.status) ||
+      session.updatedAt !== lease.sessionVersion ||
+      active === undefined ||
+      active.loopSessionId !== session.id ||
+      active.sourceExecutionSessionId !== session.sourceExecutionSessionId ||
+      active.claimedAt !== session.createdAt
+    ) {
+      throw new Error("The durable Mangekyo worker lease does not match the exact active session version");
+    }
+    if (existing !== undefined) await removeExactClaimFile(directory, path, existing);
+    await writeExclusiveClaim(
+      directory,
+      "worker-lease.claim",
+      lease,
+      "A durable Mangekyo worker lease already owns this loop",
+    );
+  } finally {
+    await removeExactClaimFile(directory, lockPath, lease);
+  }
+}
+
+export async function releaseMangekyoWorkerLease(
+  rootPath: string,
+  projectId: string,
+  lease: MangekyoWorkerLease,
+): Promise<void> {
+  if (!workerLease(lease)) throw new Error("Mangekyo worker lease is invalid");
+  const directory = await mangekyoClaimRoot(rootPath, projectId);
+  const path = assertPathInsideWorkspace(directory, join(directory, "worker-lease.claim"));
+  const existing = await readWorkerLease(path);
+  if (existing === undefined || stableJson(existing) !== stableJson(lease)) {
+    throw new Error("The exact durable Mangekyo worker lease is missing or ambiguous");
+  }
+  const session = await loadMangekyoLoopSession(rootPath, projectId, lease.loopSessionId);
+  if (Date.parse(session.updatedAt) < Date.parse(lease.sessionVersion)) {
+    throw new Error("The durable Mangekyo worker session regressed before lease release");
+  }
+  await removeExactClaimFile(directory, path, lease);
 }
 
 export async function consumeMangekyoApproveOnceAuthorization(
