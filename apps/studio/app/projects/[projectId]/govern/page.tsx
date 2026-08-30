@@ -1,5 +1,5 @@
-import { WorkspacePlaceholder } from "../../../../features/projects/workspace-placeholder";
+import { GovernWorkspace } from "../../../../features/govern/genome-view";
 
 export default function GovernPage() {
-  return <WorkspacePlaceholder workspace="govern" />;
+  return <GovernWorkspace />;
 }

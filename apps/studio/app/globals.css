@@ -477,9 +477,248 @@ textarea:focus-visible {
 
 .reference-workspace,
 .learn-workspace,
-.reports-workspace {
+.reports-workspace,
+.govern-workspace {
   display: grid;
   gap: 2rem;
+}
+
+.govern-activity {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  width: fit-content;
+  margin: -0.75rem 0 0;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+}
+
+.govern-activity span {
+  width: 0.42rem;
+  height: 0.42rem;
+  background: var(--crimson);
+  transform: rotate(45deg);
+}
+
+.genome-init {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: clamp(1.5rem, 4vw, 4rem);
+  padding: clamp(1.4rem, 3vw, 2.4rem);
+  border-top: 2px solid var(--crimson);
+  background: #10141a;
+}
+
+.genome-init h2,
+.genome-view h2,
+.screen-registry h2 {
+  margin: 0.45rem 0 1rem;
+  font-family: var(--font-display);
+  font-size: clamp(1.8rem, 3.8vw, 3rem);
+  font-weight: 600;
+  letter-spacing: -0.04em;
+}
+
+.genome-init p:last-child,
+.genome-view__header > div:first-child > p:last-child {
+  max-width: 42rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.65;
+}
+
+.genome-view {
+  min-width: 0;
+  border-top: 2px solid var(--crimson);
+}
+
+.genome-view__header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(12rem, 0.32fr);
+  gap: clamp(1.5rem, 4vw, 4rem);
+  padding: clamp(1.25rem, 3vw, 2.2rem) 0;
+  border-bottom: 1px solid var(--steel);
+}
+
+.genome-view__authority {
+  display: grid;
+  align-content: start;
+  justify-items: start;
+  gap: 0.55rem;
+  padding-left: 1.25rem;
+  border-left: 1px solid var(--steel);
+}
+
+.genome-view__authority strong,
+.genome-view__authority small,
+.govern-status {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.07em;
+}
+
+.genome-view__authority strong { color: var(--bone); }
+.genome-view__authority small { color: var(--dimmed); }
+
+.govern-status {
+  padding: 0.3rem 0.48rem;
+  border: 1px solid #6f4a31;
+  color: #d7b28e;
+}
+
+.govern-status--approved {
+  border-color: #35483b;
+  color: #a8c0ae;
+}
+
+.genome-view__authority .primary-action {
+  width: 100%;
+  margin-top: 0.65rem;
+}
+
+.genome-view__rules {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-left: 1px solid var(--steel);
+}
+
+.genome-rule-group {
+  min-width: 0;
+  min-height: 10rem;
+  padding: 1rem;
+  border-right: 1px solid var(--steel);
+  border-bottom: 1px solid var(--steel);
+}
+
+.genome-rule-group--unconfirmed {
+  background: linear-gradient(135deg, rgba(198, 75, 80, 0.09), transparent 62%);
+}
+
+.genome-rule-group h3,
+.screen-record h4 {
+  margin: 0 0 1.5rem;
+  color: var(--dimmed);
+  font-family: var(--font-mono);
+  font-size: 0.61rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.genome-rule-group ul,
+.screen-record ul {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.genome-rule-group li,
+.genome-rule-group p,
+.screen-record li,
+.screen-record p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.73rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.genome-rule-group li::before,
+.screen-record li::before {
+  content: "—";
+  margin-right: 0.45rem;
+  color: var(--crimson);
+}
+
+.screen-registry {
+  min-width: 0;
+  padding-top: 0.5rem;
+}
+
+.govern-section-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--steel);
+}
+
+.govern-section-heading > span {
+  padding-bottom: 1rem;
+  color: var(--crimson);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+}
+
+.screen-registry__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.screen-record {
+  display: grid;
+  grid-template-columns: minmax(13rem, 0.32fr) minmax(0, 1fr);
+  border-bottom: 1px solid var(--steel);
+}
+
+.screen-record__identity {
+  padding: 1.25rem 1.25rem 1.25rem 0;
+  border-right: 1px solid var(--steel);
+}
+
+.screen-record__identity > div > span {
+  color: var(--crimson);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+}
+
+.screen-record h3 {
+  margin: 0.45rem 0 1.5rem;
+  font-family: var(--font-display);
+  font-size: 1.65rem;
+}
+
+.screen-record dl {
+  display: grid;
+  gap: 0.65rem;
+  margin: 0;
+}
+
+.screen-record dl div {
+  display: grid;
+  grid-template-columns: 5.3rem minmax(0, 1fr);
+  gap: 0.5rem;
+}
+
+.screen-record dt,
+.screen-record dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.screen-record dt { color: var(--dimmed); }
+.screen-record dd { color: var(--muted); }
+
+.screen-record__rules {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.screen-record__rules section {
+  min-width: 0;
+  padding: 1.25rem;
+  border-right: 1px solid var(--steel);
+  border-bottom: 1px solid var(--steel);
 }
 
 .reference-workspace__layout {
@@ -1826,6 +2065,11 @@ textarea:focus-visible {
   .change-proposal__scope,
   .change-proposal__facts,
   .mutation-evidence dl,
+  .genome-init,
+  .genome-view__header,
+  .genome-view__rules,
+  .screen-record,
+  .screen-record__rules,
   .session-ledger li {
     grid-template-columns: 1fr;
   }
@@ -1833,6 +2077,22 @@ textarea:focus-visible {
   .scan-console__intro {
     border-right: 0;
     border-bottom: 1px solid var(--steel);
+  }
+
+  .genome-view__authority {
+    padding-left: 0;
+    padding-top: 1rem;
+    border-left: 0;
+    border-top: 1px solid var(--steel);
+  }
+
+  .genome-rule-group {
+    min-height: 0;
+  }
+
+  .screen-record__identity {
+    padding-right: 0;
+    border-right: 0;
   }
 
   .feature-brief-form__intro {
