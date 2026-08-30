@@ -1,4 +1,8 @@
 import type { DesignGenome, FeatureBrief } from "@design-sharingan/core";
+import {
+  isAuthenticatedGenomeDocument,
+  type GenomeDocument,
+} from "@design-sharingan/governance";
 
 export type GenomeAuthority = "AUTHORITATIVE" | "NON_AUTHORITATIVE";
 export type GuardDisposition = "INHERIT" | "EXTEND" | "DECIDE" | "REJECT" | "VERIFY";
@@ -10,7 +14,7 @@ export interface RepeatedPatternEvidence {
 }
 
 export interface GuardFeatureInput {
-  genome: DesignGenome;
+  genome: DesignGenome | GenomeDocument;
   featureBrief: FeatureBrief;
   repeatedPatterns?: RepeatedPatternEvidence[];
 }
@@ -126,10 +130,15 @@ function assertRepeatedPatterns(
 export async function guardFeature(
   input: GuardFeatureInput,
 ): Promise<FeatureGuardResult> {
-  const genome = assertGenome(input.genome);
+  const suppliedGenome = "value" in input.genome
+    ? input.genome.value
+    : input.genome;
+  const genome = assertGenome(
+    suppliedGenome,
+  );
   const featureBrief = assertFeatureBrief(input.featureBrief);
   const repeatedPatterns = assertRepeatedPatterns(input.repeatedPatterns);
-  const authoritative = genome.status === "APPROVED";
+  const authoritative = isAuthenticatedGenomeDocument(input.genome);
   const inheritedCandidates = [
     ...genome.uxInvariants,
     ...genome.visualInvariants,

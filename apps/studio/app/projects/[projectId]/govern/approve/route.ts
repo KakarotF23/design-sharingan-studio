@@ -4,15 +4,18 @@ import { readProjectJson } from "../../../../../features/projects/project-reques
 
 export const runtime = "nodejs";
 
-function approvalBody(value: unknown): value is { expectedRevision: number } {
+function approvalBody(value: unknown): value is { expectedRevision: number; expectedPayloadHash: string } {
   return (
     value !== null &&
     typeof value === "object" &&
     !Array.isArray(value) &&
-    Object.keys(value).length === 1 &&
+    Object.keys(value).length === 2 &&
     Object.hasOwn(value, "expectedRevision") &&
+    Object.hasOwn(value, "expectedPayloadHash") &&
     Number.isSafeInteger((value as { expectedRevision?: unknown }).expectedRevision) &&
-    ((value as { expectedRevision: number }).expectedRevision >= 1)
+    ((value as { expectedRevision: number }).expectedRevision >= 1) &&
+    typeof (value as { expectedPayloadHash?: unknown }).expectedPayloadHash === "string" &&
+    /^[a-f0-9]{64}$/.test((value as { expectedPayloadHash: string }).expectedPayloadHash)
   );
 }
 
@@ -29,7 +32,11 @@ export async function POST(
   try {
     const project = await resolveProjectRequest(projectId);
     return Response.json(
-      await approveProjectGenome(project, parsed.body.expectedRevision),
+      await approveProjectGenome(
+        project,
+        parsed.body.expectedRevision,
+        parsed.body.expectedPayloadHash,
+      ),
     );
   } catch {
     return Response.json(

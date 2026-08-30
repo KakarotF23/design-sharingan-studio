@@ -1,7 +1,7 @@
 "use client";
 
 import { ModeSwitcher, WorkspaceHeader } from "@design-sharingan/ui";
-import { useStudioProject } from "./project-shell";
+import { useStudioGenomeState, useStudioProject } from "./project-shell";
 import {
   workspaceDefinitions,
   type WorkspaceKind,
@@ -9,7 +9,18 @@ import {
 
 export function WorkspacePlaceholder({ workspace }: { workspace: WorkspaceKind }) {
   const project = useStudioProject();
+  const { genome } = useStudioGenomeState();
   const definition = workspaceDefinitions[workspace];
+  const signals = definition.signals.map((signal) => {
+    if (signal.title !== "Design Genome" && signal.title !== "Genome") return signal;
+    return {
+      ...signal,
+      detail: genome.state === "INITIALIZED"
+        ? `${genome.status} · v${genome.version} · ${genome.authority}`
+        : genome.state === "NOT_INITIALIZED" ? "Not initialized"
+          : genome.state === "UNAVAILABLE" ? "Governance unavailable" : "Checking governance…",
+    };
+  });
 
   return (
     <div className="workspace-placeholder">
@@ -20,7 +31,7 @@ export function WorkspacePlaceholder({ workspace }: { workspace: WorkspaceKind }
         actions={workspace === "execute" ? <ModeSwitcher mode="SAFE" /> : undefined}
       />
       <div className="workspace-placeholder__grid">
-        {definition.signals.map((signal) => (
+        {signals.map((signal) => (
           <section key={signal.title}>
             <h2>{signal.title}</h2>
             <p>{signal.detail}</p>

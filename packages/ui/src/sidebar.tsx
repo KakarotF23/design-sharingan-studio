@@ -9,7 +9,19 @@ export interface SidebarProject {
 export interface SidebarProps {
   project: SidebarProject;
   activePath: string;
+  genome: SidebarGenomeState;
 }
+
+export type SidebarGenomeState =
+  | { state: "LOADING" }
+  | { state: "UNAVAILABLE" }
+  | { state: "NOT_INITIALIZED" }
+  | {
+      state: "INITIALIZED";
+      status: "DRAFT" | "APPROVED";
+      version: string;
+      authority: "NON-AUTHORITATIVE" | "AUTHORITATIVE";
+    };
 
 const navigation = [
   {
@@ -26,7 +38,14 @@ const navigation = [
   { label: "Settings", path: "settings", group: "SYSTEM", mark: "⚙" },
 ] as const;
 
-export function Sidebar({ project, activePath }: SidebarProps) {
+function genomeLabel(genome: SidebarGenomeState): string {
+  if (genome.state === "LOADING") return "Checking…";
+  if (genome.state === "UNAVAILABLE") return "Unavailable";
+  if (genome.state === "NOT_INITIALIZED") return "Not initialized";
+  return `${genome.status} · v${genome.version} · ${genome.authority === "AUTHORITATIVE" ? "Authoritative" : "Non-authoritative"}`;
+}
+
+export function Sidebar({ project, activePath, genome }: SidebarProps) {
   let previousGroup = "";
 
   return (
@@ -73,7 +92,7 @@ export function Sidebar({ project, activePath }: SidebarProps) {
       <dl className="ds-sidebar__health">
         <div>
           <dt>Genome</dt>
-          <dd>Not initialized</dd>
+          <dd>{genomeLabel(genome)}</dd>
         </div>
         <div>
           <dt>Dev server</dt>

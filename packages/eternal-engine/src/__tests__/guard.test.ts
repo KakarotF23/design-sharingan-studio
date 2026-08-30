@@ -1,4 +1,8 @@
 import type { DesignGenome, FeatureBrief } from "@design-sharingan/core";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { approveGenome, initializeGovernance } from "@design-sharingan/governance";
 import { describe, expect, it } from "vitest";
 import { guardFeature } from "../guard";
 
@@ -66,8 +70,9 @@ describe("Eternal feature guard", () => {
   it("returns only bounded guard dispositions and fresh verification needs", async () => {
     const result = await guardFeature({ genome: genome("APPROVED"), featureBrief });
 
-    expect(result.genomeAuthority).toBe("AUTHORITATIVE");
-    expect(result.INHERIT).toEqual(expect.arrayContaining([
+    expect(result.genomeAuthority).toBe("NON_AUTHORITATIVE");
+    expect(result.INHERIT).toEqual([]);
+    expect(result.DECIDE).toEqual(expect.arrayContaining([
       "Keep human decisions explicit.",
       "Use one restrained accent.",
       "Maintain visible focus.",
@@ -86,6 +91,36 @@ describe("Eternal feature guard", () => {
     ]) {
       expect(values.length).toBeLessThanOrEqual(64);
       expect(values.every((value) => value.length > 0 && value.length <= 1_000)).toBe(true);
+    }
+  });
+
+  it("inherits only from an authenticated exact local-user Genome document", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "guard-authority-")));
+    try {
+      const created = await initializeGovernance({
+        rootPath: root,
+        projectId: "project-a",
+        genome: genome("DRAFT"),
+        screens: [],
+        decisions: [],
+      });
+      const approved = await approveGenome(root, "project-a", {
+        approvedBy: "local-user",
+        expectedRevision: created.genome.metadata.revision,
+        expectedPayloadHash: created.genome.payloadHash,
+      });
+
+      const verified = await guardFeature({ genome: approved, featureBrief });
+      expect(verified.genomeAuthority).toBe("AUTHORITATIVE");
+      expect(verified.INHERIT).toContain("Keep human decisions explicit.");
+
+      const forged = structuredClone(approved);
+      forged.value.uxInvariants = ["Forged invariant."];
+      const rejected = await guardFeature({ genome: forged, featureBrief });
+      expect(rejected.genomeAuthority).toBe("NON_AUTHORITATIVE");
+      expect(rejected.INHERIT).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

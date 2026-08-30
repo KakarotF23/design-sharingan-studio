@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@design-sharingan/agent-runtime": "workspace:*",
-    "@design-sharingan/core": "workspace:*"
+    "@design-sharingan/core": "workspace:*",
+    "@design-sharingan/governance": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "latest",

@@ -5,6 +5,8 @@ import {
   readGovernanceDocument,
   safeProjectId,
   withGovernanceLock,
+  readGenome,
+  assertAuthenticatedDecisionProofs,
 } from "./genome-store";
 import {
   assertDesignDecisions,
@@ -30,6 +32,16 @@ export async function readDesignDecisions(
   if (metadata.kind !== "DESIGN_DECISIONS") {
     throw new Error("DESIGN-DECISIONS.md contains the wrong governance document kind");
   }
+  const genome = await readGenome(rootPath, projectId);
+  if (
+    metadata.genomeEntityId !== genome.metadata.entityId ||
+    metadata.genomeVersion !== genome.value.version ||
+    metadata.genomeRevision > genome.metadata.revision
+  ) {
+    throw new Error("Design Decisions are not related to the active Design Genome");
+  }
+  assertDesignDecisions(metadata.decisions, metadata.approvalProofs);
+  await assertAuthenticatedDecisionProofs(rootPath, metadata);
   return document(metadata);
 }
 
@@ -40,15 +52,19 @@ export async function saveDesignDecisions(
   expectedRevision: number,
 ): Promise<DesignDecisionsDocument> {
   safeProjectId(projectId);
-  const decisions = assertDesignDecisions(decisionsInput);
   return withGovernanceLock(rootPath, async (directory) => {
     const current = await readDesignDecisions(rootPath, projectId);
     if (current.metadata.revision !== expectedRevision) {
       throw new Error("Design Decisions revision is stale");
     }
+    const genome = await readGenome(rootPath, projectId);
+    const decisions = assertDesignDecisions(decisionsInput, current.metadata.approvalProofs);
     const metadata: DesignDecisionsMetadata = {
       ...current.metadata,
       revision: current.metadata.revision + 1,
+      genomeEntityId: genome.metadata.entityId,
+      genomeVersion: genome.value.version,
+      genomeRevision: genome.metadata.revision,
       decisions,
     };
     await atomicWriteDocument(

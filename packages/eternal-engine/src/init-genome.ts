@@ -55,7 +55,13 @@ export interface GenomeProjectContext {
 export interface RepresentativeScreenEvidence {
   route: string;
   observations: string[];
-  evidence: string[];
+  evidence: GovernanceEvidence[];
+}
+
+export interface GovernanceEvidence {
+  id: string;
+  kind: "RENDER" | "ROUTE" | "NAVIGATION" | "COMPONENT" | "TOKEN" | "DOCUMENT";
+  excerpt: string;
 }
 
 export interface InitializeGenomeInput {
@@ -83,6 +89,13 @@ export interface InitializeGenomeResult {
 
 const MAX_ITEMS = 64;
 const MAX_TEXT = 1_000;
+const EVIDENCE_ID_PATTERN = /^ev_[a-zA-Z0-9_-]{8,125}$/;
+const SECRET_PATTERN = /(?:sk-[a-zA-Z0-9_-]{8,}|gh[pousr]_[a-zA-Z0-9]{12,}|AKIA[A-Z0-9]{12,}|Bearer\s+[a-zA-Z0-9._-]{8,}|(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+)/gi;
+const PATH_PATTERN = /(?:\/(?:[a-zA-Z0-9._-]+\/)+[a-zA-Z0-9._-]+|[A-Za-z]:\\[^\s,;]+)/g;
+
+export function scrubGovernanceText(value: string): string {
+  return value.replace(SECRET_PATTERN, "[REDACTED]").replace(PATH_PATTERN, "[REDACTED]");
+}
 
 const boundedStringField = {
   type: "string",
@@ -194,6 +207,10 @@ function boundedString(value: unknown, label: string, max = MAX_TEXT): string {
   return value;
 }
 
+function sanitizedString(value: unknown, label: string, max = MAX_TEXT): string {
+  return scrubGovernanceText(boundedString(value, label, max));
+}
+
 function boundedArray(value: unknown, label: string, requireEvidence = false): string[] {
   if (
     !Array.isArray(value) ||
@@ -241,7 +258,7 @@ function parseWireOutput(value: unknown): GenomeInitWireOutput {
     }
     return {
       category: rule.category as GenomeRuleCategory,
-      statement: boundedString(rule.statement, `Genome rule ${index}`),
+      statement: sanitizedString(rule.statement, `Genome rule ${index}`),
       confidence: confidence(rule.confidence, `Genome rule ${index}`),
       evidence: boundedArray(rule.evidence, `Genome rule ${index} evidence`, true),
     };
@@ -258,22 +275,22 @@ function parseWireOutput(value: unknown): GenomeInitWireOutput {
     );
     return {
       route: boundedString(screen.route, `Initialized screen ${index} route`, 512),
-      name: boundedString(screen.name, `Initialized screen ${index} name`, 512),
-      family: boundedString(screen.family, `Initialized screen ${index} family`, 512),
+      name: sanitizedString(screen.name, `Initialized screen ${index} name`, 512),
+      family: sanitizedString(screen.family, `Initialized screen ${index} family`, 512),
       inheritedRules: boundedArray(
         screen.inheritedRules,
         `Initialized screen ${index} inherited rules`,
-      ),
-      exceptions: boundedArray(screen.exceptions, `Initialized screen ${index} exceptions`),
+      ).map((value) => scrubGovernanceText(value)),
+      exceptions: boundedArray(screen.exceptions, `Initialized screen ${index} exceptions`).map((value) => scrubGovernanceText(value)),
       requiredStates: boundedArray(
         screen.requiredStates,
         `Initialized screen ${index} required states`,
-      ),
+      ).map((value) => scrubGovernanceText(value)),
     };
   });
   return {
     productIdentity: {
-      statement: boundedString(identity.statement, "Product identity candidate", 4_000),
+      statement: sanitizedString(identity.statement, "Product identity candidate", 4_000),
       confidence: confidence(identity.confidence, "Product identity candidate"),
       evidence: boundedArray(identity.evidence, "Product identity evidence", true),
     },
@@ -311,31 +328,48 @@ function validateInput(input: InitializeGenomeInput): InitializeGenomeInput {
         entry.observations,
         `Representative evidence ${index} observations`,
         true,
-      ),
-      evidence: boundedArray(
-        entry.evidence,
-        `Representative evidence ${index} locators`,
-        true,
-      ),
+      ).map((observation) => scrubGovernanceText(observation)),
+      evidence: (() => {
+        if (!Array.isArray(entry.evidence) || entry.evidence.length === 0 || entry.evidence.length > MAX_ITEMS) {
+          throw new Error(`Representative evidence ${index} locators must be a bounded non-empty array`);
+        }
+        const kinds = new Set(["RENDER", "ROUTE", "NAVIGATION", "COMPONENT", "TOKEN", "DOCUMENT"]);
+        return entry.evidence.map((candidate, evidenceIndex) => {
+          const evidence = objectValue(candidate, `Representative evidence ${index}.${evidenceIndex}`);
+          exactKeys(evidence, ["id", "kind", "excerpt"], `Representative evidence ${index}.${evidenceIndex}`);
+          const id = boundedString(evidence.id, `Evidence ${evidenceIndex} identity`, 128);
+          if (!EVIDENCE_ID_PATTERN.test(id)) throw new Error("Representative evidence identity is not server controlled");
+          if (!kinds.has(evidence.kind as string)) throw new Error("Representative evidence kind is invalid");
+          return {
+            id,
+            kind: evidence.kind as GovernanceEvidence["kind"],
+            excerpt: sanitizedString(evidence.excerpt, `Evidence ${evidenceIndex} excerpt`),
+          };
+        });
+      })(),
     };
   });
   if (new Set(representativeEvidence.map((entry) => entry.route)).size !== representativeEvidence.length) {
     throw new Error("Representative evidence routes must be unique");
   }
+  const allEvidenceIds = representativeEvidence.flatMap((entry) => entry.evidence.map((evidence) => evidence.id));
+  if (new Set(allEvidenceIds).size !== allEvidenceIds.length) {
+    throw new Error("Representative evidence identities must be unique");
+  }
   return {
     workingDirectory: input.workingDirectory,
     projectContext: {
       projectId,
-      name: boundedString(context.name, "Project name", 512),
+      name: sanitizedString(context.name, "Project name", 512),
       ...(context.framework === undefined
         ? {}
-        : { framework: boundedString(context.framework, "Project framework", 512) }),
+        : { framework: sanitizedString(context.framework, "Project framework", 512) }),
       routes,
       componentDirectories: boundedArray(
         context.componentDirectories,
         "Component directories",
-      ),
-      designDocuments: boundedArray(context.designDocuments, "Design documents"),
+      ).map((value) => scrubGovernanceText(value)),
+      designDocuments: boundedArray(context.designDocuments, "Design documents").map((value) => scrubGovernanceText(value)),
     },
     representativeEvidence,
   };
@@ -344,7 +378,7 @@ function validateInput(input: InitializeGenomeInput): InitializeGenomeInput {
 function buildPrompt(input: InitializeGenomeInput): string {
   const evidence = input.representativeEvidence
     .map(
-      (entry) => `Representative ${entry.route} evidence:\nObservations: ${entry.observations.join(" | ")}\nLocators: ${entry.evidence.join(" | ")}`,
+      (entry) => `Representative ${entry.route} evidence:\nObservations: ${entry.observations.join(" | ")}\nServer evidence: ${entry.evidence.map((item) => `${item.id} [${item.kind}]: ${item.excerpt}`).join(" | ")}`,
     )
     .join("\n\n");
   return `Initialize a DRAFT Design Genome from authenticated local project context and representative current evidence only.
@@ -387,13 +421,33 @@ export async function initializeGenome(
     throw new Error("Initialized screens must exactly match representative evidence coverage");
   }
 
-  const confirmed = output.rules.filter((rule) => rule.confidence === "CONFIRMED");
+  const evidenceCatalog = new Map(
+    input.representativeEvidence.flatMap((entry) => entry.evidence.map((evidence) => [evidence.id, evidence] as const)),
+  );
+  const isGrounded = (confidenceValue: GenomeRuleConfidence, citations: string[], statement: string): boolean => {
+    if (confidenceValue !== "CONFIRMED" || citations.some((id) => !evidenceCatalog.has(id))) return false;
+    if (/whole[- ]product|all screens|every screen|throughout the product/i.test(statement)) return false;
+    return citations.some((id) => {
+      const kind = evidenceCatalog.get(id)?.kind;
+      return kind !== undefined && kind !== "ROUTE";
+    });
+  };
+  const normalizedRules = output.rules.map((rule) => ({
+    ...rule,
+    statement: sanitizedString(rule.statement, "Genome rule"),
+    confidence: isGrounded(rule.confidence, rule.evidence, rule.statement)
+      ? "CONFIRMED" as const
+      : "UNCONFIRMED" as const,
+  }));
+  const confirmed = normalizedRules.filter((rule) => rule.confidence === "CONFIRMED");
   const confirmedStatements = new Set(confirmed.map((rule) => rule.statement));
-  const unconfirmed = output.rules
+  const unconfirmed = normalizedRules
     .filter((rule) => rule.confidence === "UNCONFIRMED")
     .map((rule) => rule.statement);
   if (output.productIdentity.confidence === "UNCONFIRMED") {
-    unconfirmed.push(output.productIdentity.statement);
+    unconfirmed.push(sanitizedString(output.productIdentity.statement, "Product identity"));
+  } else if (!isGrounded(output.productIdentity.confidence, output.productIdentity.evidence, output.productIdentity.statement)) {
+    unconfirmed.push(sanitizedString(output.productIdentity.statement, "Product identity"));
   }
 
   const confirmedFamilies = new Set(
@@ -422,7 +476,7 @@ export async function initializeGenome(
       inheritedRules: screen.inheritedRules.filter((rule) => confirmedStatements.has(rule)),
       exceptions: [],
       requiredStates: screen.requiredStates,
-      evidence: evidence.evidence,
+      evidence: evidence.evidence.map((item) => item.id),
       driftStatus: "NOT_VERIFIED",
     } satisfies ScreenRecord;
   });
@@ -436,7 +490,7 @@ export async function initializeGenome(
   const genome: DesignGenome = {
     version: "0.1.0",
     status: "DRAFT",
-    productIdentity: output.productIdentity.statement,
+    productIdentity: sanitizedString(output.productIdentity.statement, "Product identity", 4_000),
     uxInvariants: rulesFor("UX_INVARIANT"),
     visualInvariants: rulesFor("VISUAL_INVARIANT"),
     motionRules: rulesFor("MOTION_RULE"),

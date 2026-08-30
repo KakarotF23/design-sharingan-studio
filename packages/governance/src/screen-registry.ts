@@ -5,6 +5,7 @@ import {
   readGovernanceDocument,
   safeProjectId,
   withGovernanceLock,
+  readGenome,
 } from "./genome-store";
 import {
   assertScreenRecords,
@@ -30,6 +31,18 @@ export async function readScreenRegistry(
   if (metadata.kind !== "SCREEN_REGISTRY") {
     throw new Error("SCREEN-REGISTRY.md contains the wrong governance document kind");
   }
+  const genome = await readGenome(rootPath, projectId);
+  if (
+    metadata.genomeEntityId !== genome.metadata.entityId ||
+    metadata.genomeVersion !== genome.value.version ||
+    metadata.genomeRevision > genome.metadata.revision
+  ) {
+    throw new Error("Screen Registry is not related to the active Design Genome");
+  }
+  assertScreenRecords(metadata.records, {
+    genome: genome.value,
+    evidenceIds: metadata.evidenceIds,
+  });
   return document(metadata);
 }
 
@@ -40,15 +53,24 @@ export async function saveScreenRegistry(
   expectedRevision: number,
 ): Promise<ScreenRegistryDocument> {
   safeProjectId(projectId);
-  const records = assertScreenRecords(recordsInput);
   return withGovernanceLock(rootPath, async (directory) => {
     const current = await readScreenRegistry(rootPath, projectId);
     if (current.metadata.revision !== expectedRevision) {
       throw new Error("Screen Registry revision is stale");
     }
+    const genome = await readGenome(rootPath, projectId);
+    const evidenceIds = [...new Set(recordsInput.flatMap((record) => record.evidence))];
+    const records = assertScreenRecords(recordsInput, {
+      genome: genome.value,
+      evidenceIds,
+    });
     const metadata: ScreenRegistryMetadata = {
       ...current.metadata,
       revision: current.metadata.revision + 1,
+      genomeEntityId: genome.metadata.entityId,
+      genomeVersion: genome.value.version,
+      genomeRevision: genome.metadata.revision,
+      evidenceIds,
       records,
     };
     await atomicWriteDocument(directory, SCREEN_REGISTRY_FILE, renderScreenRegistry(metadata));

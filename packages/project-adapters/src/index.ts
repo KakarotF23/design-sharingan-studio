@@ -1,6 +1,7 @@
 export * from "./detect-project";
 export * from "./git";
 export * from "./github-project-adapter";
+export * from "./governance-evidence";
 export * from "./local-project-adapter";
 export * from "./mangekyo-loop-store";
 export * from "./mangekyo-worker-owner";

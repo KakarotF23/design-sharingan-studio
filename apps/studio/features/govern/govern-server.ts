@@ -1,7 +1,6 @@
-import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import type { Project } from "@design-sharingan/core";
-import { initializeGenome } from "@design-sharingan/eternal-engine";
+import { initializeGenomeWithCodex } from "@design-sharingan/eternal-engine";
 import {
   approveGenome,
   governanceIsInitialized,
@@ -9,14 +8,18 @@ import {
   readGenome,
   readScreenRegistry,
 } from "@design-sharingan/governance";
-import { detectProject } from "@design-sharingan/project-adapters";
+import {
+  collectGovernanceEvidence,
+  detectProject,
+} from "@design-sharingan/project-adapters";
 import { createAnalysisStagingDirectory } from "../projects/project-locator";
-import { createGenomeInitAgent } from "./genome-agent";
 
 export interface GovernGenomeProjection {
   status: "DRAFT" | "APPROVED";
   authority: "NON-AUTHORITATIVE" | "AUTHORITATIVE";
   revision: number;
+  version: string;
+  payloadHash: string;
   productIdentity: string;
   uxInvariants: string[];
   visualInvariants: string[];
@@ -64,9 +67,10 @@ export async function loadGovernanceProjection(
     initialized: true,
     genome: {
       status: genome.value.status,
-      authority:
-        genome.value.status === "APPROVED" ? "AUTHORITATIVE" : "NON-AUTHORITATIVE",
+      authority: genome.authority === "AUTHORITATIVE" ? "AUTHORITATIVE" : "NON-AUTHORITATIVE",
       revision: genome.metadata.revision,
+      version: genome.value.version,
+      payloadHash: genome.payloadHash,
       productIdentity: genome.value.productIdentity,
       uxInvariants: genome.value.uxInvariants,
       visualInvariants: genome.value.visualInvariants,
@@ -101,9 +105,16 @@ export async function initializeProjectGovernance(
   const analysisWorkingDirectory = await createAnalysisStagingDirectory(
     project.rootPath,
   );
-  let result: Awaited<ReturnType<typeof initializeGenome>>;
+  const evidenceCatalog = await collectGovernanceEvidence({
+    rootPath: project.rootPath,
+    projectId: project.id,
+    routes: representativeRoutes,
+    componentDirectories: detection.componentDirectories,
+    designDocuments: detection.designDocuments,
+  });
+  let result: Awaited<ReturnType<typeof initializeGenomeWithCodex>>;
   try {
-    result = await initializeGenome(
+    result = await initializeGenomeWithCodex(
       {
         workingDirectory: analysisWorkingDirectory,
         projectContext: {
@@ -117,15 +128,13 @@ export async function initializeProjectGovernance(
         representativeEvidence: representativeRoutes.map((route) => ({
           route,
           observations: [
-            `Authenticated project inspection detected ${route} as a current route or render target.`,
-            `Framework context: ${detection.framework ?? "unknown"}.`,
+            "Authenticated project inspection detected this current route or render target.",
+            "Evidence is representative only and does not establish whole-product coverage.",
           ],
-          evidence: [`project-route:${route}`],
+          evidence: evidenceCatalog
+            .filter((evidence) => evidence.route === route)
+            .map(({ id, kind, excerpt }) => ({ id, kind, excerpt })),
         })),
-      },
-      {
-        agent: createGenomeInitAgent(representativeRoutes),
-        createId: randomUUID,
       },
     );
   } finally {
@@ -147,10 +156,12 @@ export async function initializeProjectGovernance(
 export async function approveProjectGenome(
   project: Project,
   expectedRevision: number,
+  expectedPayloadHash: string,
 ): Promise<GovernanceProjection> {
   await approveGenome(project.rootPath, project.id, {
     approvedBy: "local-user",
     expectedRevision,
+    expectedPayloadHash,
   });
   return loadGovernanceProjection(project);
 }

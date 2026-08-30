@@ -2,7 +2,10 @@
 
 import { WorkspaceHeader } from "@design-sharingan/ui";
 import { useCallback, useEffect, useState } from "react";
-import { useStudioProject } from "../projects/project-shell";
+import {
+  useStudioGenomeState,
+  useStudioProject,
+} from "../projects/project-shell";
 import type {
   GovernanceProjection,
   GovernGenomeProjection,
@@ -52,7 +55,7 @@ export function GenomeView({
     <section className="genome-view" aria-labelledby="genome-title">
       <header className="genome-view__header">
         <div>
-          <p className="utility-label">GENOME / VERSION 0.1.0</p>
+          <p className="utility-label">GENOME / VERSION {genome.version}</p>
           <h2 id="genome-title">Design Genome</h2>
           <p>{genome.productIdentity}</p>
         </div>
@@ -96,6 +99,7 @@ export function GenomeView({
 
 export function GovernWorkspace() {
   const project = useStudioProject();
+  const { setGenome: setShellGenome } = useStudioGenomeState();
   const [projection, setProjection] = useState<GovernanceProjection>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -122,11 +126,19 @@ export function GovernWorkspace() {
 
   useEffect(() => {
     load()
-      .then(setProjection)
+      .then((next) => {
+        setProjection(next);
+        setShellGenome(next.initialized ? {
+          state: "INITIALIZED",
+          status: next.genome.status,
+          version: next.genome.version,
+          authority: next.genome.authority,
+        } : { state: "NOT_INITIALIZED" });
+      })
       .catch((caught: unknown) => {
         setError(caught instanceof Error ? caught.message : "Governance evidence is unavailable.");
       });
-  }, [load]);
+  }, [load, setShellGenome]);
 
   async function action(endpoint: "initialize" | "approve") {
     setBusy(true);
@@ -134,7 +146,10 @@ export function GovernWorkspace() {
     try {
       const body =
         endpoint === "approve" && projection?.initialized
-          ? { expectedRevision: projection.genome.revision }
+          ? {
+              expectedRevision: projection.genome.revision,
+              expectedPayloadHash: projection.genome.payloadHash,
+            }
           : {};
       const response = await fetch(
         `/projects/${encodeURIComponent(project.id)}/govern/${endpoint}`,
@@ -157,6 +172,12 @@ export function GovernWorkspace() {
         initialized: true,
         genome: payload.genome,
         screens: payload.screens,
+      });
+      setShellGenome({
+        state: "INITIALIZED",
+        status: payload.genome.status,
+        version: payload.genome.version,
+        authority: payload.genome.authority,
       });
     } catch (caught) {
       setError(

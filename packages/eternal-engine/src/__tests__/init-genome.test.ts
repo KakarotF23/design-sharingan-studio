@@ -9,35 +9,35 @@ import {
 } from "../init-genome";
 
 const output: GenomeInitWireOutput = {
-  productIdentity: {
+    productIdentity: {
     statement: "A calm local-first design intelligence environment.",
     confidence: "CONFIRMED",
-    evidence: ["README product description"],
+    evidence: ["ev_doc_readme_01"],
   },
   rules: [
     {
       category: "UX_INVARIANT",
       statement: "Keep human decisions explicit.",
       confidence: "CONFIRMED",
-      evidence: ["Representative /overview render"],
+      evidence: ["ev_render_overview_01"],
     },
     {
       category: "VISUAL_INVARIANT",
       statement: "Dense evidence panels may use glowing borders.",
       confidence: "UNCONFIRMED",
-      evidence: ["Observed on one representative screen"],
+      evidence: ["ev_render_overview_01"],
     },
     {
       category: "ACCESSIBILITY_RULE",
       statement: "Maintain visible focus.",
       confidence: "CONFIRMED",
-      evidence: ["Shared button styles"],
+      evidence: ["ev_component_button_01"],
     },
     {
       category: "SCREEN_FAMILY",
       statement: "Project workspaces",
       confidence: "CONFIRMED",
-      evidence: ["Stable project shell"],
+      evidence: ["ev_component_shell_01"],
     },
   ],
   screens: [
@@ -90,7 +90,12 @@ describe("Design Genome initialization", () => {
           {
             route: "/overview",
             observations: ["Stable project rail and explicit status."],
-            evidence: ["render:/overview:desktop"],
+            evidence: [
+              { id: "ev_render_overview_01", kind: "RENDER", excerpt: "Authenticated current overview render." },
+              { id: "ev_doc_readme_01", kind: "DOCUMENT", excerpt: "A calm local-first design intelligence environment." },
+              { id: "ev_component_button_01", kind: "COMPONENT", excerpt: "Button focus styles are shared." },
+              { id: "ev_component_shell_01", kind: "COMPONENT", excerpt: "The project shell is shared." },
+            ],
           },
         ],
       },
@@ -116,7 +121,12 @@ describe("Design Genome initialization", () => {
         inheritedRules: ["Keep human decisions explicit."],
         exceptions: [],
         requiredStates: ["ready", "needs-configuration"],
-        evidence: ["render:/overview:desktop"],
+        evidence: [
+          "ev_render_overview_01",
+          "ev_doc_readme_01",
+          "ev_component_button_01",
+          "ev_component_shell_01",
+        ],
         driftStatus: "NOT_VERIFIED",
       },
     ]);
@@ -149,7 +159,7 @@ describe("Design Genome initialization", () => {
             {
               route: "/overview",
               observations: ["Observed."],
-              evidence: ["render:/overview:desktop"],
+              evidence: [{ id: "ev_render_overview_01", kind: "RENDER", excerpt: "Observed." }],
             },
           ],
         },
@@ -178,5 +188,44 @@ describe("Design Genome initialization", () => {
       ),
     ).rejects.toThrow(/representative evidence/i);
     expect(fake.calls).toHaveLength(0);
+  });
+
+  it("downgrades fabricated CONFIRMED citations and scrubs paths and secrets", async () => {
+    const malicious = structuredClone(output);
+    malicious.rules[0] = {
+      ...malicious.rules[0]!,
+      statement: "Read /Users/alice/private/.env using sk-secret-1234567890",
+      confidence: "CONFIRMED",
+      evidence: ["ev_unknown_fabricated"],
+    };
+    const fake = agentWith(malicious);
+
+    const result = await initializeGenome(
+      {
+        workingDirectory: "/authenticated/project",
+        projectContext: {
+          projectId: "project-a",
+          name: "Studio fixture",
+          routes: ["/overview"],
+          componentDirectories: [],
+          designDocuments: [],
+        },
+        representativeEvidence: [{
+          route: "/overview",
+          observations: ["Observed."],
+          evidence: [
+            { id: "ev_render_overview_01", kind: "RENDER", excerpt: "Observed." },
+            { id: "ev_doc_readme_01", kind: "DOCUMENT", excerpt: "Product." },
+            { id: "ev_component_button_01", kind: "COMPONENT", excerpt: "Focus." },
+            { id: "ev_component_shell_01", kind: "COMPONENT", excerpt: "Shell." },
+          ],
+        }],
+      },
+      { agent: fake.agent, createId: () => "screen-1" },
+    );
+
+    expect(result.genome.uxInvariants).toEqual([]);
+    expect(result.genome.unconfirmedRules.join(" ")).not.toMatch(/\/Users\/|sk-secret/);
+    expect(result.genome.unconfirmedRules.join(" ")).toContain("[REDACTED]");
   });
 });
