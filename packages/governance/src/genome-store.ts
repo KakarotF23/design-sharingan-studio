@@ -60,8 +60,11 @@ const EVIDENCE_CATALOG_FILE = "governance-evidence.json";
 const AUDIT_GENERATIONS_DIRECTORY = "audit-generations";
 const AUDIT_GENERATION_POINTER_FILE = "active-audit-generation.json";
 const AUDIT_GENERATION_MANIFEST_FILE = "manifest.json";
+const AUDIT_GENERATION_COMMIT_FILE = "commit.json";
+const MAX_AUDIT_GENERATIONS = 16;
+const AUDIT_GENESIS_DIGEST = "0".repeat(64);
 
-export type AuditTransactionFault = "after-stage" | "after-pointer";
+export type AuditTransactionFault = "after-stage" | "before-pointer" | "after-pointer";
 let auditTransactionFault: AuditTransactionFault | undefined;
 
 /** Test-only fault injection for the generation promotion boundaries. */
@@ -137,10 +140,14 @@ interface StoredEvidenceCatalog {
   signature: string;
 }
 
-interface ActiveAuditGeneration {
-  kind: "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION";
+interface AuditGenerationRelations {
   projectId: string;
+  rootFingerprint: string;
   generationId: string;
+  sequence: number;
+  previousGenerationId: string | null;
+  previousCommitDigest: string;
+  previousHeadDigest: string;
   registryEntityId: string;
   registryRevision: number;
   reportEntityId: string;
@@ -148,22 +155,34 @@ interface ActiveAuditGeneration {
   registryDigest: string;
   reportDigest: string;
   catalogDigest: string;
+}
+
+interface ActiveAuditGeneration extends AuditGenerationRelations {
+  kind: "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION";
+  headDigest: string;
+  commitDigest: string;
   createdAt: string;
   signature: string;
 }
 
-interface AuditGenerationManifest {
+interface AuditGenerationManifest extends AuditGenerationRelations {
   kind: "DESIGN_SHARINGAN_AUDIT_GENERATION";
-  projectId: string;
-  generationId: string;
-  registryEntityId: string;
-  registryRevision: number;
-  reportEntityId: string;
-  reportRevision: number;
-  registryDigest: string;
-  reportDigest: string;
-  catalogDigest: string;
+  headDigest: string;
   signature: string;
+}
+
+interface AuditGenerationCommit extends AuditGenerationRelations {
+  kind: "DESIGN_SHARINGAN_AUDIT_COMMIT";
+  headDigest: string;
+  manifestDigest: string;
+  committedAt: string;
+  signature: string;
+}
+
+interface CompleteAuditGeneration {
+  commit: AuditGenerationCommit;
+  commitDigest: string;
+  directory: string;
 }
 
 export interface CommitAuditGenerationInput {
@@ -536,10 +555,50 @@ export async function writeEvidenceCatalogUnderLock(
   return { path, dev: Number(identity.dev), ino: Number(identity.ino) };
 }
 
+function documentDigest(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function auditGenerationRelationPayload(value: AuditGenerationRelations): AuditGenerationRelations {
+  return {
+    projectId: value.projectId,
+    rootFingerprint: value.rootFingerprint,
+    generationId: value.generationId,
+    sequence: value.sequence,
+    previousGenerationId: value.previousGenerationId,
+    previousCommitDigest: value.previousCommitDigest,
+    previousHeadDigest: value.previousHeadDigest,
+    registryEntityId: value.registryEntityId,
+    registryRevision: value.registryRevision,
+    reportEntityId: value.reportEntityId,
+    reportRevision: value.reportRevision,
+    registryDigest: value.registryDigest,
+    reportDigest: value.reportDigest,
+    catalogDigest: value.catalogDigest,
+  };
+}
+
+function auditGenerationHeadDigest(value: AuditGenerationRelations): string {
+  return documentDigest(JSON.stringify({
+    kind: "DESIGN_SHARINGAN_AUDIT_HEAD_RELATION",
+    ...auditGenerationRelationPayload(value),
+  }));
+}
+
 function activeAuditGenerationPayload(
   value: Omit<ActiveAuditGeneration, "signature">,
 ): string {
-  return JSON.stringify(value);
+  return JSON.stringify({
+    kind: value.kind,
+    ...auditGenerationRelationPayload(value),
+    headDigest: value.headDigest,
+    commitDigest: value.commitDigest,
+    createdAt: value.createdAt,
+  });
 }
 
 function activeAuditGenerationSignature(
@@ -552,7 +611,11 @@ function activeAuditGenerationSignature(
 function auditGenerationManifestPayload(
   value: Omit<AuditGenerationManifest, "signature">,
 ): string {
-  return JSON.stringify(value);
+  return JSON.stringify({
+    kind: value.kind,
+    ...auditGenerationRelationPayload(value),
+    headDigest: value.headDigest,
+  });
 }
 
 function auditGenerationManifestSignature(
@@ -562,12 +625,101 @@ function auditGenerationManifestSignature(
   return createHmac("sha256", key).update(auditGenerationManifestPayload(value), "utf8").digest("hex");
 }
 
-function documentDigest(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
+function auditGenerationCommitPayload(
+  value: Omit<AuditGenerationCommit, "signature">,
+): string {
+  return JSON.stringify({
+    kind: value.kind,
+    ...auditGenerationRelationPayload(value),
+    headDigest: value.headDigest,
+    manifestDigest: value.manifestDigest,
+    committedAt: value.committedAt,
+  });
 }
 
-function isDigest(value: unknown): value is string {
-  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+function auditGenerationCommitSignature(
+  key: Buffer,
+  value: Omit<AuditGenerationCommit, "signature">,
+): string {
+  return createHmac("sha256", key).update(auditGenerationCommitPayload(value), "utf8").digest("hex");
+}
+
+function renderActiveAuditGeneration(value: ActiveAuditGeneration): string {
+  return `${JSON.stringify({
+    kind: value.kind,
+    ...auditGenerationRelationPayload(value),
+    headDigest: value.headDigest,
+    commitDigest: value.commitDigest,
+    createdAt: value.createdAt,
+    signature: value.signature,
+  })}\n`;
+}
+
+function renderAuditGenerationManifest(value: AuditGenerationManifest): string {
+  return `${JSON.stringify({
+    kind: value.kind,
+    ...auditGenerationRelationPayload(value),
+    headDigest: value.headDigest,
+    signature: value.signature,
+  })}\n`;
+}
+
+function renderAuditGenerationCommit(value: AuditGenerationCommit): string {
+  return `${JSON.stringify({
+    kind: value.kind,
+    ...auditGenerationRelationPayload(value),
+    headDigest: value.headDigest,
+    manifestDigest: value.manifestDigest,
+    committedAt: value.committedAt,
+    signature: value.signature,
+  })}\n`;
+}
+
+function sameAuditGenerationRelations(
+  left: AuditGenerationRelations,
+  right: AuditGenerationRelations,
+): boolean {
+  return JSON.stringify(auditGenerationRelationPayload(left)) ===
+    JSON.stringify(auditGenerationRelationPayload(right));
+}
+
+function assertAuditGenerationRelations(
+  value: Record<string, unknown>,
+  projectId: string,
+  canonicalRoot: string,
+): asserts value is Record<string, unknown> & AuditGenerationRelations {
+  if (
+    value.projectId !== projectId || value.rootFingerprint !== rootFingerprint(canonicalRoot) ||
+    typeof value.generationId !== "string" || !/^[a-f0-9-]{36}$/.test(value.generationId) ||
+    !Number.isSafeInteger(value.sequence) || (value.sequence as number) < 1 ||
+    (value.previousGenerationId !== null &&
+      (typeof value.previousGenerationId !== "string" || !/^[a-f0-9-]{36}$/.test(value.previousGenerationId))) ||
+    !isDigest(value.previousCommitDigest) || !isDigest(value.previousHeadDigest) ||
+    typeof value.registryEntityId !== "string" || !SAFE_ID_PATTERN.test(value.registryEntityId) ||
+    !Number.isSafeInteger(value.registryRevision) || (value.registryRevision as number) < 1 ||
+    typeof value.reportEntityId !== "string" || !SAFE_ID_PATTERN.test(value.reportEntityId) ||
+    !Number.isSafeInteger(value.reportRevision) || (value.reportRevision as number) < 1 ||
+    !isDigest(value.registryDigest) || !isDigest(value.reportDigest) || !isDigest(value.catalogDigest)
+  ) throw new Error("Audit generation relation is invalid");
+  if ((value.sequence === 1) !== (value.previousGenerationId === null)) {
+    throw new Error("Audit generation genesis relation is invalid");
+  }
+  if (value.sequence === 1 && (
+    value.previousCommitDigest !== AUDIT_GENESIS_DIGEST || value.previousHeadDigest !== AUDIT_GENESIS_DIGEST
+  )) throw new Error("Audit generation genesis digest is invalid");
+}
+
+function assertAuditGenerationHead(value: AuditGenerationRelations & Record<string, unknown>): void {
+  if (!isDigest(value.headDigest) || value.headDigest !== auditGenerationHeadDigest(value)) {
+    throw new Error("Audit generation head relation is invalid");
+  }
+}
+
+export function incrementAuditGenerationSequence(sequence: number): number {
+  if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("Audit generation sequence cannot be incremented beyond the safe maximum");
+  }
+  return sequence + 1;
 }
 
 function activeDigestForFile(pointer: ActiveAuditGeneration, fileName: string): string {
@@ -575,6 +727,187 @@ function activeDigestForFile(pointer: ActiveAuditGeneration, fileName: string): 
   if (fileName === DRIFT_REPORT_FILE) return pointer.reportDigest;
   if (fileName === EVIDENCE_CATALOG_FILE) return pointer.catalogDigest;
   throw new Error("Audit generation file has no authenticated digest");
+}
+
+function authenticatedSignatureMatches(
+  actualSignature: string,
+  expectedSignature: string,
+): boolean {
+  const actual = Buffer.from(actualSignature, "hex");
+  const expected = Buffer.from(expectedSignature, "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+async function readCompleteAuditGeneration(
+  rootPath: string,
+  projectId: string,
+  canonicalRoot: string,
+  key: Buffer,
+  generationRoot: string,
+  generationId: string,
+): Promise<CompleteAuditGeneration | undefined> {
+  const directory = assertPathInsideWorkspace(generationRoot, join(generationRoot, generationId));
+  const directoryEntry = await lstat(directory).catch(() => undefined);
+  if (directoryEntry === undefined || directoryEntry.isSymbolicLink() || !directoryEntry.isDirectory()) {
+    return undefined;
+  }
+  const commitPath = assertPathInsideWorkspace(directory, join(directory, AUDIT_GENERATION_COMMIT_FILE));
+  if (!(await entryExists(commitPath))) return undefined;
+  let commitRaw: string;
+  let parsed: unknown;
+  try {
+    commitRaw = await readBoundedDocument(commitPath);
+    parsed = JSON.parse(commitRaw);
+  } catch {
+    // A malformed, untrusted directory is not a committed member of the
+    // signed history. It must not block recovery of the authenticated head.
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const commitValue = parsed as Record<string, unknown>;
+  let authenticatedCommit = false;
+  try {
+    exactObjectKeys(commitValue, [
+      "kind", "projectId", "rootFingerprint", "generationId", "sequence", "previousGenerationId",
+      "previousCommitDigest", "previousHeadDigest", "registryEntityId", "registryRevision",
+      "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest",
+      "headDigest", "manifestDigest", "committedAt", "signature",
+    ], "Audit generation commit");
+    if (
+      commitValue.kind !== "DESIGN_SHARINGAN_AUDIT_COMMIT" ||
+      typeof commitValue.committedAt !== "string" ||
+      new Date(commitValue.committedAt).toISOString() !== commitValue.committedAt ||
+      !isDigest(commitValue.manifestDigest) || !isDigest(commitValue.signature)
+    ) throw new Error("Audit generation commit is invalid");
+    assertAuditGenerationRelations(commitValue, projectId, canonicalRoot);
+    assertAuditGenerationHead(commitValue);
+    const commit = commitValue as unknown as AuditGenerationCommit;
+    if (commit.generationId !== generationId || commitRaw !== renderAuditGenerationCommit(commit)) {
+      throw new Error("Audit generation commit is not canonical");
+    }
+    const { signature, ...unsigned } = commit;
+    if (!authenticatedSignatureMatches(signature, auditGenerationCommitSignature(key, unsigned))) {
+      throw new Error("Audit generation commit is not authenticated");
+    }
+    authenticatedCommit = true;
+
+    const files = new Map(await Promise.all(
+      [SCREEN_REGISTRY_FILE, DRIFT_REPORT_FILE, EVIDENCE_CATALOG_FILE, AUDIT_GENERATION_MANIFEST_FILE].map(async (name) => {
+        const path = assertPathInsideWorkspace(directory, join(/* turbopackIgnore: true */ directory, name));
+        await assertRegularDocument(path);
+        return [name, path] as const;
+      }),
+    ));
+    const registryRaw = await readBoundedDocument(files.get(SCREEN_REGISTRY_FILE)!);
+    const reportRaw = await readBoundedDocument(files.get(DRIFT_REPORT_FILE)!);
+    const catalogPath = files.get(EVIDENCE_CATALOG_FILE)!;
+    const catalogRaw = await readBoundedDocument(catalogPath);
+    const manifestRaw = await readBoundedDocument(files.get(AUDIT_GENERATION_MANIFEST_FILE)!);
+    if (
+      documentDigest(registryRaw) !== commit.registryDigest ||
+      documentDigest(reportRaw) !== commit.reportDigest ||
+      documentDigest(catalogRaw) !== commit.catalogDigest ||
+      documentDigest(manifestRaw) !== commit.manifestDigest
+    ) throw new Error("Committed audit generation member digest is inconsistent");
+    let manifestParsed: unknown;
+    try { manifestParsed = JSON.parse(manifestRaw); } catch {
+      throw new Error("Committed audit generation manifest is malformed");
+    }
+    if (manifestParsed === null || typeof manifestParsed !== "object" || Array.isArray(manifestParsed)) {
+      throw new Error("Committed audit generation manifest is malformed");
+    }
+    const manifestValue = manifestParsed as Record<string, unknown>;
+    exactObjectKeys(manifestValue, [
+      "kind", "projectId", "rootFingerprint", "generationId", "sequence", "previousGenerationId",
+      "previousCommitDigest", "previousHeadDigest", "registryEntityId", "registryRevision",
+      "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest",
+      "headDigest", "signature",
+    ], "Audit generation manifest");
+    if (manifestValue.kind !== "DESIGN_SHARINGAN_AUDIT_GENERATION" || !isDigest(manifestValue.signature)) {
+      throw new Error("Committed audit generation manifest is invalid");
+    }
+    assertAuditGenerationRelations(manifestValue, projectId, canonicalRoot);
+    assertAuditGenerationHead(manifestValue);
+    const manifest = manifestValue as unknown as AuditGenerationManifest;
+    if (manifestRaw !== renderAuditGenerationManifest(manifest)) {
+      throw new Error("Committed audit generation manifest is not canonical");
+    }
+    const { signature: manifestSignature, ...manifestUnsigned } = manifest;
+    if (!authenticatedSignatureMatches(manifestSignature, auditGenerationManifestSignature(key, manifestUnsigned))) {
+      throw new Error("Committed audit generation manifest is not authenticated");
+    }
+    if (
+      !sameAuditGenerationRelations(commit, manifest) ||
+      commit.headDigest !== manifest.headDigest
+    ) throw new Error("Committed audit generation manifest relation is inconsistent");
+    const registry = parseGovernanceMetadata(registryRaw);
+    const report = parseGovernanceMetadata(reportRaw);
+    if (
+      registry.kind !== "SCREEN_REGISTRY" || report.kind !== "DRIFT_REPORT" ||
+      registry.entityId !== commit.registryEntityId || registry.revision !== commit.registryRevision ||
+      report.entityId !== commit.reportEntityId || report.revision !== commit.reportRevision ||
+      report.registryEntityId !== registry.entityId || report.registryRevision !== registry.revision
+    ) throw new Error("Committed audit generation documents are internally inconsistent");
+    await readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, catalogPath, commit.catalogDigest);
+    return { commit, commitDigest: documentDigest(commitRaw), directory };
+  } catch (error) {
+    // An unsigned/malformed filename cannot poison recovery. Once the HMAC'd
+    // commit record itself has authenticated, though, its members are durable
+    // history and corruption must fail closed instead of falling back.
+    if (!authenticatedCommit) return undefined;
+    throw error;
+  }
+}
+
+function assertAuditGenerationChain(generations: CompleteAuditGeneration[]): void {
+  if (generations.length > MAX_AUDIT_GENERATIONS) {
+    throw new Error("Audit generation history exceeds the bounded recovery limit");
+  }
+  generations.sort((left, right) => left.commit.sequence - right.commit.sequence);
+  for (let index = 0; index < generations.length; index += 1) {
+    const current = generations[index]!;
+    const previous = generations[index - 1];
+    if (index === 0) {
+      if (current.commit.sequence !== 1 || current.commit.previousGenerationId !== null ||
+        current.commit.previousCommitDigest !== AUDIT_GENESIS_DIGEST ||
+        current.commit.previousHeadDigest !== AUDIT_GENESIS_DIGEST) {
+        throw new Error("Audit generation history has an invalid genesis commit");
+      }
+      continue;
+    }
+    if (
+      previous === undefined || current.commit.sequence !== incrementAuditGenerationSequence(previous.commit.sequence) ||
+      current.commit.previousGenerationId !== previous.commit.generationId ||
+      current.commit.previousCommitDigest !== previous.commitDigest ||
+      current.commit.previousHeadDigest !== previous.commit.headDigest
+    ) throw new Error("Audit generation history chain is incomplete or replayed");
+  }
+}
+
+async function readCompleteAuditGenerations(
+  rootPath: string,
+  projectId: string,
+  machineDirectory: string,
+  canonicalRoot: string,
+  key: Buffer,
+): Promise<CompleteAuditGeneration[]> {
+  const generationRoot = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATIONS_DIRECTORY));
+  if (!(await entryExists(generationRoot))) return [];
+  const rootEntry = await lstat(generationRoot);
+  if (rootEntry.isSymbolicLink() || !rootEntry.isDirectory()) {
+    throw new Error("Audit generation root is unsafe");
+  }
+  const entries = await readdir(generationRoot, { withFileTypes: true });
+  const candidateEntries = entries.filter((entry) =>
+    entry.isDirectory() && /^[a-f0-9-]{36}$/.test(entry.name),
+  );
+  if (candidateEntries.length > MAX_AUDIT_GENERATIONS * 4) {
+    throw new Error("Audit generation recovery candidate count exceeds the bounded limit");
+  }
+  const generations = (await Promise.all(candidateEntries.map(async (entry) => {
+    return readCompleteAuditGeneration(rootPath, projectId, canonicalRoot, key, generationRoot, entry.name);
+  }))).filter((value): value is CompleteAuditGeneration => value !== undefined);
+  return generations;
 }
 
 async function readActiveAuditGeneration(
@@ -590,35 +923,25 @@ async function readActiveAuditGeneration(
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Active audit generation pointer is malformed");
   }
-  const pointer = parsed as Record<string, unknown>;
-  exactObjectKeys(pointer, ["kind", "projectId", "generationId", "registryEntityId", "registryRevision", "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest", "createdAt", "signature"], "Active audit generation pointer");
+  const pointerValue = parsed as Record<string, unknown>;
+  exactObjectKeys(pointerValue, [
+    "kind", "projectId", "rootFingerprint", "generationId", "sequence", "previousGenerationId",
+    "previousCommitDigest", "previousHeadDigest", "registryEntityId", "registryRevision",
+    "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest",
+    "headDigest", "commitDigest", "createdAt", "signature",
+  ], "Active audit generation pointer");
+  const canonicalRoot = await canonicalProjectRoot(rootPath);
   if (
-    pointer.kind !== "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION" || pointer.projectId !== projectId ||
-    typeof pointer.generationId !== "string" || !/^[a-f0-9-]{36}$/.test(pointer.generationId) ||
-    typeof pointer.registryEntityId !== "string" || !SAFE_ID_PATTERN.test(pointer.registryEntityId) ||
-    !Number.isSafeInteger(pointer.registryRevision) || (pointer.registryRevision as number) < 1 ||
-    typeof pointer.reportEntityId !== "string" || !SAFE_ID_PATTERN.test(pointer.reportEntityId) ||
-    !Number.isSafeInteger(pointer.reportRevision) || (pointer.reportRevision as number) < 1 ||
-    !isDigest(pointer.registryDigest) || !isDigest(pointer.reportDigest) || !isDigest(pointer.catalogDigest) ||
-    typeof pointer.createdAt !== "string" || new Date(pointer.createdAt).toISOString() !== pointer.createdAt ||
-    typeof pointer.signature !== "string" || !/^[a-f0-9]{64}$/.test(pointer.signature)
+    pointerValue.kind !== "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION" ||
+    typeof pointerValue.createdAt !== "string" || new Date(pointerValue.createdAt).toISOString() !== pointerValue.createdAt ||
+    !isDigest(pointerValue.commitDigest) || !isDigest(pointerValue.signature)
   ) throw new Error("Active audit generation pointer is invalid");
-  const normalized = pointer as unknown as ActiveAuditGeneration;
-  const canonicalPointer = `${JSON.stringify({
-    kind: normalized.kind,
-    projectId: normalized.projectId,
-    generationId: normalized.generationId,
-    registryEntityId: normalized.registryEntityId,
-    registryRevision: normalized.registryRevision,
-    reportEntityId: normalized.reportEntityId,
-    reportRevision: normalized.reportRevision,
-    registryDigest: normalized.registryDigest,
-    reportDigest: normalized.reportDigest,
-    catalogDigest: normalized.catalogDigest,
-    createdAt: normalized.createdAt,
-    signature: normalized.signature,
-  })}\n`;
-  if (raw !== canonicalPointer) throw new Error("Active audit generation pointer is not canonical");
+  assertAuditGenerationRelations(pointerValue, projectId, canonicalRoot);
+  assertAuditGenerationHead(pointerValue);
+  const normalized = pointerValue as unknown as ActiveAuditGeneration;
+  if (raw !== renderActiveAuditGeneration(normalized)) {
+    throw new Error("Active audit generation pointer is not canonical");
+  }
   const { signature, ...unsigned } = normalized;
   const key = await authorityKey(rootPath, false);
   const expected = Buffer.from(activeAuditGenerationSignature(key, unsigned), "hex");
@@ -626,74 +949,16 @@ async function readActiveAuditGeneration(
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
     throw new Error("Active audit generation pointer is not authenticated");
   }
-  const root = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATIONS_DIRECTORY));
-  const directory = assertPathInsideWorkspace(root, join(root, normalized.generationId));
-  const entry = await lstat(directory);
-  if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("Active audit generation directory is unsafe");
-  const files = new Map(await Promise.all(
-    [SCREEN_REGISTRY_FILE, DRIFT_REPORT_FILE, EVIDENCE_CATALOG_FILE, AUDIT_GENERATION_MANIFEST_FILE].map(async (name) => {
-      const path = assertPathInsideWorkspace(directory, join(/*turbopackIgnore: true */ directory, name));
-      await assertRegularDocument(path);
-      return [name, path] as const;
-    }),
-  ));
-  const registryRaw = await readBoundedDocument(files.get(SCREEN_REGISTRY_FILE)!);
-  const reportRaw = await readBoundedDocument(files.get(DRIFT_REPORT_FILE)!);
-  const catalogPath = files.get(EVIDENCE_CATALOG_FILE)!;
-  const catalogRaw = await readBoundedDocument(catalogPath);
+
+  const complete = await readCompleteAuditGenerations(rootPath, projectId, machineDirectory, canonicalRoot, key);
+  if (complete.length === 0) throw new Error("Active audit generation pointer has no committed generation");
+  assertAuditGenerationChain(complete);
+  const latest = complete.at(-1)!;
   if (
-    documentDigest(registryRaw) !== normalized.registryDigest ||
-    documentDigest(reportRaw) !== normalized.reportDigest ||
-    documentDigest(catalogRaw) !== normalized.catalogDigest
-  ) throw new Error("Active audit generation member digest does not match its signed pointer");
-  const registry = parseGovernanceMetadata(registryRaw);
-  const report = parseGovernanceMetadata(reportRaw);
-  const manifestRaw = await readBoundedDocument(files.get(AUDIT_GENERATION_MANIFEST_FILE)!);
-  let manifest: unknown;
-  try { manifest = JSON.parse(manifestRaw); } catch {
-    throw new Error("Active audit generation manifest is malformed");
-  }
-  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
-    throw new Error("Active audit generation manifest is malformed");
-  }
-  const manifestValue = manifest as Record<string, unknown>;
-  exactObjectKeys(manifestValue, ["kind", "projectId", "generationId", "registryEntityId", "registryRevision", "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest", "signature"], "Active audit generation manifest");
-  if (!isDigest(manifestValue.signature)) throw new Error("Active audit generation manifest signature is invalid");
-  const normalizedManifest = manifestValue as unknown as AuditGenerationManifest;
-  const canonicalManifest = `${JSON.stringify({
-    kind: normalizedManifest.kind,
-    projectId: normalizedManifest.projectId,
-    generationId: normalizedManifest.generationId,
-    registryEntityId: normalizedManifest.registryEntityId,
-    registryRevision: normalizedManifest.registryRevision,
-    reportEntityId: normalizedManifest.reportEntityId,
-    reportRevision: normalizedManifest.reportRevision,
-    registryDigest: normalizedManifest.registryDigest,
-    reportDigest: normalizedManifest.reportDigest,
-    catalogDigest: normalizedManifest.catalogDigest,
-    signature: normalizedManifest.signature,
-  })}\n`;
-  if (manifestRaw !== canonicalManifest) throw new Error("Active audit generation manifest is not canonical");
-  const { signature: manifestSignature, ...manifestUnsigned } = normalizedManifest;
-  const manifestExpected = Buffer.from(auditGenerationManifestSignature(key, manifestUnsigned), "hex");
-  const manifestActual = Buffer.from(manifestSignature, "hex");
-  if (manifestActual.length !== manifestExpected.length || !timingSafeEqual(manifestActual, manifestExpected)) {
-    throw new Error("Active audit generation manifest is not authenticated");
-  }
-  if (
-    registry.kind !== "SCREEN_REGISTRY" || report.kind !== "DRIFT_REPORT" ||
-    registry.entityId !== normalized.registryEntityId || registry.revision !== normalized.registryRevision ||
-    report.entityId !== normalized.reportEntityId || report.revision !== normalized.reportRevision ||
-    report.registryEntityId !== registry.entityId || report.registryRevision !== registry.revision ||
-    manifestValue.kind !== "DESIGN_SHARINGAN_AUDIT_GENERATION" ||
-    manifestValue.projectId !== projectId || manifestValue.generationId !== normalized.generationId ||
-    manifestValue.registryEntityId !== normalized.registryEntityId || manifestValue.registryRevision !== normalized.registryRevision ||
-    manifestValue.reportEntityId !== normalized.reportEntityId || manifestValue.reportRevision !== normalized.reportRevision ||
-    manifestValue.registryDigest !== normalized.registryDigest || manifestValue.reportDigest !== normalized.reportDigest ||
-    manifestValue.catalogDigest !== normalized.catalogDigest
-  ) throw new Error("Active audit generation is internally inconsistent with its pointer");
-  await readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, catalogPath, normalized.catalogDigest);
-  return { pointer: normalized, directory };
+    !sameAuditGenerationRelations(normalized, latest.commit) ||
+    normalized.headDigest !== latest.commit.headDigest || normalized.commitDigest !== latest.commitDigest
+  ) throw new Error("Active audit generation pointer is behind or does not match the committed head");
+  return { pointer: normalized, directory: latest.directory };
 }
 
 async function activeAuditGenerationMember(
@@ -717,15 +982,36 @@ export async function commitAuditGenerationUnderLock(
   const machineDirectory = await machineStateDirectory(input.rootPath, false);
   const previous = await readActiveAuditGeneration(input.rootPath, input.projectId);
   const generationRoot = await ensurePrivateDirectory(machineDirectory, AUDIT_GENERATIONS_DIRECTORY);
+  const existing = await readCompleteAuditGenerations(
+    input.rootPath,
+    input.projectId,
+    machineDirectory,
+    await canonicalProjectRoot(input.rootPath),
+    await authorityKey(input.rootPath, false),
+  );
+  assertAuditGenerationChain(existing);
+  const prior = existing.at(-1);
+  if (previous !== undefined && (
+    prior === undefined || previous.pointer.generationId !== prior.commit.generationId ||
+    previous.pointer.commitDigest !== prior.commitDigest
+  )) throw new Error("Active audit generation is not the committed head");
+  if (existing.length >= MAX_AUDIT_GENERATIONS) {
+    throw new Error("Audit generation retention limit prevents another committed generation");
+  }
   const generationId = randomUUID();
   const generationDirectory = assertPathInsideWorkspace(generationRoot, join(generationRoot, generationId));
   await mkdir(generationDirectory, { mode: 0o700 });
   const renderedCatalog = await renderAuthenticatedEvidenceCatalog(input.rootPath, input.projectId, input.catalog);
   const key = await authorityKey(input.rootPath, false);
-  const manifestUnsigned: Omit<AuditGenerationManifest, "signature"> = {
-    kind: "DESIGN_SHARINGAN_AUDIT_GENERATION",
+  const canonicalRoot = await canonicalProjectRoot(input.rootPath);
+  const relations: AuditGenerationRelations = {
     projectId: input.projectId,
+    rootFingerprint: rootFingerprint(canonicalRoot),
     generationId,
+    sequence: prior === undefined ? 1 : incrementAuditGenerationSequence(prior.commit.sequence),
+    previousGenerationId: prior?.commit.generationId ?? null,
+    previousCommitDigest: prior?.commitDigest ?? AUDIT_GENESIS_DIGEST,
+    previousHeadDigest: prior?.commit.headDigest ?? AUDIT_GENESIS_DIGEST,
     registryEntityId: input.registryEntityId,
     registryRevision: input.registryRevision,
     reportEntityId: input.reportEntityId,
@@ -733,6 +1019,12 @@ export async function commitAuditGenerationUnderLock(
     registryDigest: documentDigest(input.registryMarkdown),
     reportDigest: documentDigest(input.reportMarkdown),
     catalogDigest: documentDigest(renderedCatalog.markdown),
+  };
+  const headDigest = auditGenerationHeadDigest(relations);
+  const manifestUnsigned: Omit<AuditGenerationManifest, "signature"> = {
+    kind: "DESIGN_SHARINGAN_AUDIT_GENERATION",
+    ...relations,
+    headDigest,
   };
   const manifest: AuditGenerationManifest = {
     ...manifestUnsigned,
@@ -742,7 +1034,8 @@ export async function commitAuditGenerationUnderLock(
     await atomicWriteDocument(generationDirectory, SCREEN_REGISTRY_FILE, input.registryMarkdown);
     await atomicWriteDocument(generationDirectory, DRIFT_REPORT_FILE, input.reportMarkdown);
     await atomicWriteDocument(generationDirectory, EVIDENCE_CATALOG_FILE, renderedCatalog.markdown);
-    await atomicWriteDocument(generationDirectory, AUDIT_GENERATION_MANIFEST_FILE, `${JSON.stringify(manifest)}\n`);
+    const manifestMarkdown = renderAuditGenerationManifest(manifest);
+    await atomicWriteDocument(generationDirectory, AUDIT_GENERATION_MANIFEST_FILE, manifestMarkdown);
     const registryRaw = await readBoundedDocument(join(generationDirectory, SCREEN_REGISTRY_FILE));
     const reportRaw = await readBoundedDocument(join(generationDirectory, DRIFT_REPORT_FILE));
     const catalogRaw = await readBoundedDocument(join(generationDirectory, EVIDENCE_CATALOG_FILE));
@@ -761,24 +1054,37 @@ export async function commitAuditGenerationUnderLock(
     ) throw new Error("Staged audit generation is internally inconsistent");
     await syncDirectory(generationDirectory);
     throwAuditTransactionFault("after-stage");
+    throwAuditTransactionFault("before-pointer");
+
+    // The signed commit record is the durable transition. Once this has been
+    // synced, later pointer replay cannot make an earlier complete generation
+    // authoritative, because readers enumerate and validate this chain first.
+    const commitUnsigned: Omit<AuditGenerationCommit, "signature"> = {
+      kind: "DESIGN_SHARINGAN_AUDIT_COMMIT",
+      ...relations,
+      headDigest,
+      manifestDigest: documentDigest(manifestMarkdown),
+      committedAt: new Date().toISOString(),
+    };
+    const commit: AuditGenerationCommit = {
+      ...commitUnsigned,
+      signature: auditGenerationCommitSignature(key, commitUnsigned),
+    };
+    const commitMarkdown = renderAuditGenerationCommit(commit);
+    await atomicWriteDocument(generationDirectory, AUDIT_GENERATION_COMMIT_FILE, commitMarkdown);
+    await syncDirectory(generationDirectory);
     const unsigned: Omit<ActiveAuditGeneration, "signature"> = {
       kind: "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION",
-      projectId: input.projectId,
-      generationId,
-      registryEntityId: input.registryEntityId,
-      registryRevision: input.registryRevision,
-      reportEntityId: input.reportEntityId,
-      reportRevision: input.reportRevision,
-      registryDigest: manifest.registryDigest,
-      reportDigest: manifest.reportDigest,
-      catalogDigest: manifest.catalogDigest,
+      ...relations,
+      headDigest,
+      commitDigest: documentDigest(commitMarkdown),
       createdAt: new Date().toISOString(),
     };
     const pointer: ActiveAuditGeneration = {
       ...unsigned,
       signature: activeAuditGenerationSignature(key, unsigned),
     };
-    await atomicWriteDocument(machineDirectory, AUDIT_GENERATION_POINTER_FILE, `${JSON.stringify(pointer)}\n`);
+    await atomicWriteDocument(machineDirectory, AUDIT_GENERATION_POINTER_FILE, renderActiveAuditGeneration(pointer));
     throwAuditTransactionFault("after-pointer");
 
     // These remain human-readable projections. Readers use the authenticated
@@ -786,9 +1092,6 @@ export async function commitAuditGenerationUnderLock(
     await atomicWriteDocument(input.governanceDirectory, SCREEN_REGISTRY_FILE, input.registryMarkdown);
     await atomicWriteDocument(input.governanceDirectory, DRIFT_REPORT_FILE, input.reportMarkdown);
     await atomicWriteDocument(machineDirectory, EVIDENCE_CATALOG_FILE, renderedCatalog.markdown);
-    if (previous !== undefined && previous.pointer.generationId !== generationId) {
-      await rm(previous.directory, { recursive: true, force: false });
-    }
   } catch (error) {
     const active = await readActiveAuditGeneration(input.rootPath, input.projectId).catch(() => undefined);
     if (active?.pointer.generationId !== generationId) {
@@ -1341,7 +1644,7 @@ async function reconcileAuditGenerations(rootPath: string, machineDirectory: str
     throw new Error("Audit generation root is unsafe");
   }
   const pointerPath = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATION_POINTER_FILE));
-  let active: Awaited<ReturnType<typeof readActiveAuditGeneration>>;
+  let committedIds: Set<string> | undefined;
   if (await entryExists(pointerPath)) {
     let raw: unknown;
     try { raw = JSON.parse(await readBoundedDocument(pointerPath)); } catch {
@@ -1350,17 +1653,38 @@ async function reconcileAuditGenerations(rootPath: string, machineDirectory: str
     if (raw === null || typeof raw !== "object" || Array.isArray(raw) || typeof (raw as { projectId?: unknown }).projectId !== "string") {
       throw new Error("Active audit generation pointer is malformed");
     }
-    active = await readActiveAuditGeneration(rootPath, (raw as { projectId: string }).projectId);
+    const projectId = (raw as { projectId: string }).projectId;
+    await readActiveAuditGeneration(rootPath, projectId);
+    const complete = await readCompleteAuditGenerations(
+      rootPath,
+      projectId,
+      machineDirectory,
+      await canonicalProjectRoot(rootPath),
+      await authorityKey(rootPath, false),
+    );
+    assertAuditGenerationChain(complete);
+    committedIds = new Set(complete.map(({ commit }) => commit.generationId));
   }
-  const activeId = active?.pointer.generationId;
   const entries = await readdir(generationRoot, { withFileTypes: true });
-  if (entries.length > 32) throw new Error("Audit generation residue exceeds the recovery bound");
+  let retained = 0;
   for (const entry of entries) {
-    if (!entry.isDirectory() || !/^[a-f0-9-]{36}$/.test(entry.name) || entry.name === activeId) continue;
+    if (!entry.isDirectory() || !/^[a-f0-9-]{36}$/.test(entry.name)) continue;
     const candidate = assertPathInsideWorkspace(generationRoot, join(generationRoot, entry.name));
     const current = await lstat(candidate);
     if (current.isSymbolicLink() || !current.isDirectory()) throw new Error("Audit generation residue is unsafe");
-    await rm(candidate, { recursive: true, force: false });
+    const commitPath = assertPathInsideWorkspace(candidate, join(candidate, AUDIT_GENERATION_COMMIT_FILE));
+    if (!(await entryExists(commitPath)) || (committedIds !== undefined && !committedIds.has(entry.name))) {
+      // Staged directories have no signed commit marker and are never part of
+      // history. An unsigned marker is also not a committed record; remove
+      // both only while holding the writer lock so filenames cannot consume
+      // the bounded retention budget.
+      await rm(candidate, { recursive: true, force: false });
+      continue;
+    }
+    retained += 1;
+  }
+  if (retained > MAX_AUDIT_GENERATIONS) {
+    throw new Error("Audit generation retained history exceeds the bounded limit");
   }
 }
 

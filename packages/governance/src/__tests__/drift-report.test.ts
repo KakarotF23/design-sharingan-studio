@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +6,7 @@ import type { DesignGenome, ScreenRecord } from "@design-sharingan/core";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   approveGenome,
+  incrementAuditGenerationSequence,
   initializeGovernance,
   readEvidenceCatalog,
   readDriftReport,
@@ -340,6 +341,101 @@ describe("Drift Report governance store", () => {
     expect(report.metadata.registryEntityId).toBe(registry.metadata.entityId);
   });
 
+  it("keeps generation A authoritative when generation B faults before its signed pointer is published", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "drift-report-before-pointer-")));
+    roots.push(root);
+    await initialize(root);
+    await saveDriftReport({ rootPath: root, projectId: "project-a", expectedRevision: 1, evidenceCatalog: [], report: unavailableReport() });
+    const registryA = await readScreenRegistry(root, "project-a");
+
+    setAuditTransactionFaultForTest("before-pointer");
+    await expect(saveDriftReport({
+      rootPath: root,
+      projectId: "project-a",
+      expectedRevision: registryA.metadata.revision,
+      evidenceCatalog: [],
+      report: unavailableReport(),
+    })).rejects.toThrow(/fault/i);
+    setAuditTransactionFaultForTest(undefined);
+
+    await expect(readScreenRegistry(root, "project-a")).resolves.toMatchObject({
+      metadata: { entityId: registryA.metadata.entityId, revision: registryA.metadata.revision },
+    });
+  });
+
+  it("ignores an unsigned incomplete higher generation candidate during recovery", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "drift-report-incomplete-candidate-")));
+    roots.push(root);
+    await initialize(root);
+    await saveDriftReport({ rootPath: root, projectId: "project-a", expectedRevision: 1, evidenceCatalog: [], report: unavailableReport() });
+    const registry = await readScreenRegistry(root, "project-a");
+    const candidate = join(root, ".design-sharingan", "audit-generations", "11111111-1111-4111-8111-111111111111");
+    await mkdir(candidate, { mode: 0o700 });
+    await writeFile(join(candidate, "commit.json"), "{not-authenticated}\n", "utf8");
+
+    await expect(readScreenRegistry(root, "project-a")).resolves.toMatchObject({
+      metadata: { entityId: registry.metadata.entityId, revision: registry.metadata.revision },
+    });
+  });
+
+  it("rejects a seventeenth committed generation instead of overflowing bounded retention", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "drift-report-retention-bound-")));
+    roots.push(root);
+    await initialize(root);
+    let revision = 1;
+    for (let index = 0; index < 16; index += 1) {
+      await saveDriftReport({ rootPath: root, projectId: "project-a", expectedRevision: revision, evidenceCatalog: [], report: unavailableReport() });
+      revision = (await readScreenRegistry(root, "project-a")).metadata.revision;
+    }
+
+    await expect(saveDriftReport({
+      rootPath: root,
+      projectId: "project-a",
+      expectedRevision: revision,
+      evidenceCatalog: [],
+      report: unavailableReport(),
+    })).rejects.toThrow(/retention|bounded/i);
+  });
+
+  it("rejects an audit sequence increment past the safe integer maximum", () => {
+    expect(() => incrementAuditGenerationSequence(Number.MAX_SAFE_INTEGER)).toThrow(/safe maximum/i);
+  });
+
+  it("rejects replay of generation A's signed pointer after generation B committed before an after-pointer crash", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "drift-report-after-pointer-replay-")));
+    roots.push(root);
+    await initialize(root);
+    await saveDriftReport({
+      rootPath: root,
+      projectId: "project-a",
+      expectedRevision: 1,
+      evidenceCatalog: [],
+      report: unavailableReport(),
+    });
+    const pointerPath = join(root, ".design-sharingan", "active-audit-generation.json");
+    const generationAPointer = await readFile(pointerPath, "utf8");
+    const registry = await readScreenRegistry(root, "project-a");
+
+    setAuditTransactionFaultForTest("after-pointer");
+    await expect(saveDriftReport({
+      rootPath: root,
+      projectId: "project-a",
+      expectedRevision: registry.metadata.revision,
+      evidenceCatalog: [{
+        id: "ev_route_after_pointer_b_01",
+        kind: "ROUTE",
+        route: "/reports",
+        excerpt: "Authenticated evidence committed by generation B.",
+        verifiedClaims: [],
+      }],
+      report: unavailableReport(),
+    })).rejects.toThrow(/fault/i);
+    setAuditTransactionFaultForTest(undefined);
+
+    await writeFile(pointerPath, generationAPointer, "utf8");
+    await expect(readScreenRegistry(root, "project-a")).rejects.toThrow(/head|generation|replay|behind/i);
+  });
+
   it("rejects a pointer whose Registry file no longer has the committed generation revision", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "drift-report-revision-")));
     roots.push(root);
@@ -439,6 +535,18 @@ describe("Drift Report governance store", () => {
     await writeFile(manifestPath, `\n${await readFile(manifestPath, "utf8")}`, "utf8");
 
     await expect(readDriftReport(root, "project-a")).rejects.toThrow(/manifest|generation|integrity/i);
+  });
+
+  it("fails closed when the signed durable commit record is tampered", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "drift-report-commit-tamper-")));
+    roots.push(root);
+    await initialize(root);
+    await saveDriftReport({ rootPath: root, projectId: "project-a", expectedRevision: 1, evidenceCatalog: [], report: unavailableReport() });
+    const pointer = JSON.parse(await readFile(join(root, ".design-sharingan", "active-audit-generation.json"), "utf8")) as { generationId: string };
+    const commitPath = join(root, ".design-sharingan", "audit-generations", pointer.generationId, "commit.json");
+    await writeFile(commitPath, `\n${await readFile(commitPath, "utf8")}`, "utf8");
+
+    await expect(readScreenRegistry(root, "project-a")).rejects.toThrow(/commit|generation|head/i);
   });
 
   it("rejects a signed catalog substituted from an earlier generation", async () => {
