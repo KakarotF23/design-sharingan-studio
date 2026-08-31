@@ -6,6 +6,8 @@ import {
   safeProjectId,
   withGovernanceLock,
   readGenome,
+  readEvidenceCatalog,
+  incrementGovernanceRevision,
 } from "./genome-store";
 import {
   assertScreenRecords,
@@ -32,6 +34,11 @@ export async function readScreenRegistry(
     throw new Error("SCREEN-REGISTRY.md contains the wrong governance document kind");
   }
   const genome = await readGenome(rootPath, projectId);
+  const evidenceCatalog = await readEvidenceCatalog(rootPath, projectId);
+  const catalogIds = new Set(evidenceCatalog.map(({ id }) => id));
+  if (metadata.evidenceIds.some((id) => !catalogIds.has(id))) {
+    throw new Error("Screen Registry evidence is not authenticated by the durable evidence catalog");
+  }
   if (
     metadata.genomeEntityId !== genome.metadata.entityId ||
     metadata.genomeVersion !== genome.value.version ||
@@ -41,7 +48,8 @@ export async function readScreenRegistry(
   }
   assertScreenRecords(metadata.records, {
     genome: genome.value,
-    evidenceIds: metadata.evidenceIds,
+    evidenceIds: evidenceCatalog.map(({ id }) => id),
+    evidenceRoutes: Object.fromEntries(evidenceCatalog.map(({ id, route }) => [id, route])),
   });
   return document(metadata);
 }
@@ -59,14 +67,16 @@ export async function saveScreenRegistry(
       throw new Error("Screen Registry revision is stale");
     }
     const genome = await readGenome(rootPath, projectId);
+    const evidenceCatalog = await readEvidenceCatalog(rootPath, projectId);
     const evidenceIds = [...new Set(recordsInput.flatMap((record) => record.evidence))];
     const records = assertScreenRecords(recordsInput, {
       genome: genome.value,
-      evidenceIds,
+      evidenceIds: evidenceCatalog.map(({ id }) => id),
+      evidenceRoutes: Object.fromEntries(evidenceCatalog.map(({ id, route }) => [id, route])),
     });
     const metadata: ScreenRegistryMetadata = {
       ...current.metadata,
-      revision: current.metadata.revision + 1,
+      revision: incrementGovernanceRevision(current.metadata.revision),
       genomeEntityId: genome.metadata.entityId,
       genomeVersion: genome.value.version,
       genomeRevision: genome.metadata.revision,

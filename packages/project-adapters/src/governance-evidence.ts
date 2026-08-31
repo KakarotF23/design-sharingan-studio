@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { extname, isAbsolute, join, posix } from "node:path";
-import type { RenderArtifact } from "@design-sharingan/core";
+import {
+  normalizeGovernanceRoute,
+  type GovernanceVerifiedClaim,
+  type RenderArtifact,
+} from "@design-sharingan/core";
 import { loadMangekyoLoopSession } from "./mangekyo-loop-store";
 import { assertPathInsideWorkspace } from "./path-policy";
 import { listSessions } from "./workspace-store";
@@ -13,6 +17,7 @@ export interface AdapterGovernanceEvidence {
   excerpt: string;
   route: string;
   authenticatedRenderId?: string;
+  verifiedClaims: GovernanceVerifiedClaim[];
 }
 
 export interface CollectGovernanceEvidenceInput {
@@ -50,14 +55,9 @@ function safeRelativePath(value: string, label: string): string {
 }
 
 function safeRoute(value: string): string {
-  let decoded: string;
-  try { decoded = decodeURIComponent(value); } catch { throw new Error("Governance evidence route is invalid"); }
-  if (
-    !value.startsWith("/") || value.length > 512 || decoded.includes("\\") ||
-    /[\u0000-\u001f\u007f]/.test(decoded) || decoded.includes("//") ||
-    posix.normalize(decoded) !== decoded || /(^|\/)\.\.?($|\/)/.test(decoded)
-  ) throw new Error("Governance evidence route is invalid");
-  return value;
+  try { return normalizeGovernanceRoute(value); } catch {
+    throw new Error("Governance evidence route is invalid");
+  }
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -69,11 +69,13 @@ async function pathExists(path: string): Promise<boolean> {
 
 async function readSafeExcerpt(
   root: string,
+  rootIdentity: { dev: number; ino: number },
   relativePath: string,
   allowDirectory = false,
 ): Promise<string | undefined> {
   const relative = safeRelativePath(relativePath, "Governance evidence path");
   const candidate = join(root, relative);
+  await assertNoAliasSegments(root, rootIdentity, relative);
   if (!(await pathExists(candidate))) return undefined;
   const before = await lstat(candidate);
   if (before.isSymbolicLink()) throw new Error("Governance evidence file must not be a symbolic link");
@@ -94,10 +96,43 @@ async function readSafeExcerpt(
       throw new Error("Governance evidence identity changed while it was read");
     }
     const excerpt = scrub(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, bytesRead)));
+    await assertRootIdentity(root, rootIdentity);
     return excerpt.length === 0 ? undefined : excerpt;
   } finally {
     await handle.close();
   }
+}
+
+async function assertRootIdentity(
+  root: string,
+  identity: { dev: number; ino: number },
+): Promise<void> {
+  const current = await lstat(root);
+  if (
+    current.isSymbolicLink() || !current.isDirectory() ||
+    current.dev !== identity.dev || current.ino !== identity.ino
+  ) throw new Error("Governance evidence project root identity changed");
+}
+
+async function assertNoAliasSegments(
+  root: string,
+  rootIdentity: { dev: number; ino: number },
+  relativePath: string,
+): Promise<void> {
+  await assertRootIdentity(root, rootIdentity);
+  let current = root;
+  for (const segment of relativePath.split("/")) {
+    current = join(current, segment);
+    const entry = await lstat(current).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (entry === undefined) break;
+    if (entry.isSymbolicLink()) {
+      throw new Error("Governance evidence path segment must not be a symbolic link alias");
+    }
+  }
+  await assertRootIdentity(root, rootIdentity);
 }
 
 function evidenceId(factory: () => string): string {
@@ -139,17 +174,20 @@ export async function collectGovernanceEvidence(
     kind: "ROUTE",
     excerpt: `Authenticated project inspection detected this current route.`,
     route,
+    verifiedClaims: [],
   }));
   const representativeRoute = routes[0]!;
 
   for (const document of input.designDocuments.slice(0, 4)) {
-    const excerpt = await readSafeExcerpt(root, document, true);
+    const excerpt = await readSafeExcerpt(root, rootEntry, document, true);
     if (excerpt !== undefined) evidence.push({
       id: evidenceId(createId), kind: "DOCUMENT", excerpt, route: representativeRoute,
+      verifiedClaims: [],
     });
   }
   for (const directoryRelative of input.componentDirectories.slice(0, 4)) {
     const relative = safeRelativePath(directoryRelative, "Component evidence directory");
+    await assertNoAliasSegments(root, rootEntry, relative);
     const directory = join(root, relative);
     const directoryEntry = await lstat(directory);
     if (directoryEntry.isSymbolicLink() || !directoryEntry.isDirectory()) {
@@ -160,18 +198,19 @@ export async function collectGovernanceEvidence(
       .sort((left, right) => left.name.localeCompare(right.name))
       .slice(0, 3);
     for (const entry of entries) {
-      const excerpt = await readSafeExcerpt(root, posix.join(relative, entry.name));
+      const excerpt = await readSafeExcerpt(root, rootEntry, posix.join(relative, entry.name));
       if (excerpt === undefined) continue;
       const lower = entry.name.toLowerCase();
       const kind = /nav|sidebar|header|rail/.test(lower)
         ? "NAVIGATION" as const
         : /token|theme|\.css$/.test(lower) ? "TOKEN" as const : "COMPONENT" as const;
-      evidence.push({ id: evidenceId(createId), kind, excerpt, route: representativeRoute });
+      evidence.push({ id: evidenceId(createId), kind, excerpt, route: representativeRoute, verifiedClaims: [] });
     }
   }
 
   const sessionsDirectory = join(root, ".design-sharingan", "sessions");
   if (await pathExists(sessionsDirectory)) {
+    await assertNoAliasSegments(root, rootEntry, ".design-sharingan/sessions");
     const sessionRecords = (await listSessions(root, input.projectId))
       .filter(({ type }) => type === "MANGEKYO_LOOP")
       .slice(0, 3);
@@ -185,6 +224,7 @@ export async function collectGovernanceEvidence(
           excerpt: `Authenticated current render ${scrub(artifact.id)} captured for this route.`,
           route: artifact.route,
           authenticatedRenderId: artifact.id,
+          verifiedClaims: [],
         });
       }
     }
@@ -193,5 +233,6 @@ export async function collectGovernanceEvidence(
   if (new Set(evidence.map(({ id }) => id)).size !== evidence.length) {
     throw new Error("Governance evidence identities must be unique");
   }
+  await assertRootIdentity(root, rootEntry);
   return evidence;
 }

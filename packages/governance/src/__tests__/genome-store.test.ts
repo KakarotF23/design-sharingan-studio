@@ -6,6 +6,7 @@ import {
   realpath,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,7 +23,10 @@ import {
   genomePayloadHash,
   parseGovernanceMetadata,
   renderGenome,
+  renderDesignDecisions,
   renderScreenRegistry,
+  saveDesignDecisions,
+  saveScreenRegistry,
 } from "../index";
 
 const roots: string[] = [];
@@ -58,6 +62,16 @@ function screenRecord(): ScreenRecord {
   };
 }
 
+function evidenceCatalog() {
+  return [{
+    id: "ev_route_overview_01",
+    kind: "ROUTE" as const,
+    route: "/overview",
+    excerpt: "Authenticated project inspection detected this current route.",
+    verifiedClaims: [],
+  }];
+}
+
 async function projectRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "design-sharingan-governance-"));
   roots.push(root);
@@ -77,6 +91,7 @@ describe("Genome governance store", () => {
       projectId: "project-a",
       genome: draftGenome(),
       screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
       decisions: [],
     });
 
@@ -174,6 +189,7 @@ describe("Genome governance store", () => {
       projectId: "project-a",
       genome: draftGenome(),
       screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
       decisions: [],
     };
     const results = await Promise.allSettled([
@@ -191,10 +207,11 @@ describe("Genome governance store", () => {
 
   it("pre-renders all documents and leaves no partial governance for an oversized Registry", async () => {
     const root = await projectRoot();
-    const records = Array.from({ length: 128 }, (_, index) => ({
+    const records = Array.from({ length: 32 }, (_, index) => ({
       ...screenRecord(),
       id: `screen-${index}`,
       route: `/route-${index}`,
+      evidence: [`ev_route_${String(index).padStart(8, "0")}`],
       requiredStates: Array.from({ length: 64 }, (__, state) => `${state}-${"x".repeat(990)}`),
     }));
     await expect(initializeGovernance({
@@ -202,6 +219,13 @@ describe("Genome governance store", () => {
       projectId: "project-a",
       genome: draftGenome(),
       screens: records,
+      evidenceCatalog: records.map((record) => ({
+        id: record.evidence[0]!,
+        kind: "ROUTE" as const,
+        route: record.route,
+        excerpt: "Authenticated route evidence.",
+        verifiedClaims: [],
+      })),
       decisions: [],
     })).rejects.toThrow(/256 KiB/i);
     await expect(governanceIsInitialized(root)).resolves.toBe(false);
@@ -439,6 +463,7 @@ describe("Genome governance store", () => {
         projectId: "project-a",
         genome: draftGenome(),
         screens: [invalid, { ...invalid, id: "screen-other" }],
+        evidenceCatalog: evidenceCatalog(),
         decisions: [],
       }),
     ).rejects.toThrow(/route|family|verification|unique/i);
@@ -453,6 +478,7 @@ describe("Genome governance store", () => {
       projectId: "project-a",
       genome: draftGenome(),
       screens: [invalid],
+      evidenceCatalog: evidenceCatalog(),
       decisions: [],
     })).rejects.toThrow(/route/i);
     const ungrounded = screenRecord();
@@ -464,6 +490,7 @@ describe("Genome governance store", () => {
       projectId: "project-a",
       genome: draftGenome(),
       screens: [ungrounded],
+      evidenceCatalog: evidenceCatalog(),
       decisions: [],
     })).rejects.toThrow(/evidence|verification/i);
     const unauthenticatedPass = screenRecord();
@@ -474,6 +501,7 @@ describe("Genome governance store", () => {
       projectId: "project-a",
       genome: draftGenome(),
       screens: [unauthenticatedPass],
+      evidenceCatalog: evidenceCatalog(),
       decisions: [],
     })).rejects.toThrow(/remains NOT_VERIFIED|authenticated verification/i);
   });
@@ -497,7 +525,7 @@ describe("Genome governance store", () => {
         affectedComponents: [],
         migrationRequired: true,
         genomeChanges: ["Replace an invariant."],
-        approvedBy: "agent",
+        approvedBy: "agent" as never,
       }],
     })).rejects.toThrow(/ISO|proof|status|local-user/i);
   });
@@ -509,6 +537,7 @@ describe("Genome governance store", () => {
       projectId: "project-a",
       genome: draftGenome(),
       screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
       decisions: [],
     });
     const path = join(root, "design-governance", "SCREEN-REGISTRY.md");
@@ -517,6 +546,254 @@ describe("Genome governance store", () => {
     registry.genomeEntityId = "foreign-genome";
     await writeFile(path, renderScreenRegistry(registry));
     await expect(readScreenRegistry(root, "project-a")).rejects.toThrow(/active Design Genome/i);
+  });
+
+  it("recovers stale zero-byte and partial crash lock claims but preserves a recent incomplete claim", async () => {
+    for (const [name, content] of [["zero", ""], ["partial", '{"kind":']] as const) {
+      const root = await projectRoot();
+      const machine = join(root, ".design-sharingan");
+      await mkdir(machine);
+      const lock = join(machine, "governance.lock");
+      await writeFile(lock, content);
+      await utimes(lock, new Date("2000-01-01T00:00:00.000Z"), new Date("2000-01-01T00:00:00.000Z"));
+
+      await expect(initializeGovernance({
+        rootPath: root,
+        projectId: `project-${name}`,
+        genome: draftGenome(),
+        screens: [],
+        decisions: [],
+      })).resolves.toBeDefined();
+    }
+
+    const liveRoot = await projectRoot();
+    const liveMachine = join(liveRoot, ".design-sharingan");
+    await mkdir(liveMachine);
+    await writeFile(join(liveMachine, "governance.lock"), "");
+    await expect(initializeGovernance({
+      rootPath: liveRoot,
+      projectId: "project-live",
+      genome: draftGenome(),
+      screens: [],
+      decisions: [],
+    })).rejects.toThrow(/busy/i);
+  });
+
+  it.each([
+    "/a%2Fb",
+    "/a%5Cb",
+    "/a%3Fb",
+    "/a%23b",
+    "/%2e/private",
+    "/a?query=1",
+    "/a#fragment",
+  ])("rejects ambiguous or noncanonical route %s", async (route) => {
+    const root = await projectRoot();
+    await expect(initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [{ ...screenRecord(), route }],
+      evidenceCatalog: [{ ...evidenceCatalog()[0]!, route }],
+      decisions: [],
+    })).rejects.toThrow(/route/i);
+  });
+
+  it("canonicalizes unreserved route encoding before enforcing route uniqueness", async () => {
+    const root = await projectRoot();
+    await expect(initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [
+        { ...screenRecord(), id: "screen-a", route: "/over%76iew" },
+        { ...screenRecord(), id: "screen-b", route: "/overview" },
+      ],
+      evidenceCatalog: evidenceCatalog(),
+      decisions: [],
+    })).rejects.toThrow(/routes must be unique/i);
+  });
+
+  it("normalizes canonically equivalent Unicode routes before uniqueness checks", async () => {
+    const root = await projectRoot();
+    await expect(initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [
+        {
+          ...screenRecord(),
+          id: "screen-a",
+          route: "/caf%C3%A9",
+          evidence: ["ev_route_overview_01"],
+        },
+        {
+          ...screenRecord(),
+          id: "screen-b",
+          route: "/cafe%CC%81",
+          evidence: ["ev_route_unicode_0002"],
+        },
+      ],
+      evidenceCatalog: [
+        { ...evidenceCatalog()[0]!, route: "/caf%C3%A9" },
+        {
+          ...evidenceCatalog()[0]!,
+          id: "ev_route_unicode_0002",
+          route: "/cafe%CC%81",
+        },
+      ],
+      decisions: [],
+    })).rejects.toThrow(/routes must be unique/i);
+  });
+
+  it("authenticates Registry evidence against the durable server catalog", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
+      decisions: [],
+    });
+    const catalogPath = join(root, ".design-sharingan", "governance-evidence.json");
+    const catalog = JSON.parse(await readFile(catalogPath, "utf8")) as {
+      entries: Array<{ id: string }>;
+    };
+    catalog.entries[0]!.id = "ev_attacker_forged_01";
+    await writeFile(catalogPath, JSON.stringify(catalog));
+
+    await expect(readScreenRegistry(root, "project-a")).rejects.toThrow(/evidence catalog|signature|authenticated/i);
+  });
+
+  it("rejects Registry evidence that is not present in the durable catalog", async () => {
+    const root = await projectRoot();
+    await expect(initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [screenRecord()],
+      evidenceCatalog: [],
+      decisions: [],
+    })).rejects.toThrow(/evidence catalog/i);
+  });
+
+  it("rejects a Registry citation scoped to a different catalog route", async () => {
+    const root = await projectRoot();
+    await expect(initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [screenRecord()],
+      evidenceCatalog: [{ ...evidenceCatalog()[0]!, route: "/different" }],
+      inspectedScope: {
+        representative: true,
+        routes: ["/different"],
+        evidenceIds: ["ev_route_overview_01"],
+      },
+      decisions: [],
+    })).rejects.toThrow(/evidence.*route|route.*evidence/i);
+  });
+
+  it("requires every Decision screen reference to match a canonical Registry id or route", async () => {
+    const root = await projectRoot();
+    await expect(initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
+      decisions: [{
+        id: "decision-1",
+        date: "2026-08-31T00:00:00.000Z",
+        status: "DRAFT",
+        scope: "Overview",
+        decision: "Consider a scoped layout change.",
+        reason: "Needs local review.",
+        alternatives: [],
+        affectedScreens: ["/unknown"],
+        affectedComponents: [],
+        migrationRequired: false,
+        genomeChanges: [],
+      }],
+    })).rejects.toThrow(/registered screen/i);
+  });
+
+  it("rejects forged Registry catalog citations even when canonical Markdown is regenerated", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
+      decisions: [],
+    });
+    const path = join(root, "design-governance", "SCREEN-REGISTRY.md");
+    const registry = parseGovernanceMetadata(await readFile(path, "utf8"));
+    if (registry.kind !== "SCREEN_REGISTRY") throw new Error("test Registry kind changed");
+    registry.evidenceIds.push("ev_attacker_forged_01");
+    await writeFile(path, renderScreenRegistry(registry));
+
+    await expect(readScreenRegistry(root, "project-a")).rejects.toThrow(/evidence catalog|authenticated/i);
+  });
+
+  it("validates Decision screen relations on both writer and loader", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
+      decisions: [],
+    });
+    const invalidDecision = {
+      id: "decision-1",
+      date: "2026-08-31T00:00:00.000Z",
+      status: "DRAFT" as const,
+      scope: "Overview",
+      decision: "Consider a scoped layout change.",
+      reason: "Needs local review.",
+      alternatives: [],
+      affectedScreens: ["/unknown"],
+      affectedComponents: [],
+      migrationRequired: false,
+      genomeChanges: [],
+    };
+    await expect(saveDesignDecisions(root, "project-a", [invalidDecision], 1))
+      .rejects.toThrow(/registered screen/i);
+
+    const path = join(root, "design-governance", "DESIGN-DECISIONS.md");
+    const decisions = parseGovernanceMetadata(await readFile(path, "utf8"));
+    if (decisions.kind !== "DESIGN_DECISIONS") throw new Error("test Decisions kind changed");
+    decisions.decisions = [invalidDecision];
+    await writeFile(path, renderDesignDecisions(decisions));
+    await expect(readDesignDecisions(root, "project-a")).rejects.toThrow(/registered screen/i);
+  });
+
+  it("rejects revision overflow instead of producing an unsafe increment", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: draftGenome(),
+      screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
+      decisions: [],
+    });
+    const path = join(root, "design-governance", "SCREEN-REGISTRY.md");
+    const registry = parseGovernanceMetadata(await readFile(path, "utf8"));
+    if (registry.kind !== "SCREEN_REGISTRY") throw new Error("test Registry kind changed");
+    registry.revision = Number.MAX_SAFE_INTEGER;
+    await writeFile(path, renderScreenRegistry(registry));
+
+    await expect(saveScreenRegistry(
+      root,
+      "project-a",
+      [screenRecord()],
+      Number.MAX_SAFE_INTEGER,
+    )).rejects.toThrow(/revision.*maximum|increment/i);
   });
 });
 

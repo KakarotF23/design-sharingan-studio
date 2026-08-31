@@ -133,7 +133,12 @@ export async function initializeProjectGovernance(
           ],
           evidence: evidenceCatalog
             .filter((evidence) => evidence.route === route)
-            .map(({ id, kind, excerpt }) => ({ id, kind, excerpt })),
+            .map(({ id, kind, excerpt, verifiedClaims }) => ({
+              id,
+              kind,
+              excerpt,
+              verifiedClaims,
+            })),
         })),
       },
     );
@@ -149,6 +154,9 @@ export async function initializeProjectGovernance(
     genome: result.genome,
     screens: result.screens,
     decisions: [],
+    evidenceCatalog,
+    inspectedScope: result.inspectedScope,
+    claimCitations: result.claimCitations,
   });
   return loadGovernanceProjection(project);
 }

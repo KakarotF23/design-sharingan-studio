@@ -2,7 +2,15 @@ import type {
   CodexAgentResult,
   CodexAgentRunInput,
 } from "@design-sharingan/agent-runtime";
-import type { DesignGenome, ScreenRecord } from "@design-sharingan/core";
+import type {
+  DesignGenome,
+  GovernanceClaimCitation,
+  GovernanceClaimCategory,
+  GovernanceClaimScope,
+  GovernanceInspectedScope,
+  GovernanceVerifiedClaim,
+  ScreenRecord,
+} from "@design-sharingan/core";
 
 export type GenomeRuleCategory =
   | "UX_INVARIANT"
@@ -19,6 +27,7 @@ export interface GenomeInitProductIdentity {
   statement: string;
   confidence: GenomeRuleConfidence;
   evidence: string[];
+  scope: GovernanceClaimScope;
 }
 
 export interface GenomeInitRule {
@@ -26,6 +35,7 @@ export interface GenomeInitRule {
   statement: string;
   confidence: GenomeRuleConfidence;
   evidence: string[];
+  scope: GovernanceClaimScope;
 }
 
 export interface GenomeInitScreen {
@@ -62,6 +72,7 @@ export interface GovernanceEvidence {
   id: string;
   kind: "RENDER" | "ROUTE" | "NAVIGATION" | "COMPONENT" | "TOKEN" | "DOCUMENT";
   excerpt: string;
+  verifiedClaims?: GovernanceVerifiedClaim[];
 }
 
 export interface InitializeGenomeInput {
@@ -84,6 +95,8 @@ export interface InitializeGenomeDependencies {
 export interface InitializeGenomeResult {
   genome: DesignGenome;
   screens: ScreenRecord[];
+  inspectedScope: GovernanceInspectedScope;
+  claimCitations: GovernanceClaimCitation[];
   threadId: string;
 }
 
@@ -111,6 +124,12 @@ const evidenceField = {
   ...boundedStringArrayField,
   minItems: 1,
 } as const;
+const claimScopeField = {
+  type: "object",
+  properties: { routes: boundedStringArrayField },
+  required: ["routes"],
+  additionalProperties: false,
+} as const;
 
 export const GENOME_INIT_OUTPUT_SCHEMA = {
   type: "object",
@@ -121,8 +140,9 @@ export const GENOME_INIT_OUTPUT_SCHEMA = {
         statement: { ...boundedStringField, maxLength: 4_000 },
         confidence: { type: "string", enum: ["CONFIRMED", "UNCONFIRMED"] },
         evidence: evidenceField,
+        scope: claimScopeField,
       },
-      required: ["statement", "confidence", "evidence"],
+      required: ["statement", "confidence", "evidence", "scope"],
       additionalProperties: false,
     },
     rules: {
@@ -146,8 +166,9 @@ export const GENOME_INIT_OUTPUT_SCHEMA = {
           statement: boundedStringField,
           confidence: { type: "string", enum: ["CONFIRMED", "UNCONFIRMED"] },
           evidence: evidenceField,
+          scope: claimScopeField,
         },
-        required: ["category", "statement", "confidence", "evidence"],
+        required: ["category", "statement", "confidence", "evidence", "scope"],
         additionalProperties: false,
       },
     },
@@ -229,13 +250,23 @@ function confidence(value: unknown, label: string): GenomeRuleConfidence {
   return value;
 }
 
+function claimScope(value: unknown, label: string): GovernanceClaimScope {
+  const scope = objectValue(value, label);
+  exactKeys(scope, ["routes"], label);
+  const routes = boundedArray(scope.routes, `${label} routes`, true);
+  if (new Set(routes).size !== routes.length) {
+    throw new Error(`${label} routes must be unique`);
+  }
+  return { routes };
+}
+
 function parseWireOutput(value: unknown): GenomeInitWireOutput {
   const output = objectValue(value, "Genome initialization output");
   exactKeys(output, ["productIdentity", "rules", "screens"], "Genome initialization output");
   const identity = objectValue(output.productIdentity, "Product identity candidate");
   exactKeys(
     identity,
-    ["statement", "confidence", "evidence"],
+    ["statement", "confidence", "evidence", "scope"],
     "Product identity candidate",
   );
   if (!Array.isArray(output.rules) || output.rules.length > MAX_ITEMS) {
@@ -252,7 +283,7 @@ function parseWireOutput(value: unknown): GenomeInitWireOutput {
   ]);
   const rules = output.rules.map((candidate, index) => {
     const rule = objectValue(candidate, `Genome rule ${index}`);
-    exactKeys(rule, ["category", "statement", "confidence", "evidence"], `Genome rule ${index}`);
+    exactKeys(rule, ["category", "statement", "confidence", "evidence", "scope"], `Genome rule ${index}`);
     if (!categories.has(rule.category as GenomeRuleCategory)) {
       throw new Error(`Genome rule ${index} category is invalid`);
     }
@@ -261,6 +292,7 @@ function parseWireOutput(value: unknown): GenomeInitWireOutput {
       statement: sanitizedString(rule.statement, `Genome rule ${index}`),
       confidence: confidence(rule.confidence, `Genome rule ${index}`),
       evidence: boundedArray(rule.evidence, `Genome rule ${index} evidence`, true),
+      scope: claimScope(rule.scope, `Genome rule ${index} scope`),
     };
   });
   if (!Array.isArray(output.screens) || output.screens.length > MAX_ITEMS) {
@@ -293,6 +325,7 @@ function parseWireOutput(value: unknown): GenomeInitWireOutput {
       statement: sanitizedString(identity.statement, "Product identity candidate", 4_000),
       confidence: confidence(identity.confidence, "Product identity candidate"),
       evidence: boundedArray(identity.evidence, "Product identity evidence", true),
+      scope: claimScope(identity.scope, "Product identity scope"),
     },
     rules,
     screens,
@@ -336,14 +369,58 @@ function validateInput(input: InitializeGenomeInput): InitializeGenomeInput {
         const kinds = new Set(["RENDER", "ROUTE", "NAVIGATION", "COMPONENT", "TOKEN", "DOCUMENT"]);
         return entry.evidence.map((candidate, evidenceIndex) => {
           const evidence = objectValue(candidate, `Representative evidence ${index}.${evidenceIndex}`);
-          exactKeys(evidence, ["id", "kind", "excerpt"], `Representative evidence ${index}.${evidenceIndex}`);
+          exactKeys(
+            evidence,
+            evidence.verifiedClaims === undefined
+              ? ["id", "kind", "excerpt"]
+              : ["id", "kind", "excerpt", "verifiedClaims"],
+            `Representative evidence ${index}.${evidenceIndex}`,
+          );
           const id = boundedString(evidence.id, `Evidence ${evidenceIndex} identity`, 128);
           if (!EVIDENCE_ID_PATTERN.test(id)) throw new Error("Representative evidence identity is not server controlled");
           if (!kinds.has(evidence.kind as string)) throw new Error("Representative evidence kind is invalid");
+          const verifiedClaims = evidence.verifiedClaims === undefined
+            ? []
+            : (() => {
+                if (!Array.isArray(evidence.verifiedClaims) || evidence.verifiedClaims.length > MAX_ITEMS) {
+                  throw new Error("Verified evidence claims must be bounded");
+                }
+                return evidence.verifiedClaims.map((rawClaim, claimIndex) => {
+                  const candidateClaim = objectValue(rawClaim, `Verified evidence claim ${claimIndex}`);
+                  exactKeys(candidateClaim, ["claimType", "category", "statement", "scope"], `Verified evidence claim ${claimIndex}`);
+                  const claimType = candidateClaim.claimType;
+                  if (claimType !== "PRODUCT_IDENTITY" && claimType !== "RULE") {
+                    throw new Error("Verified evidence claim type is invalid");
+                  }
+                  const claimCategory = candidateClaim.category;
+                  const categories = new Set<GovernanceClaimCategory>([
+                    "PRODUCT_IDENTITY", "UX_INVARIANT", "VISUAL_INVARIANT",
+                    "MOTION_RULE", "ACCESSIBILITY_RULE", "COMPONENT_DNA",
+                    "SCREEN_FAMILY", "CONTENT_VOICE",
+                  ]);
+                  if (!categories.has(claimCategory as GovernanceClaimCategory)) {
+                    throw new Error("Verified evidence claim category is invalid");
+                  }
+                  if ((claimType === "PRODUCT_IDENTITY") !== (claimCategory === "PRODUCT_IDENTITY")) {
+                    throw new Error("Verified evidence claim type and category are inconsistent");
+                  }
+                  const scope = claimScope(candidateClaim.scope, `Verified evidence claim ${claimIndex} scope`);
+                  if (scope.routes.length !== 1 || scope.routes[0] !== route) {
+                    throw new Error("Verified evidence claims cannot exceed their inspected route");
+                  }
+                  return {
+                    claimType,
+                    category: claimCategory as GovernanceClaimCategory,
+                    statement: sanitizedString(candidateClaim.statement, `Verified evidence claim ${claimIndex}`),
+                    scope,
+                  } satisfies GovernanceVerifiedClaim;
+                });
+              })();
           return {
             id,
             kind: evidence.kind as GovernanceEvidence["kind"],
             excerpt: sanitizedString(evidence.excerpt, `Evidence ${evidenceIndex} excerpt`),
+            ...(verifiedClaims.length === 0 ? {} : { verifiedClaims }),
           };
         });
       })(),
@@ -424,29 +501,82 @@ export async function initializeGenome(
   const evidenceCatalog = new Map(
     input.representativeEvidence.flatMap((entry) => entry.evidence.map((evidence) => [evidence.id, evidence] as const)),
   );
-  const isGrounded = (confidenceValue: GenomeRuleConfidence, citations: string[], statement: string): boolean => {
+  const routeByEvidence = new Map(
+    input.representativeEvidence.flatMap((entry) =>
+      entry.evidence.map((evidence) => [evidence.id, entry.route] as const)),
+  );
+  const verifiedClaim = (
+    claimType: GovernanceVerifiedClaim["claimType"],
+    category: GovernanceClaimCategory,
+    confidenceValue: GenomeRuleConfidence,
+    citations: string[],
+    statement: string,
+    scope: GovernanceClaimScope,
+  ): boolean => {
     if (confidenceValue !== "CONFIRMED" || citations.some((id) => !evidenceCatalog.has(id))) return false;
-    if (/whole[- ]product|all screens|every screen|throughout the product/i.test(statement)) return false;
-    return citations.some((id) => {
-      const kind = evidenceCatalog.get(id)?.kind;
-      return kind !== undefined && kind !== "ROUTE";
+    const citedRoutes = unique(citations.flatMap((id) => {
+      const route = routeByEvidence.get(id);
+      return route === undefined ? [] : [route];
+    })).sort();
+    if (JSON.stringify([...scope.routes].sort()) !== JSON.stringify(citedRoutes)) return false;
+    return citations.every((id) => {
+      const evidence = evidenceCatalog.get(id);
+      const route = routeByEvidence.get(id);
+      return evidence !== undefined && route !== undefined &&
+        (evidence.verifiedClaims ?? []).some((claim) =>
+          claim.claimType === claimType && claim.category === category &&
+          claim.statement === statement && claim.scope.routes.length === 1 &&
+          claim.scope.routes[0] === route,
+        );
     });
   };
-  const normalizedRules = output.rules.map((rule) => ({
-    ...rule,
-    statement: sanitizedString(rule.statement, "Genome rule"),
-    confidence: isGrounded(rule.confidence, rule.evidence, rule.statement)
-      ? "CONFIRMED" as const
-      : "UNCONFIRMED" as const,
-  }));
+  const auditedScope = (citations: string[]): GovernanceClaimScope => {
+    const routes = unique(citations.flatMap((id) => {
+      const route = routeByEvidence.get(id);
+      return route === undefined ? [] : [route];
+    }));
+    return { routes };
+  };
+  const claimCitations: GovernanceClaimCitation[] = [];
+  const normalizedRules = output.rules.map((rule) => {
+    const statement = sanitizedString(rule.statement, "Genome rule");
+    const evidenceIds = rule.evidence.filter((id) => evidenceCatalog.has(id));
+    const normalizedConfidence = verifiedClaim(
+      "RULE", rule.category, rule.confidence, evidenceIds, statement, rule.scope,
+    ) ? "CONFIRMED" as const : "UNCONFIRMED" as const;
+    claimCitations.push({
+      claimType: "RULE",
+      category: rule.category,
+      statement,
+      confidence: normalizedConfidence,
+      requestedConfidence: rule.confidence,
+      scope: auditedScope(evidenceIds),
+      evidenceIds,
+    });
+    return { ...rule, statement, evidence: evidenceIds, confidence: normalizedConfidence };
+  });
   const confirmed = normalizedRules.filter((rule) => rule.confidence === "CONFIRMED");
   const confirmedStatements = new Set(confirmed.map((rule) => rule.statement));
   const unconfirmed = normalizedRules
     .filter((rule) => rule.confidence === "UNCONFIRMED")
     .map((rule) => rule.statement);
+  const identityEvidenceIds = output.productIdentity.evidence.filter((id) => evidenceCatalog.has(id));
+  const identityConfirmed = verifiedClaim(
+    "PRODUCT_IDENTITY", "PRODUCT_IDENTITY", output.productIdentity.confidence,
+    identityEvidenceIds, output.productIdentity.statement, output.productIdentity.scope,
+  );
+  claimCitations.push({
+    claimType: "PRODUCT_IDENTITY",
+    category: "PRODUCT_IDENTITY",
+    statement: sanitizedString(output.productIdentity.statement, "Product identity", 4_000),
+    confidence: identityConfirmed ? "CONFIRMED" : "UNCONFIRMED",
+    requestedConfidence: output.productIdentity.confidence,
+    scope: auditedScope(identityEvidenceIds),
+    evidenceIds: identityEvidenceIds,
+  });
   if (output.productIdentity.confidence === "UNCONFIRMED") {
     unconfirmed.push(sanitizedString(output.productIdentity.statement, "Product identity"));
-  } else if (!isGrounded(output.productIdentity.confidence, output.productIdentity.evidence, output.productIdentity.statement)) {
+  } else if (!identityConfirmed) {
     unconfirmed.push(sanitizedString(output.productIdentity.statement, "Product identity"));
   }
 
@@ -490,7 +620,9 @@ export async function initializeGenome(
   const genome: DesignGenome = {
     version: "0.1.0",
     status: "DRAFT",
-    productIdentity: sanitizedString(output.productIdentity.statement, "Product identity", 4_000),
+    productIdentity: identityConfirmed
+      ? sanitizedString(output.productIdentity.statement, "Product identity", 4_000)
+      : "Product identity is not yet confirmed from representative evidence.",
     uxInvariants: rulesFor("UX_INVARIANT"),
     visualInvariants: rulesFor("VISUAL_INVARIANT"),
     motionRules: rulesFor("MOTION_RULE"),
@@ -504,5 +636,11 @@ export async function initializeGenome(
       "Representative evidence does not establish whole-product coverage.",
     ]),
   };
-  return { genome, screens, threadId: result.threadId };
+  const inspectedScope: GovernanceInspectedScope = {
+    representative: true,
+    routes: input.representativeEvidence.map(({ route }) => route),
+    evidenceIds: input.representativeEvidence.flatMap(({ evidence }) =>
+      evidence.map(({ id }) => id)),
+  };
+  return { genome, screens, inspectedScope, claimCitations, threadId: result.threadId };
 }

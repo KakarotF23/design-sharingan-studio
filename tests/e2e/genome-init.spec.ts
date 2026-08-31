@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 import {
   parseGovernanceMetadata,
+  readEvidenceCatalog,
   readGenome,
   renderDesignDecisions,
   renderGenome,
@@ -92,7 +93,7 @@ test("initializes a non-authoritative Genome, registers evidence-backed screens,
     page.getByText("Representative evidence does not establish whole-product coverage."),
   ).toBeVisible();
   await expect(page.getByRole("heading", { name: "Screen Registry" })).toBeVisible();
-  await expect(page.getByText("Project workspaces", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("UNCONFIRMED", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("NOT_VERIFIED", { exact: true }).first()).toBeVisible();
   await expect(page.locator(".ds-sidebar__health dd").first()).toContainText(
     "DRAFT · v0.1.0 · Non-authoritative",
@@ -122,6 +123,14 @@ test("initializes a non-authoritative Genome, registers evidence-backed screens,
   expect(renderGenome(draft)).toBe(draftMarkdown);
   expect(renderScreenRegistry(registry)).toBe(registryMarkdown);
   expect(renderDesignDecisions(decisions)).toBe(decisionsMarkdown);
+  expect(draft.inspectedScope).toMatchObject({ representative: true });
+  expect(draft.inspectedScope.routes.length).toBeGreaterThan(0);
+  expect(draft.claimCitations.length).toBeGreaterThan(0);
+  expect(draft.claimCitations.every(({ confidence }) => confidence === "UNCONFIRMED")).toBe(true);
+  const evidenceCatalog = await readEvidenceCatalog(projectPath, draft.projectId);
+  expect(evidenceCatalog.map(({ id }) => id).sort()).toEqual(
+    [...draft.inspectedScope.evidenceIds].sort(),
+  );
   expect(registry.genomeEntityId).toBe(draft.entityId);
   expect(registry.genomeVersion).toBe(draft.value.version);
   expect(registry.genomeRevision).toBe(draft.revision);

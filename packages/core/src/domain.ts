@@ -450,6 +450,56 @@ export interface DesignGenome {
   unconfirmedRules: string[];
 }
 
+export type GovernanceClaimCategory =
+  | "PRODUCT_IDENTITY"
+  | "UX_INVARIANT"
+  | "VISUAL_INVARIANT"
+  | "MOTION_RULE"
+  | "ACCESSIBILITY_RULE"
+  | "COMPONENT_DNA"
+  | "SCREEN_FAMILY"
+  | "CONTENT_VOICE";
+
+export interface GovernanceClaimScope {
+  routes: string[];
+}
+
+export interface GovernanceVerifiedClaim {
+  claimType: "PRODUCT_IDENTITY" | "RULE";
+  category: GovernanceClaimCategory;
+  statement: string;
+  scope: GovernanceClaimScope;
+}
+
+export interface GovernanceClaimCitation extends GovernanceVerifiedClaim {
+  confidence: "CONFIRMED" | "UNCONFIRMED";
+  requestedConfidence: "CONFIRMED" | "UNCONFIRMED";
+  evidenceIds: string[];
+}
+
+export interface GovernanceInspectedScope {
+  representative: true;
+  routes: string[];
+  evidenceIds: string[];
+}
+
+export type GovernanceEvidenceKind =
+  | "RENDER"
+  | "ROUTE"
+  | "NAVIGATION"
+  | "COMPONENT"
+  | "TOKEN"
+  | "DOCUMENT";
+
+export interface GovernanceEvidenceCatalogEntry {
+  id: string;
+  kind: GovernanceEvidenceKind;
+  route: string;
+  excerpt: string;
+  verifiedClaims: GovernanceVerifiedClaim[];
+  authenticatedRenderId?: string;
+}
+
 export interface ScreenRecord {
   id: string;
   route: string;
@@ -459,14 +509,14 @@ export interface ScreenRecord {
   exceptions: string[];
   requiredStates: string[];
   evidence: string[];
-  driftStatus: string;
+  driftStatus: "NOT_VERIFIED" | "PASS" | "DRIFT" | "INTENTIONAL";
   lastVerified?: ISODateTime;
 }
 
 export interface DesignDecision {
   id: string;
   date: ISODateTime;
-  status: string;
+  status: "DRAFT" | "APPROVED" | "REJECTED";
   scope: string;
   decision: string;
   reason: string;
@@ -475,7 +525,7 @@ export interface DesignDecision {
   affectedComponents: string[];
   migrationRequired: boolean;
   genomeChanges: string[];
-  approvedBy?: string;
+  approvedBy?: "local-user";
 }
 
 export interface DriftFinding {

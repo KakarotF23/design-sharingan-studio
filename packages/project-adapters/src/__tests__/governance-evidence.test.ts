@@ -54,4 +54,33 @@ describe("governance representative evidence", () => {
       componentDirectories: [],
     })).rejects.toThrow(/symbolic link/i);
   });
+
+  it("rejects a symlink in any existing evidence path segment", async () => {
+    const root = await fixture();
+    await mkdir(join(root, "docs"));
+    await writeFile(join(root, "docs", "DESIGN.md"), "Local design evidence.\n");
+    await symlink(join(root, "docs"), join(root, "docs-alias"));
+
+    await expect(collectGovernanceEvidence({
+      rootPath: root,
+      projectId: "project-a",
+      routes: ["/"],
+      designDocuments: ["docs-alias/DESIGN.md"],
+      componentDirectories: [],
+    })).rejects.toThrow(/symbolic link|alias/i);
+  });
+
+  it.each(["/a%2Fb", "/a%3Fb", "/a%23b", "/%2e/private", "/a?x=1", "/a#x"])(
+    "rejects ambiguous evidence route %s",
+    async (route) => {
+      const root = await fixture();
+      await expect(collectGovernanceEvidence({
+        rootPath: root,
+        projectId: "project-a",
+        routes: [route],
+        designDocuments: [],
+        componentDirectories: [],
+      })).rejects.toThrow(/route/i);
+    },
+  );
 });

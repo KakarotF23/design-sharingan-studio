@@ -9,10 +9,11 @@ import {
 } from "../init-genome";
 
 const output: GenomeInitWireOutput = {
-    productIdentity: {
+  productIdentity: {
     statement: "A calm local-first design intelligence environment.",
     confidence: "CONFIRMED",
     evidence: ["ev_doc_readme_01"],
+    scope: { routes: ["/overview"] },
   },
   rules: [
     {
@@ -20,24 +21,28 @@ const output: GenomeInitWireOutput = {
       statement: "Keep human decisions explicit.",
       confidence: "CONFIRMED",
       evidence: ["ev_render_overview_01"],
+      scope: { routes: ["/overview"] },
     },
     {
       category: "VISUAL_INVARIANT",
       statement: "Dense evidence panels may use glowing borders.",
       confidence: "UNCONFIRMED",
       evidence: ["ev_render_overview_01"],
+      scope: { routes: ["/overview"] },
     },
     {
       category: "ACCESSIBILITY_RULE",
       statement: "Maintain visible focus.",
       confidence: "CONFIRMED",
       evidence: ["ev_component_button_01"],
+      scope: { routes: ["/overview"] },
     },
     {
       category: "SCREEN_FAMILY",
       statement: "Project workspaces",
       confidence: "CONFIRMED",
       evidence: ["ev_component_shell_01"],
+      scope: { routes: ["/overview"] },
     },
   ],
   screens: [
@@ -71,7 +76,7 @@ function agentWith(structured: unknown) {
 }
 
 describe("Design Genome initialization", () => {
-  it("starts DRAFT and moves uncertain agent rules into unconfirmedRules", async () => {
+  it("starts DRAFT and defaults agent-derived claims to UNCONFIRMED with auditable scope", async () => {
     const fake = agentWith(output);
     let nextId = 0;
 
@@ -106,9 +111,15 @@ describe("Design Genome initialization", () => {
     );
 
     expect(result.genome.status).toBe("DRAFT");
-    expect(result.genome.uxInvariants).toEqual(["Keep human decisions explicit."]);
+    expect(result.genome.productIdentity).toBe(
+      "Product identity is not yet confirmed from representative evidence.",
+    );
+    expect(result.genome.uxInvariants).toEqual([]);
     expect(result.genome.visualInvariants).toEqual([]);
     expect(result.genome.unconfirmedRules).toEqual(expect.arrayContaining([
+      "Keep human decisions explicit.",
+      "Maintain visible focus.",
+      "Project workspaces",
       "Dense evidence panels may use glowing borders.",
       "Representative evidence does not establish whole-product coverage.",
     ]));
@@ -117,8 +128,8 @@ describe("Design Genome initialization", () => {
         id: "screen-1",
         route: "/overview",
         name: "Overview",
-        family: "Project workspaces",
-        inheritedRules: ["Keep human decisions explicit."],
+        family: "UNCONFIRMED",
+        inheritedRules: [],
         exceptions: [],
         requiredStates: ["ready", "needs-configuration"],
         evidence: [
@@ -131,6 +142,27 @@ describe("Design Genome initialization", () => {
       },
     ]);
     expect(result.threadId).toBe("genome-thread");
+    expect(result.inspectedScope).toEqual({
+      representative: true,
+      routes: ["/overview"],
+      evidenceIds: [
+        "ev_render_overview_01",
+        "ev_doc_readme_01",
+        "ev_component_button_01",
+        "ev_component_shell_01",
+      ],
+    });
+    expect(result.claimCitations).toEqual(expect.arrayContaining([
+      {
+        claimType: "RULE",
+        category: "UX_INVARIANT",
+        statement: "Keep human decisions explicit.",
+        confidence: "UNCONFIRMED",
+        requestedConfidence: "CONFIRMED",
+        scope: { routes: ["/overview"] },
+        evidenceIds: ["ev_render_overview_01"],
+      },
+    ]));
     expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0]?.workingDirectory).toBe("/authenticated/project");
     expect(fake.calls[0]?.prompt).toContain("Representative /overview evidence");
@@ -227,5 +259,100 @@ describe("Design Genome initialization", () => {
     expect(result.genome.uxInvariants).toEqual([]);
     expect(result.genome.unconfirmedRules.join(" ")).not.toMatch(/\/Users\/|sk-secret/);
     expect(result.genome.unconfirmedRules.join(" ")).toContain("[REDACTED]");
+  });
+
+  it("does not launder a whole-product claim through one legitimate evidence identity", async () => {
+    const malicious = structuredClone(output);
+    malicious.rules[0] = {
+      ...malicious.rules[0]!,
+      statement: "Every screen throughout the product uses one navigation system.",
+      confidence: "CONFIRMED",
+      evidence: ["ev_component_shell_01"],
+      scope: { routes: ["/overview", "/learn"] },
+    };
+    const fake = agentWith(malicious);
+
+    const result = await initializeGenome(
+      {
+        workingDirectory: "/authenticated/project",
+        projectContext: {
+          projectId: "project-a",
+          name: "Studio fixture",
+          routes: ["/overview", "/learn"],
+          componentDirectories: ["components"],
+          designDocuments: [],
+        },
+        representativeEvidence: [{
+          route: "/overview",
+          observations: ["Observed."],
+          evidence: [
+            { id: "ev_render_overview_01", kind: "RENDER", excerpt: "Observed." },
+            { id: "ev_doc_readme_01", kind: "DOCUMENT", excerpt: "Product." },
+            { id: "ev_component_button_01", kind: "COMPONENT", excerpt: "Focus." },
+            { id: "ev_component_shell_01", kind: "COMPONENT", excerpt: "Shell." },
+          ],
+        }],
+      },
+      { agent: fake.agent, createId: () => "screen-1" },
+    );
+
+    expect(result.genome.uxInvariants).toEqual([]);
+    expect(result.genome.unconfirmedRules).toContain(
+      "Every screen throughout the product uses one navigation system.",
+    );
+    expect(result.claimCitations.find(({ statement }) =>
+      statement.startsWith("Every screen"),
+    )).toMatchObject({
+      confidence: "UNCONFIRMED",
+      scope: { routes: ["/overview"] },
+      evidenceIds: ["ev_component_shell_01"],
+    });
+  });
+
+  it("confirms only an exact claim and scope proved by server-owned evidence", async () => {
+    const focused = structuredClone(output);
+    focused.productIdentity.confidence = "UNCONFIRMED";
+    focused.rules = [focused.rules[0]!];
+    const fake = agentWith(focused);
+
+    const result = await initializeGenome(
+      {
+        workingDirectory: "/authenticated/project",
+        projectContext: {
+          projectId: "project-a",
+          name: "Studio fixture",
+          routes: ["/overview"],
+          componentDirectories: [],
+          designDocuments: [],
+        },
+        representativeEvidence: [{
+          route: "/overview",
+          observations: ["Observed."],
+          evidence: [{
+            id: "ev_render_overview_01",
+            kind: "RENDER",
+            excerpt: "Observed explicit decision state.",
+            verifiedClaims: [{
+              claimType: "RULE",
+              category: "UX_INVARIANT",
+              statement: "Keep human decisions explicit.",
+              scope: { routes: ["/overview"] },
+            }],
+          }],
+        }],
+      },
+      { agent: fake.agent, createId: () => "screen-1" },
+    );
+
+    expect(result.genome.uxInvariants).toEqual(["Keep human decisions explicit."]);
+    expect(result.claimCitations).toContainEqual({
+      claimType: "RULE",
+      category: "UX_INVARIANT",
+      statement: "Keep human decisions explicit.",
+      confidence: "CONFIRMED",
+      requestedConfidence: "CONFIRMED",
+      scope: { routes: ["/overview"] },
+      evidenceIds: ["ev_render_overview_01"],
+    });
   });
 });

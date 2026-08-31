@@ -8,6 +8,7 @@ import {
 import { constants } from "node:fs";
 import {
   lstat,
+  link,
   mkdir,
   open,
   readdir,
@@ -20,8 +21,12 @@ import { basename, join, resolve } from "node:path";
 import type {
   DesignDecision,
   DesignGenome,
+  GovernanceClaimCitation,
+  GovernanceEvidenceCatalogEntry,
+  GovernanceInspectedScope,
   ScreenRecord,
 } from "@design-sharingan/core";
+import { normalizeGovernanceRoute } from "@design-sharingan/core";
 import { assertPathInsideWorkspace } from "@design-sharingan/project-adapters";
 import {
   GOVERNANCE_SCHEMA_VERSION,
@@ -50,6 +55,7 @@ const MAX_DOCUMENT_BYTES = 256 * 1024;
 const MAX_LOCK_ATTEMPTS = 100;
 const LOCK_STALE_MILLISECONDS = 30_000;
 const STAGING_DIRECTORY = "governance-staging";
+const EVIDENCE_CATALOG_FILE = "governance-evidence.json";
 
 export class GovernanceNotInitializedError extends Error {
   constructor() {
@@ -71,6 +77,9 @@ export interface InitializeGovernanceInput {
   genome: DesignGenome;
   screens: ScreenRecord[];
   decisions: DesignDecision[];
+  evidenceCatalog?: GovernanceEvidenceCatalogEntry[];
+  inspectedScope?: GovernanceInspectedScope;
+  claimCitations?: GovernanceClaimCitation[];
 }
 
 export interface InitializedGovernance {
@@ -88,9 +97,29 @@ export interface ApproveGenomeInput {
   expectedPayloadHash: string;
 }
 
+export function incrementGovernanceRevision(revision: number): number {
+  if (!Number.isSafeInteger(revision) || revision < 1 || revision >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("Governance revision cannot be incremented beyond the safe maximum");
+  }
+  return revision + 1;
+}
+
 const authenticatedGenomeDocuments = new WeakMap<GenomeDocument, string>();
 const MACHINE_STATE_DIRECTORY = ".design-sharingan";
 const AUTHORITY_KEY_FILE = "governance-authority.key";
+const EVIDENCE_ID_PATTERN = /^ev_[a-zA-Z0-9_-]{8,125}$/;
+const SAFE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+const SECRET_OR_PATH_PATTERN = /(?:sk-[a-zA-Z0-9_-]{8,}|gh[pousr]_[a-zA-Z0-9]{12,}|AKIA[A-Z0-9]{12,}|Bearer\s+[a-zA-Z0-9._-]{8,}|(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+|\/(?:[a-zA-Z0-9._-]+\/)+[a-zA-Z0-9._-]+)/i;
+
+interface StoredEvidenceCatalog {
+  schemaVersion: 1;
+  kind: "DESIGN_SHARINGAN_EVIDENCE_CATALOG";
+  projectId: string;
+  rootFingerprint: string;
+  createdAt: string;
+  entries: GovernanceEvidenceCatalogEntry[];
+  signature: string;
+}
 
 function safeProjectId(projectId: string): string {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(projectId)) {
@@ -240,6 +269,211 @@ function authoritySignature(
   return createHmac("sha256", key).update(authorityPayload(proof), "utf8").digest("hex");
 }
 
+function exactObjectKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
+  if (Object.keys(value).sort().join(",") !== [...keys].sort().join(",")) {
+    throw new Error(`${label} does not match the exact schema`);
+  }
+}
+
+function normalizeEvidenceCatalog(
+  value: unknown,
+): GovernanceEvidenceCatalogEntry[] {
+  if (!Array.isArray(value) || value.length > 32) {
+    throw new Error("Governance evidence catalog must be bounded");
+  }
+  const entries = value.map((raw, index) => {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`Governance evidence catalog entry ${index} is invalid`);
+    }
+    const entry = raw as Record<string, unknown>;
+    exactObjectKeys(
+      entry,
+      entry.authenticatedRenderId === undefined
+        ? ["id", "kind", "route", "excerpt", "verifiedClaims"]
+        : ["id", "kind", "route", "excerpt", "verifiedClaims", "authenticatedRenderId"],
+      `Governance evidence catalog entry ${index}`,
+    );
+    if (typeof entry.id !== "string" || !EVIDENCE_ID_PATTERN.test(entry.id)) {
+      throw new Error("Governance evidence catalog identity is invalid");
+    }
+    const kinds = new Set(["RENDER", "ROUTE", "NAVIGATION", "COMPONENT", "TOKEN", "DOCUMENT"]);
+    if (typeof entry.kind !== "string" || !kinds.has(entry.kind)) {
+      throw new Error("Governance evidence catalog kind is invalid");
+    }
+    const route = normalizeGovernanceRoute(String(entry.route));
+    if (
+      typeof entry.excerpt !== "string" || entry.excerpt.trim().length === 0 ||
+      entry.excerpt.length > 1_000 || SECRET_OR_PATH_PATTERN.test(entry.excerpt)
+    ) throw new Error("Governance evidence catalog excerpt is unsafe");
+    if (!Array.isArray(entry.verifiedClaims) || entry.verifiedClaims.length > 64) {
+      throw new Error("Governance verified claims must be bounded");
+    }
+    const verifiedClaims = entry.verifiedClaims.map((rawClaim, claimIndex) => {
+      if (rawClaim === null || typeof rawClaim !== "object" || Array.isArray(rawClaim)) {
+        throw new Error("Governance verified claim is invalid");
+      }
+      const claim = rawClaim as Record<string, unknown>;
+      exactObjectKeys(claim, ["claimType", "category", "statement", "scope"], `Governance verified claim ${claimIndex}`);
+      const categories = new Set([
+        "PRODUCT_IDENTITY", "UX_INVARIANT", "VISUAL_INVARIANT", "MOTION_RULE",
+        "ACCESSIBILITY_RULE", "COMPONENT_DNA", "SCREEN_FAMILY", "CONTENT_VOICE",
+      ]);
+      if (
+        (claim.claimType !== "PRODUCT_IDENTITY" && claim.claimType !== "RULE") ||
+        typeof claim.category !== "string" || !categories.has(claim.category) ||
+        ((claim.claimType === "PRODUCT_IDENTITY") !== (claim.category === "PRODUCT_IDENTITY")) ||
+        typeof claim.statement !== "string" || claim.statement.trim().length === 0 ||
+        claim.statement.length > 1_000 || SECRET_OR_PATH_PATTERN.test(claim.statement) ||
+        claim.scope === null || typeof claim.scope !== "object" || Array.isArray(claim.scope)
+      ) throw new Error("Governance verified claim is invalid");
+      const scope = claim.scope as Record<string, unknown>;
+      exactObjectKeys(scope, ["routes"], "Governance verified claim scope");
+      if (!Array.isArray(scope.routes) || scope.routes.length !== 1) {
+        throw new Error("Governance verified claim cannot exceed one inspected route");
+      }
+      const claimRoute = normalizeGovernanceRoute(String(scope.routes[0]));
+      if (claimRoute !== route) throw new Error("Governance verified claim exceeds its evidence route");
+      return {
+        claimType: claim.claimType,
+        category: claim.category,
+        statement: claim.statement,
+        scope: { routes: [claimRoute] },
+      } as GovernanceEvidenceCatalogEntry["verifiedClaims"][number];
+    });
+    const authenticatedRenderId = entry.authenticatedRenderId;
+    if (
+      authenticatedRenderId !== undefined &&
+      (typeof authenticatedRenderId !== "string" || !SAFE_ID_PATTERN.test(authenticatedRenderId))
+    ) throw new Error("Authenticated render identity is invalid");
+    return {
+      id: entry.id,
+      kind: entry.kind as GovernanceEvidenceCatalogEntry["kind"],
+      route,
+      excerpt: entry.excerpt,
+      verifiedClaims,
+      ...(authenticatedRenderId === undefined ? {} : { authenticatedRenderId }),
+    };
+  });
+  if (new Set(entries.map(({ id }) => id)).size !== entries.length) {
+    throw new Error("Governance evidence catalog identities must be unique");
+  }
+  return entries;
+}
+
+function evidenceCatalogSignature(
+  key: Buffer,
+  value: Omit<StoredEvidenceCatalog, "signature">,
+): string {
+  return createHmac("sha256", key).update(JSON.stringify(value), "utf8").digest("hex");
+}
+
+async function writeEvidenceCatalog(
+  rootPath: string,
+  projectId: string,
+  machineDirectory: string,
+  entriesInput: unknown,
+): Promise<{ path: string; dev: number; ino: number }> {
+  const entries = normalizeEvidenceCatalog(entriesInput);
+  const key = await authorityKey(rootPath, true);
+  const canonicalRoot = await canonicalProjectRoot(rootPath);
+  const unsigned: Omit<StoredEvidenceCatalog, "signature"> = {
+    schemaVersion: 1,
+    kind: "DESIGN_SHARINGAN_EVIDENCE_CATALOG",
+    projectId,
+    rootFingerprint: rootFingerprint(canonicalRoot),
+    createdAt: new Date().toISOString(),
+    entries,
+  };
+  const stored: StoredEvidenceCatalog = {
+    ...unsigned,
+    signature: evidenceCatalogSignature(key, unsigned),
+  };
+  await atomicWriteDocument(
+    machineDirectory,
+    EVIDENCE_CATALOG_FILE,
+    `${JSON.stringify(stored)}\n`,
+  );
+  const path = join(machineDirectory, EVIDENCE_CATALOG_FILE);
+  const identity = await assertRegularDocument(path);
+  return { path, dev: Number(identity.dev), ino: Number(identity.ino) };
+}
+
+export async function readEvidenceCatalog(
+  rootPath: string,
+  projectId: string,
+): Promise<GovernanceEvidenceCatalogEntry[]> {
+  safeProjectId(projectId);
+  const canonicalRoot = await canonicalProjectRoot(rootPath);
+  const machineDirectory = await machineStateDirectory(rootPath, false);
+  const path = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, EVIDENCE_CATALOG_FILE));
+  const raw = await readBoundedDocument(path);
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("Governance evidence catalog is malformed"); }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Governance evidence catalog is malformed");
+  }
+  const stored = parsed as Record<string, unknown>;
+  exactObjectKeys(stored, ["schemaVersion", "kind", "projectId", "rootFingerprint", "createdAt", "entries", "signature"], "Governance evidence catalog");
+  if (
+    stored.schemaVersion !== 1 || stored.kind !== "DESIGN_SHARINGAN_EVIDENCE_CATALOG" ||
+    stored.projectId !== projectId || stored.rootFingerprint !== rootFingerprint(canonicalRoot) ||
+    typeof stored.createdAt !== "string" || new Date(stored.createdAt).toISOString() !== stored.createdAt ||
+    typeof stored.signature !== "string" || !/^[a-f0-9]{64}$/.test(stored.signature)
+  ) throw new Error("Governance evidence catalog identity is invalid");
+  const entries = normalizeEvidenceCatalog(stored.entries);
+  const unsigned: Omit<StoredEvidenceCatalog, "signature"> = {
+    schemaVersion: 1,
+    kind: "DESIGN_SHARINGAN_EVIDENCE_CATALOG",
+    projectId,
+    rootFingerprint: stored.rootFingerprint,
+    createdAt: stored.createdAt,
+    entries,
+  };
+  const key = await authorityKey(rootPath, false);
+  const expected = Buffer.from(evidenceCatalogSignature(key, unsigned), "hex");
+  const actual = Buffer.from(stored.signature, "hex");
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    throw new Error("Governance evidence catalog signature is not authenticated");
+  }
+  const normalized: StoredEvidenceCatalog = { ...unsigned, signature: stored.signature };
+  if (`${JSON.stringify(normalized)}\n` !== raw) {
+    throw new Error("Governance evidence catalog is not canonical");
+  }
+  return entries;
+}
+
+function assertGenomeEvidenceRelationships(
+  inspectedScope: GovernanceInspectedScope,
+  claimCitations: GovernanceClaimCitation[],
+  catalog: GovernanceEvidenceCatalogEntry[],
+): void {
+  const catalogById = new Map(catalog.map((entry) => [entry.id, entry]));
+  const catalogRoutes = [...new Set(catalog.map(({ route }) => route))];
+  if (
+    inspectedScope.representative !== true ||
+    new Set(inspectedScope.routes).size !== inspectedScope.routes.length ||
+    new Set(inspectedScope.evidenceIds).size !== inspectedScope.evidenceIds.length ||
+    inspectedScope.routes.some((route) => !catalogRoutes.includes(normalizeGovernanceRoute(route))) ||
+    inspectedScope.evidenceIds.some((id) => !catalogById.has(id))
+  ) throw new Error("Genome inspected scope is not authenticated by the evidence catalog");
+  for (const citation of claimCitations) {
+    const entries = citation.evidenceIds.map((id) => catalogById.get(id));
+    if (entries.some((entry) => entry === undefined)) {
+      throw new Error("Genome claim citation is not authenticated by the evidence catalog");
+    }
+    const routes = [...new Set(entries.flatMap((entry) => entry === undefined ? [] : [entry.route]))];
+    if (
+      citation.scope.routes.length !== routes.length ||
+      citation.scope.routes.some((route) => !routes.includes(normalizeGovernanceRoute(route)))
+    ) throw new Error("Genome claim scope does not match its evidence citations");
+    if (citation.confidence === "CONFIRMED" && entries.some((entry) =>
+      entry === undefined || !entry.verifiedClaims.some((claim) =>
+        claim.claimType === citation.claimType && claim.category === citation.category &&
+        claim.statement === citation.statement && claim.scope.routes[0] === entry.route,
+      ))) throw new Error("Confirmed Genome claim lacks exact server-owned verification");
+  }
+}
+
 async function verifyAuthority(
   rootPath: string,
   metadata: GenomeMetadata,
@@ -252,7 +486,7 @@ async function verifyAuthority(
     proof.rootFingerprint !== rootFingerprint(canonicalRoot) ||
     proof.genomeEntityId !== metadata.entityId ||
     proof.genomeVersion !== metadata.value.version ||
-    proof.approvedDraftRevision + 1 !== metadata.revision ||
+    incrementGovernanceRevision(proof.approvedDraftRevision) !== metadata.revision ||
     proof.documentRevision !== metadata.revision ||
     proof.payloadHash !== genomePayloadHash(metadata.value) ||
     proof.approvedBy !== "local-user" ||
@@ -311,6 +545,11 @@ export async function governanceIsInitialized(rootPath: string): Promise<boolean
     throw new Error("Governance initialization is incomplete");
   }
   await Promise.all(paths.map(assertRegularDocument));
+  const genomeMetadata = parseGovernanceMetadata(await readBoundedDocument(paths[0]!));
+  if (genomeMetadata.kind !== "DESIGN_GENOME") {
+    throw new Error("Governance initialization has the wrong Genome document kind");
+  }
+  await readEvidenceCatalog(rootPath, genomeMetadata.projectId);
   await withMachineGovernanceLock(rootPath, async () => undefined);
   return true;
 }
@@ -525,30 +764,68 @@ async function withMachineGovernanceLock<T>(
     pid: process.pid,
     createdAt: new Date().toISOString(),
   };
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let ownership: { dev: number; ino: number } | undefined;
   for (let attempt = 0; attempt < MAX_LOCK_ATTEMPTS; attempt += 1) {
+    const temporaryLock = assertPathInsideWorkspace(
+      directory,
+      join(directory, `.governance.lock.tmp-${process.pid}-${randomUUID()}`),
+    );
+    let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
+    let temporaryOwnership: { dev: number; ino: number } | undefined;
+    let publishedOwnership: { dev: number; ino: number } | undefined;
     try {
-      handle = await open(
-        lockPath,
+      temporaryHandle = await open(
+        temporaryLock,
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
         0o600,
       );
-      await handle.writeFile(JSON.stringify(claim), "utf8");
-      await handle.sync();
+      const opened = await temporaryHandle.stat();
+      temporaryOwnership = { dev: opened.dev, ino: opened.ino };
+      await temporaryHandle.writeFile(JSON.stringify(claim), "utf8");
+      await temporaryHandle.sync();
+      await temporaryHandle.close();
+      temporaryHandle = undefined;
+      await link(temporaryLock, lockPath);
+      const linked = await lstat(lockPath);
+      publishedOwnership = { dev: Number(linked.dev), ino: Number(linked.ino) };
+      await unlink(temporaryLock);
+      const published = await lstat(lockPath);
+      if (!published.isFile() || published.isSymbolicLink() || published.nlink !== 1) {
+        throw new Error("Governance lock publication is unsafe");
+      }
+      ownership = { dev: published.dev, ino: published.ino };
+      await syncDirectory(directory);
       break;
     } catch (error) {
+      if (temporaryHandle !== undefined) await temporaryHandle.close().catch(() => undefined);
+      const temporaryEntry = await lstat(temporaryLock).catch(() => undefined);
+      if (
+        temporaryEntry !== undefined && temporaryOwnership !== undefined &&
+        temporaryEntry.dev === temporaryOwnership.dev && temporaryEntry.ino === temporaryOwnership.ino
+      ) await unlink(temporaryLock).catch(() => undefined);
+      if (publishedOwnership !== undefined) {
+        const publishedEntry = await lstat(lockPath).catch(() => undefined);
+        if (
+          publishedEntry !== undefined && Number(publishedEntry.dev) === publishedOwnership.dev &&
+          Number(publishedEntry.ino) === publishedOwnership.ino
+        ) await unlink(lockPath).catch(() => undefined);
+      }
       if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) {
         throw error;
       }
       const entry = await lstat(lockPath);
-      const existing = await readLockClaim(lockPath);
-      const age = existing === undefined
-        ? Date.now() - entry.mtimeMs
-        : Date.now() - Date.parse(existing.createdAt);
+      let existing: LockClaim | undefined;
+      let incomplete = false;
+      try {
+        existing = await readLockClaim(lockPath);
+        incomplete = existing === undefined;
+      } catch {
+        incomplete = true;
+      }
+      const age = existing === undefined ? Date.now() - entry.mtimeMs : Date.now() - Date.parse(existing.createdAt);
       if (
         age > LOCK_STALE_MILLISECONDS &&
-        existing !== undefined &&
-        !processIsAlive(existing.pid)
+        (incomplete || (existing !== undefined && !processIsAlive(existing.pid)))
       ) {
         const current = await lstat(lockPath);
         if (current.dev === entry.dev && current.ino === entry.ino && current.nlink === 1) {
@@ -559,10 +836,9 @@ async function withMachineGovernanceLock<T>(
       await delay(10);
     }
   }
-  if (handle === undefined) {
+  if (ownership === undefined) {
     throw new Error("Governance is busy; refusing an unsynchronized write");
   }
-  const ownership = await handle.stat();
   let result: T | undefined;
   let operationError: unknown;
   try {
@@ -571,7 +847,6 @@ async function withMachineGovernanceLock<T>(
   } catch (error) {
     operationError = error;
   }
-  await handle.close().catch(() => undefined);
   const current = await lstat(lockPath).catch(() => undefined);
   if (
     current === undefined ||
@@ -720,9 +995,24 @@ export async function initializeGovernance(
   if (genome.status !== "DRAFT") {
     throw new Error("A newly initialized Design Genome must start DRAFT");
   }
+  const catalog = normalizeEvidenceCatalog(input.evidenceCatalog ?? []);
+  const inspectedScope: GovernanceInspectedScope = input.inspectedScope ?? {
+    representative: true,
+    routes: [...new Set(input.screens.map(({ route }) => normalizeGovernanceRoute(route)))],
+    evidenceIds: catalog.map(({ id }) => id),
+  };
+  const claimCitations = input.claimCitations ?? [];
+  assertGenomeEvidenceRelationships(inspectedScope, claimCitations, catalog);
   const evidenceIds = [...new Set(input.screens.flatMap((screen) => screen.evidence))];
-  const screens = assertScreenRecords(input.screens, { genome, evidenceIds });
-  const decisions = assertDesignDecisions(input.decisions);
+  const screens = assertScreenRecords(input.screens, {
+    genome,
+    evidenceIds: catalog.map(({ id }) => id),
+    evidenceRoutes: Object.fromEntries(catalog.map(({ id, route }) => [id, route])),
+  });
+  if (evidenceIds.some((id) => !catalog.some((entry) => entry.id === id))) {
+    throw new Error("Screen evidence is missing from the durable evidence catalog");
+  }
+  const decisions = assertDesignDecisions(input.decisions, [], screens);
   const canonicalRoot = await canonicalProjectRoot(input.rootPath);
   const rootIdentity = await lstat(canonicalRoot);
   const genomeMetadata: GenomeMetadata = {
@@ -732,6 +1022,8 @@ export async function initializeGovernance(
     entityId: randomUUID(),
     revision: 1,
     status: "DRAFT",
+    inspectedScope,
+    claimCitations,
     value: genome,
   };
   const screensMetadata: ScreenRegistryMetadata = {
@@ -775,6 +1067,22 @@ export async function initializeGovernance(
     }
     const target = assertPathInsideWorkspace(canonicalRoot, targetCandidate);
     if (await entryExists(target)) throw new Error("Governance is already initialized");
+    const catalogPath = assertPathInsideWorkspace(
+      machineDirectory,
+      join(machineDirectory, EVIDENCE_CATALOG_FILE),
+    );
+    if (await entryExists(catalogPath)) {
+      await readEvidenceCatalog(input.rootPath, projectId);
+      const staleCatalog = await assertRegularDocument(catalogPath);
+      const currentTarget = await entryExists(target);
+      if (currentTarget) throw new Error("Governance is already initialized");
+      const currentCatalog = await assertRegularDocument(catalogPath);
+      if (currentCatalog.dev !== staleCatalog.dev || currentCatalog.ino !== staleCatalog.ino) {
+        throw new Error("Governance evidence catalog identity changed during reconciliation");
+      }
+      await unlink(catalogPath);
+      await syncDirectory(machineDirectory);
+    }
     const stagingRoot = await ensurePrivateDirectory(machineDirectory, STAGING_DIRECTORY);
     const owner = randomUUID();
     const ownerDirectory = assertPathInsideWorkspace(stagingRoot, join(stagingRoot, owner));
@@ -806,6 +1114,7 @@ export async function initializeGovernance(
       await manifestHandle.close();
     }
     let promoted = false;
+    let catalogOwnership: { path: string; dev: number; ino: number } | undefined;
     try {
       for (const [fileName, markdown] of documents) {
         await atomicWriteDocument(payloadDirectory, fileName, markdown);
@@ -818,6 +1127,12 @@ export async function initializeGovernance(
       }));
       await syncDirectory(payloadDirectory);
       await syncDirectory(ownerDirectory);
+      catalogOwnership = await writeEvidenceCatalog(
+        input.rootPath,
+        projectId,
+        machineDirectory,
+        catalog,
+      );
       const currentRootPath = await canonicalProjectRoot(input.rootPath);
       const currentRoot = await lstat(currentRootPath);
       if (
@@ -835,6 +1150,17 @@ export async function initializeGovernance(
         join(/* turbopackIgnore: true */ target, fileName),
       )));
     } finally {
+      if (!promoted && catalogOwnership !== undefined) {
+        const currentCatalog = await lstat(catalogOwnership.path).catch(() => undefined);
+        if (
+          currentCatalog !== undefined && currentCatalog.isFile() &&
+          !currentCatalog.isSymbolicLink() && currentCatalog.nlink === 1 &&
+          currentCatalog.dev === catalogOwnership.dev && currentCatalog.ino === catalogOwnership.ino
+        ) {
+          await unlink(catalogOwnership.path).catch(() => undefined);
+          await syncDirectory(machineDirectory).catch(() => undefined);
+        }
+      }
       const currentOwner = await lstat(ownerDirectory).catch(() => undefined);
       const ownerUnchanged = currentOwner !== undefined &&
         currentOwner.dev === ownerIdentity.dev && currentOwner.ino === ownerIdentity.ino &&
@@ -899,6 +1225,12 @@ export async function readGenome(
   if (metadata.kind !== "DESIGN_GENOME") {
     throw new Error("DESIGN-GENOME.md contains the wrong governance document kind");
   }
+  const evidenceCatalog = await readEvidenceCatalog(rootPath, projectId);
+  assertGenomeEvidenceRelationships(
+    metadata.inspectedScope,
+    metadata.claimCitations,
+    evidenceCatalog,
+  );
   const authenticated = await verifyAuthority(rootPath, metadata);
   if (metadata.value.status === "APPROVED" && !authenticated) {
     throw new Error("Approved Genome authority proof could not be authenticated");
@@ -932,6 +1264,7 @@ export async function approveGenome(
     if (current.payloadHash !== input.expectedPayloadHash) {
       throw new Error("Genome approval payload hash is stale");
     }
+    const nextRevision = incrementGovernanceRevision(current.metadata.revision);
     const approvedAt = new Date().toISOString();
     const value: DesignGenome = { ...current.value, status: "APPROVED" };
     const canonicalRoot = await canonicalProjectRoot(rootPath);
@@ -943,14 +1276,14 @@ export async function approveGenome(
       genomeEntityId: current.metadata.entityId,
       genomeVersion: value.version,
       approvedDraftRevision: current.metadata.revision,
-      documentRevision: current.metadata.revision + 1,
+      documentRevision: nextRevision,
       payloadHash: genomePayloadHash(value),
       approvedBy: "local-user",
       approvedAt,
     };
     const metadata: GenomeMetadata = {
       ...current.metadata,
-      revision: current.metadata.revision + 1,
+      revision: nextRevision,
       status: "APPROVED",
       authority: {
         ...unsignedAuthority,

@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
-import { posix } from "node:path";
-import type { DesignDecision, DesignGenome, ScreenRecord } from "@design-sharingan/core";
+import {
+  normalizeGovernanceRoute,
+  type DesignDecision,
+  type DesignGenome,
+  type GovernanceClaimCitation,
+  type GovernanceClaimCategory,
+  type GovernanceInspectedScope,
+  type ScreenRecord,
+} from "@design-sharingan/core";
 
 export const GOVERNANCE_SCHEMA_VERSION = 1 as const;
 export const GOVERNANCE_METADATA_PREFIX = "<!-- design-sharingan-metadata:";
@@ -28,6 +35,8 @@ export interface GenomeMetadata {
   revision: number;
   status: DesignGenome["status"];
   authority?: GenomeAuthorityProof;
+  inspectedScope: GovernanceInspectedScope;
+  claimCitations: GovernanceClaimCitation[];
   value: DesignGenome;
 }
 
@@ -74,6 +83,7 @@ export type GovernanceMetadata = GenomeMetadata | ScreenRegistryMetadata | Desig
 export interface ScreenRelationContext {
   genome: DesignGenome;
   evidenceIds: readonly string[];
+  evidenceRoutes?: Readonly<Record<string, string>>;
   authenticatedVerificationEvidenceIds?: readonly string[];
 }
 
@@ -111,8 +121,21 @@ export function renderGenome(metadata: GenomeMetadata): string {
 **Machine identity:** ${quoted(metadata.entityId)}
 **Authority:** ${metadata.authority === undefined ? "NON_AUTHORITATIVE" : "AUTHORITATIVE"}
 **Rule payload hash:** ${genomePayloadHash(genome)}
+**Inspected scope:** REPRESENTATIVE
 
 This document is human-readable product knowledge. A DRAFT Genome remains non-authoritative until a local user explicitly approves its exact revision and rule payload.
+
+## Inspected Routes
+
+${markdownList(metadata.inspectedScope.routes, "No representative routes recorded.")}
+
+## Evidence Catalog Citations
+
+${markdownList(metadata.inspectedScope.evidenceIds, "No evidence citations recorded.")}
+
+## Auditable Claim Citations
+
+${markdownList(metadata.claimCitations.map((citation) => JSON.stringify(citation)), "No claims recorded.")}
 
 ## Product Identity
 
@@ -278,6 +301,10 @@ function positiveRevision(value: unknown): number {
   return value as number;
 }
 
+function isNextRevision(previous: number, next: number): boolean {
+  return previous < Number.MAX_SAFE_INTEGER && previous + 1 === next;
+}
+
 function isoTimestamp(value: unknown, label: string): string {
   const timestamp = boundedString(value, label, 64);
   let canonical: string;
@@ -290,6 +317,55 @@ function hash(value: unknown, label: string): string {
   const digest = boundedString(value, label, 64);
   if (!HASH_PATTERN.test(digest)) throw new Error(`${label} must be a SHA-256 digest`);
   return digest;
+}
+
+const CLAIM_CATEGORIES = new Set<GovernanceClaimCategory>([
+  "PRODUCT_IDENTITY", "UX_INVARIANT", "VISUAL_INVARIANT", "MOTION_RULE",
+  "ACCESSIBILITY_RULE", "COMPONENT_DNA", "SCREEN_FAMILY", "CONTENT_VOICE",
+]);
+
+function parseClaimScope(value: unknown, label: string): { routes: string[] } {
+  const scope = objectValue(value, label);
+  exactKeys(scope, ["routes"], [], label);
+  if (!Array.isArray(scope.routes) || scope.routes.length > MAX_RULES) {
+    throw new Error(`${label} routes must be bounded`);
+  }
+  const routes = scope.routes.map(safeRoute);
+  if (new Set(routes).size !== routes.length) throw new Error(`${label} routes must be unique`);
+  return { routes };
+}
+
+function parseInspectedScope(value: unknown): GovernanceInspectedScope {
+  const scope = objectValue(value, "Genome inspected scope");
+  exactKeys(scope, ["representative", "routes", "evidenceIds"], [], "Genome inspected scope");
+  if (scope.representative !== true) throw new Error("Genome inspected scope must remain representative");
+  const routes = parseClaimScope({ routes: scope.routes }, "Genome inspected scope").routes;
+  if (!Array.isArray(scope.evidenceIds) || scope.evidenceIds.length > MAX_RECORDS) {
+    throw new Error("Genome inspected evidence must be bounded");
+  }
+  const evidenceIds = scope.evidenceIds.map((entry, index) => evidenceId(entry, `Inspected evidence[${index}]`));
+  if (new Set(evidenceIds).size !== evidenceIds.length) throw new Error("Genome inspected evidence must be unique");
+  return { representative: true, routes, evidenceIds };
+}
+
+function parseClaimCitation(value: unknown): GovernanceClaimCitation {
+  const citation = objectValue(value, "Genome claim citation");
+  exactKeys(citation, ["claimType", "category", "statement", "confidence", "requestedConfidence", "scope", "evidenceIds"], [], "Genome claim citation");
+  if (citation.claimType !== "PRODUCT_IDENTITY" && citation.claimType !== "RULE") throw new Error("Genome claim type is invalid");
+  if (!CLAIM_CATEGORIES.has(citation.category as GovernanceClaimCategory)) throw new Error("Genome claim category is invalid");
+  if ((citation.claimType === "PRODUCT_IDENTITY") !== (citation.category === "PRODUCT_IDENTITY")) throw new Error("Genome claim type and category are inconsistent");
+  if (citation.confidence !== "CONFIRMED" && citation.confidence !== "UNCONFIRMED") throw new Error("Genome claim confidence is invalid");
+  if (citation.requestedConfidence !== "CONFIRMED" && citation.requestedConfidence !== "UNCONFIRMED") throw new Error("Genome requested claim confidence is invalid");
+  if (!Array.isArray(citation.evidenceIds) || citation.evidenceIds.length > MAX_RULES) throw new Error("Genome claim evidence must be bounded");
+  return {
+    claimType: citation.claimType,
+    category: citation.category as GovernanceClaimCategory,
+    statement: boundedString(citation.statement, "Genome claim statement"),
+    confidence: citation.confidence,
+    requestedConfidence: citation.requestedConfidence,
+    scope: parseClaimScope(citation.scope, "Genome claim scope"),
+    evidenceIds: citation.evidenceIds.map((entry, index) => evidenceId(entry, `Genome claim evidence[${index}]`)),
+  };
 }
 
 function assertBaseMetadata(value: Record<string, unknown>, kind: GovernanceMetadata["kind"]): void {
@@ -334,10 +410,7 @@ function parseAuthority(value: unknown): GenomeAuthorityProof {
 
 function safeRoute(value: unknown): string {
   const route = boundedString(value, "Screen route", MAX_SHORT_TEXT_LENGTH);
-  let decoded: string;
-  try { decoded = decodeURIComponent(route); } catch { throw new Error("Screen route must be a safe normalized route"); }
-  if (!route.startsWith("/") || decoded.includes("\\") || route.includes("?") || route.includes("#") || /[\u0000-\u001f\u007f]/.test(decoded) || decoded.includes("//") || posix.normalize(decoded) !== decoded || /(^|\/)\.\.?($|\/)/.test(decoded)) throw new Error("Screen route must be a safe normalized route");
-  return route;
+  return normalizeGovernanceRoute(route);
 }
 
 function parseScreenRecord(value: unknown): ScreenRecord {
@@ -350,7 +423,7 @@ function parseScreenRecord(value: unknown): ScreenRecord {
   const lastVerified = record.lastVerified === undefined ? undefined : isoTimestamp(record.lastVerified, "Last verification");
   if (record.driftStatus === "NOT_VERIFIED" && lastVerified !== undefined) throw new Error("A NOT_VERIFIED screen cannot claim a verification time");
   if (record.driftStatus !== "NOT_VERIFIED" && (lastVerified === undefined || evidence.length === 0)) throw new Error("A verified screen requires authenticated evidence and an ISO verification time");
-  return { id: safeId(record.id, "Screen record identity"), route: safeRoute(record.route), name: boundedString(record.name, "Screen name", MAX_SHORT_TEXT_LENGTH), family: boundedString(record.family, "Screen family", MAX_SHORT_TEXT_LENGTH), inheritedRules: boundedStringArray(record.inheritedRules, "Inherited rules"), exceptions: boundedStringArray(record.exceptions, "Screen exceptions"), requiredStates: boundedStringArray(record.requiredStates, "Required states"), evidence, driftStatus: record.driftStatus as string, ...(lastVerified === undefined ? {} : { lastVerified }) };
+  return { id: safeId(record.id, "Screen record identity"), route: safeRoute(record.route), name: boundedString(record.name, "Screen name", MAX_SHORT_TEXT_LENGTH), family: boundedString(record.family, "Screen family", MAX_SHORT_TEXT_LENGTH), inheritedRules: boundedStringArray(record.inheritedRules, "Inherited rules"), exceptions: boundedStringArray(record.exceptions, "Screen exceptions"), requiredStates: boundedStringArray(record.requiredStates, "Required states"), evidence, driftStatus: record.driftStatus as ScreenRecord["driftStatus"], ...(lastVerified === undefined ? {} : { lastVerified }) };
 }
 
 function decisionPayloadHash(decision: DesignDecision): string {
@@ -363,7 +436,9 @@ function parseDesignDecision(value: unknown): DesignDecision {
   exactKeys(decision, ["id", "date", "status", "scope", "decision", "reason", "alternatives", "affectedScreens", "affectedComponents", "migrationRequired", "genomeChanges"], ["approvedBy"], "Design decision");
   if (!["DRAFT", "APPROVED", "REJECTED"].includes(decision.status as string)) throw new Error("Design decision status is invalid");
   if (typeof decision.migrationRequired !== "boolean") throw new Error("Design decision migration flag must be boolean");
-  return { id: safeId(decision.id, "Design decision identity"), date: isoTimestamp(decision.date, "Design decision date"), status: decision.status as string, scope: boundedString(decision.scope, "Design decision scope", MAX_SHORT_TEXT_LENGTH), decision: boundedString(decision.decision, "Design decision", 4_000), reason: boundedString(decision.reason, "Design decision reason", 4_000), alternatives: boundedStringArray(decision.alternatives, "Design decision alternatives"), affectedScreens: boundedStringArray(decision.affectedScreens, "Affected screens"), affectedComponents: boundedStringArray(decision.affectedComponents, "Affected components"), migrationRequired: decision.migrationRequired, genomeChanges: boundedStringArray(decision.genomeChanges, "Genome changes"), approvedBy: optionalBoundedString(decision.approvedBy, "Design decision approver", MAX_SHORT_TEXT_LENGTH) };
+  const approvedBy = optionalBoundedString(decision.approvedBy, "Design decision approver", MAX_SHORT_TEXT_LENGTH);
+  if (approvedBy !== undefined && approvedBy !== "local-user") throw new Error("Design decision approver must be local-user");
+  return { id: safeId(decision.id, "Design decision identity"), date: isoTimestamp(decision.date, "Design decision date"), status: decision.status as DesignDecision["status"], scope: boundedString(decision.scope, "Design decision scope", MAX_SHORT_TEXT_LENGTH), decision: boundedString(decision.decision, "Design decision", 4_000), reason: boundedString(decision.reason, "Design decision reason", 4_000), alternatives: boundedStringArray(decision.alternatives, "Design decision alternatives"), affectedScreens: boundedStringArray(decision.affectedScreens, "Affected screens"), affectedComponents: boundedStringArray(decision.affectedComponents, "Affected components"), migrationRequired: decision.migrationRequired, genomeChanges: boundedStringArray(decision.genomeChanges, "Genome changes"), ...(approvedBy === undefined ? {} : { approvedBy }) };
 }
 
 function parseDecisionProof(value: unknown): DecisionApprovalProof {
@@ -390,6 +465,10 @@ function validateScreens(records: ScreenRecord[], context?: ScreenRelationContex
       if (record.exceptions.some((rule) => !exceptions.has(rule))) throw new Error("Screen exceptions are not related to the same Genome");
       if (record.evidence.some((id) => !evidenceIds.has(id))) throw new Error("Screen verification evidence is not authenticated by this Registry");
       if (
+        context.evidenceRoutes !== undefined &&
+        record.evidence.some((id) => context.evidenceRoutes?.[id] !== record.route)
+      ) throw new Error("Screen evidence route does not match the registered screen route");
+      if (
         record.driftStatus !== "NOT_VERIFIED" &&
         !record.evidence.some((id) => authenticatedVerificationEvidenceIds.has(id))
       ) throw new Error("Screen coverage remains NOT_VERIFIED without authenticated verification evidence");
@@ -398,10 +477,17 @@ function validateScreens(records: ScreenRecord[], context?: ScreenRelationContex
   return records;
 }
 
-function validateDecisions(decisions: DesignDecision[], proofs: DecisionApprovalProof[]): DesignDecision[] {
+function validateDecisions(
+  decisions: DesignDecision[],
+  proofs: DecisionApprovalProof[],
+  screens?: readonly ScreenRecord[],
+): DesignDecision[] {
   if (new Set(decisions.map((decision) => decision.id)).size !== decisions.length) throw new Error("Design Decision identities must be unique");
   if (new Set(proofs.map((proof) => proof.decisionId)).size !== proofs.length) throw new Error("Design Decision approval proofs must be unique");
   const proofById = new Map(proofs.map((proof) => [proof.decisionId, proof]));
+  const registeredScreens = screens === undefined
+    ? undefined
+    : new Set(screens.flatMap((screen) => [screen.id, screen.route]));
   for (const decision of decisions) {
     const proof = proofById.get(decision.id);
     const consequential = decision.migrationRequired || decision.genomeChanges.length > 0;
@@ -409,6 +495,10 @@ function validateDecisions(decisions: DesignDecision[], proofs: DecisionApproval
       if (decision.approvedBy !== "local-user" || proof === undefined || proof.decisionHash !== decisionPayloadHash(decision)) throw new Error("Approved Design Decision requires an exact local-user decision proof");
     } else if (decision.approvedBy !== undefined || proof !== undefined) throw new Error("A non-approved Design Decision cannot contain approval authority");
     if (consequential && decision.status !== "APPROVED") throw new Error("Migration and Genome changes require an approved local-user decision proof");
+    if (
+      registeredScreens !== undefined &&
+      decision.affectedScreens.some((screen) => !registeredScreens.has(screen))
+    ) throw new Error("Design Decision references an unregistered screen id or route");
   }
   if (proofs.some((proof) => !decisions.some((decision) => decision.id === proof.decisionId))) throw new Error("Design Decision approval proof has no matching decision");
   return decisions;
@@ -423,15 +513,25 @@ export function parseGovernanceMetadata(markdown: string): GovernanceMetadata {
   const metadata = objectValue(parsed, "Governance metadata");
   let normalized: GovernanceMetadata;
   if (metadata.kind === "DESIGN_GENOME") {
-    exactKeys(metadata, ["schemaVersion", "kind", "projectId", "entityId", "revision", "status", "value"], ["authority"], "Design Genome metadata");
+    exactKeys(metadata, ["schemaVersion", "kind", "projectId", "entityId", "revision", "status", "inspectedScope", "claimCitations", "value"], ["authority"], "Design Genome metadata");
     assertBaseMetadata(metadata, "DESIGN_GENOME");
     const value = parseGenome(metadata.value);
     if (metadata.status !== value.status) throw new Error("Design Genome status metadata is inconsistent");
     const authority = metadata.authority === undefined ? undefined : parseAuthority(metadata.authority);
+    const inspectedScope = parseInspectedScope(metadata.inspectedScope);
+    if (!Array.isArray(metadata.claimCitations) || metadata.claimCitations.length > MAX_RECORDS) throw new Error("Genome claim citations must be bounded");
+    const claimCitations = metadata.claimCitations.map(parseClaimCitation);
+    const inspectedRoutes = new Set(inspectedScope.routes);
+    const inspectedEvidence = new Set(inspectedScope.evidenceIds);
+    if (claimCitations.some((citation) =>
+      citation.scope.routes.some((route) => !inspectedRoutes.has(route)) ||
+      citation.evidenceIds.some((id) => !inspectedEvidence.has(id)))) {
+      throw new Error("Genome claim citations exceed the authenticated inspected scope");
+    }
     if (value.status === "DRAFT" && authority !== undefined) throw new Error("Draft Genome cannot contain authority");
     if (value.status === "APPROVED" && authority === undefined) throw new Error("Approved Genome requires authenticated authority proof");
-    if (authority !== undefined && (authority.projectId !== metadata.projectId || authority.genomeEntityId !== metadata.entityId || authority.genomeVersion !== value.version || authority.documentRevision !== metadata.revision || authority.approvedDraftRevision + 1 !== metadata.revision || authority.payloadHash !== genomePayloadHash(value))) throw new Error("Genome authority proof is stale or inconsistent");
-    normalized = { schemaVersion: GOVERNANCE_SCHEMA_VERSION, kind: "DESIGN_GENOME", projectId: metadata.projectId as string, entityId: metadata.entityId as string, revision: metadata.revision as number, status: value.status, ...(authority === undefined ? {} : { authority }), value };
+    if (authority !== undefined && (authority.projectId !== metadata.projectId || authority.genomeEntityId !== metadata.entityId || authority.genomeVersion !== value.version || authority.documentRevision !== metadata.revision || !isNextRevision(authority.approvedDraftRevision, metadata.revision as number) || authority.payloadHash !== genomePayloadHash(value))) throw new Error("Genome authority proof is stale or inconsistent");
+    normalized = { schemaVersion: GOVERNANCE_SCHEMA_VERSION, kind: "DESIGN_GENOME", projectId: metadata.projectId as string, entityId: metadata.entityId as string, revision: metadata.revision as number, status: value.status, inspectedScope, claimCitations, ...(authority === undefined ? {} : { authority }), value };
   } else if (metadata.kind === "SCREEN_REGISTRY") {
     exactKeys(metadata, ["schemaVersion", "kind", "projectId", "entityId", "revision", "genomeEntityId", "genomeVersion", "genomeRevision", "evidenceIds", "records"], [], "Screen Registry metadata");
     assertBaseMetadata(metadata, "SCREEN_REGISTRY");
@@ -461,7 +561,11 @@ export function assertScreenRecords(value: unknown, context?: ScreenRelationCont
   return validateScreens(value.map(parseScreenRecord), context);
 }
 
-export function assertDesignDecisions(value: unknown, proofs: DecisionApprovalProof[] = []): DesignDecision[] {
+export function assertDesignDecisions(
+  value: unknown,
+  proofs: DecisionApprovalProof[] = [],
+  screens?: readonly ScreenRecord[],
+): DesignDecision[] {
   if (!Array.isArray(value) || value.length > MAX_RECORDS) throw new Error("Design Decisions must be bounded");
-  return validateDecisions(value.map(parseDesignDecision), proofs);
+  return validateDecisions(value.map(parseDesignDecision), proofs, screens);
 }

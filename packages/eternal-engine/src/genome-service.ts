@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { CodexAgent, type CodexAgentRunInput } from "@design-sharingan/agent-runtime";
+import {
+  createDenyByDefaultCodexAgent,
+  type CodexAgentRunInput,
+} from "@design-sharingan/agent-runtime";
 import {
   initializeGenome,
   type GenomeInitAgent,
@@ -21,6 +24,10 @@ function fakeAgent(input: InitializeGenomeInput): GenomeInitAgent {
   if (first === undefined) throw new Error("Fake Genome service requires representative evidence");
   const grounded = catalog.find(({ kind }) => kind !== "ROUTE") ?? first;
   const navigation = catalog.find(({ kind }) => kind === "NAVIGATION" || kind === "COMPONENT") ?? grounded;
+  const routeFor = (evidenceId: string): string =>
+    input.representativeEvidence.find(({ evidence }) =>
+      evidence.some(({ id }) => id === evidenceId),
+    )?.route ?? input.representativeEvidence[0]!.route;
   const confirmed = grounded.kind !== "ROUTE";
   const familyConfirmed = navigation.kind === "NAVIGATION" || navigation.kind === "COMPONENT";
   const output: GenomeInitWireOutput = {
@@ -28,6 +35,7 @@ function fakeAgent(input: InitializeGenomeInput): GenomeInitAgent {
       statement: "A calm, local-first product with deliberate human design decisions.",
       confidence: confirmed ? "CONFIRMED" : "UNCONFIRMED",
       evidence: [grounded.id],
+      scope: { routes: [routeFor(grounded.id)] },
     },
     rules: [
       {
@@ -35,30 +43,35 @@ function fakeAgent(input: InitializeGenomeInput): GenomeInitAgent {
         statement: "Keep primary decisions explicit and reversible.",
         confidence: confirmed ? "CONFIRMED" : "UNCONFIRMED",
         evidence: [grounded.id],
+        scope: { routes: [routeFor(grounded.id)] },
       },
       {
         category: "VISUAL_INVARIANT",
         statement: "Use restrained contrast to separate primary action from evidence.",
         confidence: "UNCONFIRMED",
         evidence: [first.id],
+        scope: { routes: [routeFor(first.id)] },
       },
       {
         category: "ACCESSIBILITY_RULE",
         statement: "Preserve visible focus and readable contrast.",
         confidence: confirmed ? "CONFIRMED" : "UNCONFIRMED",
         evidence: [grounded.id],
+        scope: { routes: [routeFor(grounded.id)] },
       },
       {
         category: "SCREEN_FAMILY",
         statement: "Project workspaces",
         confidence: familyConfirmed ? "CONFIRMED" : "UNCONFIRMED",
         evidence: [navigation.id],
+        scope: { routes: [routeFor(navigation.id)] },
       },
       {
         category: "CONTENT_VOICE",
         statement: "Use calm, technical, and direct language.",
         confidence: confirmed ? "CONFIRMED" : "UNCONFIRMED",
         evidence: [grounded.id],
+        scope: { routes: [routeFor(grounded.id)] },
       },
     ],
     screens: input.representativeEvidence.map(({ route }) => ({
@@ -95,7 +108,9 @@ export async function initializeGenomeWithCodex(
   options: InitializeGenomeServiceOptions = {},
 ): Promise<InitializeGenomeResult> {
   const agent = options.agent ?? (
-    process.env.DESIGN_SHARINGAN_FAKE_AGENT === "1" ? fakeAgent(input) : new CodexAgent()
+    process.env.DESIGN_SHARINGAN_FAKE_AGENT === "1"
+      ? fakeAgent(input)
+      : createDenyByDefaultCodexAgent()
   );
   return initializeGenome(input, {
     agent,

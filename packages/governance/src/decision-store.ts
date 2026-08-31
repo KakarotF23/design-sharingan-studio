@@ -7,12 +7,14 @@ import {
   withGovernanceLock,
   readGenome,
   assertAuthenticatedDecisionProofs,
+  incrementGovernanceRevision,
 } from "./genome-store";
 import {
   assertDesignDecisions,
   renderDesignDecisions,
   type DesignDecisionsMetadata,
 } from "./templates";
+import { readScreenRegistry } from "./screen-registry";
 
 export interface DesignDecisionsDocument {
   metadata: Omit<DesignDecisionsMetadata, "decisions">;
@@ -40,7 +42,8 @@ export async function readDesignDecisions(
   ) {
     throw new Error("Design Decisions are not related to the active Design Genome");
   }
-  assertDesignDecisions(metadata.decisions, metadata.approvalProofs);
+  const registry = await readScreenRegistry(rootPath, projectId);
+  assertDesignDecisions(metadata.decisions, metadata.approvalProofs, registry.records);
   await assertAuthenticatedDecisionProofs(rootPath, metadata);
   return document(metadata);
 }
@@ -58,10 +61,15 @@ export async function saveDesignDecisions(
       throw new Error("Design Decisions revision is stale");
     }
     const genome = await readGenome(rootPath, projectId);
-    const decisions = assertDesignDecisions(decisionsInput, current.metadata.approvalProofs);
+    const registry = await readScreenRegistry(rootPath, projectId);
+    const decisions = assertDesignDecisions(
+      decisionsInput,
+      current.metadata.approvalProofs,
+      registry.records,
+    );
     const metadata: DesignDecisionsMetadata = {
       ...current.metadata,
-      revision: current.metadata.revision + 1,
+      revision: incrementGovernanceRevision(current.metadata.revision),
       genomeEntityId: genome.metadata.entityId,
       genomeVersion: genome.value.version,
       genomeRevision: genome.metadata.revision,
