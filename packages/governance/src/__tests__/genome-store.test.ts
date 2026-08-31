@@ -587,6 +587,11 @@ describe("Genome governance store", () => {
     "/%2e/private",
     "/a?query=1",
     "/a#fragment",
+    "/%252e%252e/private",
+    "/a%252Fb",
+    "/a%255Cb",
+    "/a%253Fb",
+    "/a%2523b",
   ])("rejects ambiguous or noncanonical route %s", async (route) => {
     const root = await projectRoot();
     await expect(initializeGovernance({

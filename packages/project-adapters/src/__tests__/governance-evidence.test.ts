@@ -70,7 +70,10 @@ describe("governance representative evidence", () => {
     })).rejects.toThrow(/symbolic link|alias/i);
   });
 
-  it.each(["/a%2Fb", "/a%3Fb", "/a%23b", "/%2e/private", "/a?x=1", "/a#x"])(
+  it.each([
+    "/a%2Fb", "/a%3Fb", "/a%23b", "/%2e/private", "/a?x=1", "/a#x",
+    "/%252e%252e/private", "/a%252Fb", "/a%255Cb", "/a%253Fb", "/a%2523b",
+  ])(
     "rejects ambiguous evidence route %s",
     async (route) => {
       const root = await fixture();
