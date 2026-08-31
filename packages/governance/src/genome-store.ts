@@ -57,6 +57,21 @@ const MAX_LOCK_ATTEMPTS = 100;
 const LOCK_STALE_MILLISECONDS = 30_000;
 const STAGING_DIRECTORY = "governance-staging";
 const EVIDENCE_CATALOG_FILE = "governance-evidence.json";
+const AUDIT_GENERATIONS_DIRECTORY = "audit-generations";
+const AUDIT_GENERATION_POINTER_FILE = "active-audit-generation.json";
+const AUDIT_GENERATION_MANIFEST_FILE = "manifest.json";
+
+export type AuditTransactionFault = "after-stage" | "after-pointer";
+let auditTransactionFault: AuditTransactionFault | undefined;
+
+/** Test-only fault injection for the generation promotion boundaries. */
+export function setAuditTransactionFaultForTest(value: AuditTransactionFault | undefined): void {
+  auditTransactionFault = value;
+}
+
+function throwAuditTransactionFault(point: AuditTransactionFault): void {
+  if (auditTransactionFault === point) throw new Error(`Injected audit transaction fault: ${point}`);
+}
 
 export class GovernanceNotInitializedError extends Error {
   constructor() {
@@ -120,6 +135,31 @@ interface StoredEvidenceCatalog {
   createdAt: string;
   entries: GovernanceEvidenceCatalogEntry[];
   signature: string;
+}
+
+interface ActiveAuditGeneration {
+  kind: "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION";
+  projectId: string;
+  generationId: string;
+  registryEntityId: string;
+  registryRevision: number;
+  reportEntityId: string;
+  reportRevision: number;
+  createdAt: string;
+  signature: string;
+}
+
+export interface CommitAuditGenerationInput {
+  rootPath: string;
+  projectId: string;
+  governanceDirectory: string;
+  registryMarkdown: string;
+  registryEntityId: string;
+  registryRevision: number;
+  reportMarkdown: string;
+  reportEntityId: string;
+  reportRevision: number;
+  catalog: GovernanceEvidenceCatalogEntry[];
 }
 
 function safeProjectId(projectId: string): string {
@@ -287,13 +327,13 @@ function normalizeEvidenceCatalog(
       throw new Error(`Governance evidence catalog entry ${index} is invalid`);
     }
     const entry = raw as Record<string, unknown>;
-    const renderMetadataPresent = entry.renderCapturedAt !== undefined || entry.renderSourceRevisionFingerprint !== undefined;
+    const renderMetadataPresent = entry.renderState !== undefined || entry.renderCapturedAt !== undefined || entry.renderSourceRevisionFingerprint !== undefined;
     exactObjectKeys(
       entry,
       entry.authenticatedRenderId === undefined
         ? ["id", "kind", "route", "excerpt", "verifiedClaims"]
         : renderMetadataPresent
-          ? ["id", "kind", "route", "excerpt", "verifiedClaims", "authenticatedRenderId", "renderCapturedAt", "renderSourceRevisionFingerprint"]
+          ? ["id", "kind", "route", "excerpt", "verifiedClaims", "authenticatedRenderId", "renderState", "renderCapturedAt", "renderSourceRevisionFingerprint"]
           : ["id", "kind", "route", "excerpt", "verifiedClaims", "authenticatedRenderId"],
       `Governance evidence catalog entry ${index}`,
     );
@@ -352,9 +392,14 @@ function normalizeEvidenceCatalog(
     if (renderMetadataPresent && authenticatedRenderId === undefined) {
       throw new Error("Render verification metadata requires an authenticated render identity");
     }
+    if (authenticatedRenderId !== undefined && entry.kind !== "RENDER") {
+      throw new Error("Authenticated render metadata requires RENDER evidence");
+    }
+    const renderState = entry.renderState;
     const renderCapturedAt = entry.renderCapturedAt;
     const renderSourceRevisionFingerprint = entry.renderSourceRevisionFingerprint;
     if (renderMetadataPresent && (
+      typeof renderState !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(renderState) ||
       typeof renderCapturedAt !== "string" || new Date(renderCapturedAt).toISOString() !== renderCapturedAt ||
       typeof renderSourceRevisionFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(renderSourceRevisionFingerprint)
     )) throw new Error("Authenticated render verification metadata is invalid");
@@ -366,6 +411,7 @@ function normalizeEvidenceCatalog(
       verifiedClaims,
       ...(authenticatedRenderId === undefined ? {} : { authenticatedRenderId }),
       ...(renderMetadataPresent ? {
+        renderState: renderState as string,
         renderCapturedAt: renderCapturedAt as string,
         renderSourceRevisionFingerprint: renderSourceRevisionFingerprint as string,
       } : {}),
@@ -384,12 +430,11 @@ function evidenceCatalogSignature(
   return createHmac("sha256", key).update(JSON.stringify(value), "utf8").digest("hex");
 }
 
-export async function writeEvidenceCatalogUnderLock(
+async function renderAuthenticatedEvidenceCatalog(
   rootPath: string,
   projectId: string,
-  machineDirectory: string,
   entriesInput: unknown,
-): Promise<{ path: string; dev: number; ino: number }> {
+): Promise<{ markdown: string; entries: GovernanceEvidenceCatalogEntry[] }> {
   const entries = normalizeEvidenceCatalog(entriesInput);
   const key = await authorityKey(rootPath, true);
   const canonicalRoot = await canonicalProjectRoot(rootPath);
@@ -401,28 +446,22 @@ export async function writeEvidenceCatalogUnderLock(
     createdAt: new Date().toISOString(),
     entries,
   };
-  const stored: StoredEvidenceCatalog = {
-    ...unsigned,
-    signature: evidenceCatalogSignature(key, unsigned),
+  return {
+    entries,
+    markdown: `${JSON.stringify({
+      ...unsigned,
+      signature: evidenceCatalogSignature(key, unsigned),
+    })}\n`,
   };
-  await atomicWriteDocument(
-    machineDirectory,
-    EVIDENCE_CATALOG_FILE,
-    `${JSON.stringify(stored)}\n`,
-  );
-  const path = join(machineDirectory, EVIDENCE_CATALOG_FILE);
-  const identity = await assertRegularDocument(path);
-  return { path, dev: Number(identity.dev), ino: Number(identity.ino) };
 }
 
-export async function readEvidenceCatalog(
+async function readAuthenticatedEvidenceCatalogAtPath(
   rootPath: string,
   projectId: string,
+  path: string,
 ): Promise<GovernanceEvidenceCatalogEntry[]> {
   safeProjectId(projectId);
   const canonicalRoot = await canonicalProjectRoot(rootPath);
-  const machineDirectory = await machineStateDirectory(rootPath, false);
-  const path = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, EVIDENCE_CATALOG_FILE));
   const raw = await readBoundedDocument(path);
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { throw new Error("Governance evidence catalog is malformed"); }
@@ -457,6 +496,232 @@ export async function readEvidenceCatalog(
     throw new Error("Governance evidence catalog is not canonical");
   }
   return entries;
+}
+
+export async function writeEvidenceCatalogUnderLock(
+  rootPath: string,
+  projectId: string,
+  machineDirectory: string,
+  entriesInput: unknown,
+): Promise<{ path: string; dev: number; ino: number }> {
+  const rendered = await renderAuthenticatedEvidenceCatalog(rootPath, projectId, entriesInput);
+  await atomicWriteDocument(
+    machineDirectory,
+    EVIDENCE_CATALOG_FILE,
+    rendered.markdown,
+  );
+  const path = join(machineDirectory, EVIDENCE_CATALOG_FILE);
+  const identity = await assertRegularDocument(path);
+  return { path, dev: Number(identity.dev), ino: Number(identity.ino) };
+}
+
+function activeAuditGenerationPayload(
+  value: Omit<ActiveAuditGeneration, "signature">,
+): string {
+  return JSON.stringify(value);
+}
+
+function activeAuditGenerationSignature(
+  key: Buffer,
+  value: Omit<ActiveAuditGeneration, "signature">,
+): string {
+  return createHmac("sha256", key).update(activeAuditGenerationPayload(value), "utf8").digest("hex");
+}
+
+async function readActiveAuditGeneration(
+  rootPath: string,
+  projectId: string,
+): Promise<{ pointer: ActiveAuditGeneration; directory: string } | undefined> {
+  const machineDirectory = await machineStateDirectory(rootPath, false);
+  const pointerPath = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATION_POINTER_FILE));
+  if (!(await entryExists(pointerPath))) return undefined;
+  const raw = await readBoundedDocument(pointerPath);
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("Active audit generation pointer is malformed"); }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Active audit generation pointer is malformed");
+  }
+  const pointer = parsed as Record<string, unknown>;
+  exactObjectKeys(pointer, ["kind", "projectId", "generationId", "registryEntityId", "registryRevision", "reportEntityId", "reportRevision", "createdAt", "signature"], "Active audit generation pointer");
+  if (
+    pointer.kind !== "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION" || pointer.projectId !== projectId ||
+    typeof pointer.generationId !== "string" || !/^[a-f0-9-]{36}$/.test(pointer.generationId) ||
+    typeof pointer.registryEntityId !== "string" || !SAFE_ID_PATTERN.test(pointer.registryEntityId) ||
+    !Number.isSafeInteger(pointer.registryRevision) || (pointer.registryRevision as number) < 1 ||
+    typeof pointer.reportEntityId !== "string" || !SAFE_ID_PATTERN.test(pointer.reportEntityId) ||
+    !Number.isSafeInteger(pointer.reportRevision) || (pointer.reportRevision as number) < 1 ||
+    typeof pointer.createdAt !== "string" || new Date(pointer.createdAt).toISOString() !== pointer.createdAt ||
+    typeof pointer.signature !== "string" || !/^[a-f0-9]{64}$/.test(pointer.signature)
+  ) throw new Error("Active audit generation pointer is invalid");
+  const normalized = pointer as unknown as ActiveAuditGeneration;
+  const { signature, ...unsigned } = normalized;
+  const key = await authorityKey(rootPath, false);
+  const expected = Buffer.from(activeAuditGenerationSignature(key, unsigned), "hex");
+  const actual = Buffer.from(signature, "hex");
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    throw new Error("Active audit generation pointer is not authenticated");
+  }
+  const root = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATIONS_DIRECTORY));
+  const directory = assertPathInsideWorkspace(root, join(root, normalized.generationId));
+  const entry = await lstat(directory);
+  if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("Active audit generation directory is unsafe");
+  const files = new Map(await Promise.all(
+    [SCREEN_REGISTRY_FILE, DRIFT_REPORT_FILE, EVIDENCE_CATALOG_FILE, AUDIT_GENERATION_MANIFEST_FILE].map(async (name) => {
+      const path = assertPathInsideWorkspace(directory, join(/*turbopackIgnore: true */ directory, name));
+      await assertRegularDocument(path);
+      return [name, path] as const;
+    }),
+  ));
+  const registry = parseGovernanceMetadata(await readBoundedDocument(files.get(SCREEN_REGISTRY_FILE)!));
+  const report = parseGovernanceMetadata(await readBoundedDocument(files.get(DRIFT_REPORT_FILE)!));
+  let manifest: unknown;
+  try { manifest = JSON.parse(await readBoundedDocument(files.get(AUDIT_GENERATION_MANIFEST_FILE)!)); } catch {
+    throw new Error("Active audit generation manifest is malformed");
+  }
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error("Active audit generation manifest is malformed");
+  }
+  const manifestValue = manifest as Record<string, unknown>;
+  exactObjectKeys(manifestValue, ["kind", "projectId", "generationId", "registryEntityId", "registryRevision", "reportEntityId", "reportRevision"], "Active audit generation manifest");
+  if (
+    registry.kind !== "SCREEN_REGISTRY" || report.kind !== "DRIFT_REPORT" ||
+    registry.entityId !== normalized.registryEntityId || registry.revision !== normalized.registryRevision ||
+    report.entityId !== normalized.reportEntityId || report.revision !== normalized.reportRevision ||
+    report.registryEntityId !== registry.entityId || report.registryRevision !== registry.revision ||
+    manifestValue.kind !== "DESIGN_SHARINGAN_AUDIT_GENERATION" ||
+    manifestValue.projectId !== projectId || manifestValue.generationId !== normalized.generationId ||
+    manifestValue.registryEntityId !== normalized.registryEntityId || manifestValue.registryRevision !== normalized.registryRevision ||
+    manifestValue.reportEntityId !== normalized.reportEntityId || manifestValue.reportRevision !== normalized.reportRevision
+  ) throw new Error("Active audit generation is internally inconsistent with its pointer");
+  await readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, files.get(EVIDENCE_CATALOG_FILE)!);
+  return { pointer: normalized, directory };
+}
+
+async function activeAuditGenerationFile(
+  rootPath: string,
+  projectId: string,
+  fileName: string,
+): Promise<string | undefined> {
+  if (fileName !== SCREEN_REGISTRY_FILE && fileName !== DRIFT_REPORT_FILE && fileName !== EVIDENCE_CATALOG_FILE) {
+    return undefined;
+  }
+  const active = await readActiveAuditGeneration(rootPath, projectId);
+  return active === undefined ? undefined : assertPathInsideWorkspace(active.directory, join(active.directory, fileName));
+}
+
+export async function commitAuditGenerationUnderLock(
+  input: CommitAuditGenerationInput,
+): Promise<void> {
+  const machineDirectory = await machineStateDirectory(input.rootPath, false);
+  const generationRoot = await ensurePrivateDirectory(machineDirectory, AUDIT_GENERATIONS_DIRECTORY);
+  const generationId = randomUUID();
+  const generationDirectory = assertPathInsideWorkspace(generationRoot, join(generationRoot, generationId));
+  await mkdir(generationDirectory, { mode: 0o700 });
+  const renderedCatalog = await renderAuthenticatedEvidenceCatalog(input.rootPath, input.projectId, input.catalog);
+  const manifest = JSON.stringify({
+    kind: "DESIGN_SHARINGAN_AUDIT_GENERATION",
+    projectId: input.projectId,
+    generationId,
+    registryEntityId: input.registryEntityId,
+    registryRevision: input.registryRevision,
+    reportEntityId: input.reportEntityId,
+    reportRevision: input.reportRevision,
+  });
+  try {
+    await atomicWriteDocument(generationDirectory, SCREEN_REGISTRY_FILE, input.registryMarkdown);
+    await atomicWriteDocument(generationDirectory, DRIFT_REPORT_FILE, input.reportMarkdown);
+    await atomicWriteDocument(generationDirectory, EVIDENCE_CATALOG_FILE, renderedCatalog.markdown);
+    await atomicWriteDocument(generationDirectory, AUDIT_GENERATION_MANIFEST_FILE, `${manifest}\n`);
+    const registry = parseGovernanceMetadata(await readBoundedDocument(join(generationDirectory, SCREEN_REGISTRY_FILE)));
+    const report = parseGovernanceMetadata(await readBoundedDocument(join(generationDirectory, DRIFT_REPORT_FILE)));
+    if (
+      registry.kind !== "SCREEN_REGISTRY" || report.kind !== "DRIFT_REPORT" ||
+      registry.entityId !== input.registryEntityId || registry.revision !== input.registryRevision ||
+      report.entityId !== input.reportEntityId || report.revision !== input.reportRevision ||
+      report.registryEntityId !== registry.entityId || report.registryRevision !== registry.revision
+    ) throw new Error("Staged audit generation is internally inconsistent");
+    await syncDirectory(generationDirectory);
+    throwAuditTransactionFault("after-stage");
+    const key = await authorityKey(input.rootPath, false);
+    const unsigned: Omit<ActiveAuditGeneration, "signature"> = {
+      kind: "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION",
+      projectId: input.projectId,
+      generationId,
+      registryEntityId: input.registryEntityId,
+      registryRevision: input.registryRevision,
+      reportEntityId: input.reportEntityId,
+      reportRevision: input.reportRevision,
+      createdAt: new Date().toISOString(),
+    };
+    const pointer: ActiveAuditGeneration = {
+      ...unsigned,
+      signature: activeAuditGenerationSignature(key, unsigned),
+    };
+    await atomicWriteDocument(machineDirectory, AUDIT_GENERATION_POINTER_FILE, `${JSON.stringify(pointer)}\n`);
+    throwAuditTransactionFault("after-pointer");
+
+    // These remain human-readable projections. Readers use the authenticated
+    // pointer, so a crash here cannot expose a mixed authoritative generation.
+    await atomicWriteDocument(input.governanceDirectory, SCREEN_REGISTRY_FILE, input.registryMarkdown);
+    await atomicWriteDocument(input.governanceDirectory, DRIFT_REPORT_FILE, input.reportMarkdown);
+    await atomicWriteDocument(machineDirectory, EVIDENCE_CATALOG_FILE, renderedCatalog.markdown);
+  } catch (error) {
+    const active = await readActiveAuditGeneration(input.rootPath, input.projectId).catch(() => undefined);
+    if (active?.pointer.generationId !== generationId) {
+      await rm(generationDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+export async function materializeActiveAuditGenerationUnderLock(
+  rootPath: string,
+  projectId: string,
+  governanceDirectoryPath: string,
+): Promise<boolean> {
+  const active = await readActiveAuditGeneration(rootPath, projectId);
+  if (active === undefined) return false;
+  const machineDirectory = await machineStateDirectory(rootPath, false);
+  for (const [fileName, destination] of [
+    [SCREEN_REGISTRY_FILE, governanceDirectoryPath],
+    [DRIFT_REPORT_FILE, governanceDirectoryPath],
+    [EVIDENCE_CATALOG_FILE, machineDirectory],
+  ] as const) {
+    await atomicWriteDocument(
+      destination,
+      fileName,
+      await readBoundedDocument(assertPathInsideWorkspace(active.directory, join(/*turbopackIgnore: true */ active.directory, fileName))),
+    );
+  }
+  return true;
+}
+
+export async function clearActiveAuditGenerationUnderLock(
+  rootPath: string,
+  projectId: string,
+): Promise<void> {
+  const active = await readActiveAuditGeneration(rootPath, projectId);
+  if (active === undefined) return;
+  const machineDirectory = await machineStateDirectory(rootPath, false);
+  const pointerPath = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATION_POINTER_FILE));
+  const pointer = await assertRegularDocument(pointerPath);
+  await unlink(pointerPath);
+  await syncDirectory(machineDirectory);
+  const current = await lstat(pointerPath).catch(() => undefined);
+  if (current !== undefined && current.dev === pointer.dev && current.ino === pointer.ino) {
+    throw new Error("Active audit generation pointer could not be cleared");
+  }
+}
+
+export async function readEvidenceCatalog(
+  rootPath: string,
+  projectId: string,
+): Promise<GovernanceEvidenceCatalogEntry[]> {
+  safeProjectId(projectId);
+  const machineDirectory = await machineStateDirectory(rootPath, false);
+  const path = (await activeAuditGenerationFile(rootPath, projectId, EVIDENCE_CATALOG_FILE)) ??
+    assertPathInsideWorkspace(machineDirectory, join(machineDirectory, EVIDENCE_CATALOG_FILE));
+  return readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, path);
 }
 
 function assertGenomeEvidenceRelationships(
@@ -642,7 +907,8 @@ export async function readGovernanceDocument(
 ): Promise<GovernanceMetadata> {
   safeProjectId(projectId);
   const directory = await governanceDirectory(rootPath, false);
-  const path = assertPathInsideWorkspace(directory, join(directory, fileName));
+  const path = (await activeAuditGenerationFile(rootPath, projectId, fileName)) ??
+    assertPathInsideWorkspace(directory, join(directory, fileName));
   const metadata = parseGovernanceMetadata(await readBoundedDocument(path));
   if (metadata.projectId !== projectId) {
     throw new Error("Governance project identity does not match the active project");
@@ -860,6 +1126,7 @@ async function withMachineGovernanceLock<T>(
   let operationError: unknown;
   try {
     await reconcileOwnedStaging(directory);
+    await reconcileAuditGenerations(rootPath, directory);
     result = await operation(directory);
   } catch (error) {
     operationError = error;
@@ -935,6 +1202,37 @@ async function reconcileOwnedStaging(machineDirectory: string): Promise<void> {
       continue;
     }
     await rm(ownerDirectory, { recursive: true, force: false });
+  }
+}
+
+async function reconcileAuditGenerations(rootPath: string, machineDirectory: string): Promise<void> {
+  const generationRoot = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATIONS_DIRECTORY));
+  if (!(await entryExists(generationRoot))) return;
+  const rootEntry = await lstat(generationRoot);
+  if (rootEntry.isSymbolicLink() || !rootEntry.isDirectory()) {
+    throw new Error("Audit generation root is unsafe");
+  }
+  const pointerPath = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATION_POINTER_FILE));
+  let active: Awaited<ReturnType<typeof readActiveAuditGeneration>>;
+  if (await entryExists(pointerPath)) {
+    let raw: unknown;
+    try { raw = JSON.parse(await readBoundedDocument(pointerPath)); } catch {
+      throw new Error("Active audit generation pointer is malformed");
+    }
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw) || typeof (raw as { projectId?: unknown }).projectId !== "string") {
+      throw new Error("Active audit generation pointer is malformed");
+    }
+    active = await readActiveAuditGeneration(rootPath, (raw as { projectId: string }).projectId);
+  }
+  const activeId = active?.pointer.generationId;
+  const entries = await readdir(generationRoot, { withFileTypes: true });
+  if (entries.length > 32) throw new Error("Audit generation residue exceeds the recovery bound");
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[a-f0-9-]{36}$/.test(entry.name) || entry.name === activeId) continue;
+    const candidate = assertPathInsideWorkspace(generationRoot, join(generationRoot, entry.name));
+    const current = await lstat(candidate);
+    if (current.isSymbolicLink() || !current.isDirectory()) throw new Error("Audit generation residue is unsafe");
+    await rm(candidate, { recursive: true, force: false });
   }
 }
 

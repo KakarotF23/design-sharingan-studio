@@ -499,6 +499,7 @@ export interface GovernanceEvidenceCatalogEntry {
   excerpt: string;
   verifiedClaims: GovernanceVerifiedClaim[];
   authenticatedRenderId?: string;
+  renderState?: string;
   renderCapturedAt?: ISODateTime;
   renderSourceRevisionFingerprint?: string;
 }
@@ -535,6 +536,8 @@ export interface DriftFinding {
   category: DriftAuditCategory;
   severity: DriftSeverity;
   scope: string;
+  evidenceIds: string[];
+  genomeRuleId: string;
   expectedRule: string;
   observedEvidence: string[];
   whyItMatters: string;

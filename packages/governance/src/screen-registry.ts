@@ -8,6 +8,8 @@ import {
   readGenome,
   readEvidenceCatalog,
   incrementGovernanceRevision,
+  materializeActiveAuditGenerationUnderLock,
+  clearActiveAuditGenerationUnderLock,
 } from "./genome-store";
 import {
   assertScreenRecords,
@@ -99,7 +101,13 @@ export async function saveScreenRegistry(
       evidenceIds,
       records,
     };
+    const hadActiveAudit = await materializeActiveAuditGenerationUnderLock(
+      rootPath,
+      projectId,
+      directory,
+    );
     await atomicWriteDocument(directory, SCREEN_REGISTRY_FILE, renderScreenRegistry(metadata));
+    if (hadActiveAudit) await clearActiveAuditGenerationUnderLock(rootPath, projectId);
     return document(metadata);
   });
 }

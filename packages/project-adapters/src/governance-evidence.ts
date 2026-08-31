@@ -17,6 +17,7 @@ export interface AdapterGovernanceEvidence {
   excerpt: string;
   route: string;
   authenticatedRenderId?: string;
+  renderState?: string;
   renderCapturedAt?: string;
   renderSourceRevisionFingerprint?: string;
   verifiedClaims: GovernanceVerifiedClaim[];
@@ -229,6 +230,7 @@ export async function collectGovernanceEvidence(
           ...(artifact.sourceRevision.available
             ? {
                 renderCapturedAt: artifact.capturedAt,
+                renderState: "default",
                 renderSourceRevisionFingerprint: artifact.sourceRevision.worktreeFingerprint,
               }
             : {}),

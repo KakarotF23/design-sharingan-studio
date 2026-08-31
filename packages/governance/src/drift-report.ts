@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type {
   DriftReport,
   GovernanceEvidenceCatalogEntry,
@@ -6,15 +7,13 @@ import type {
 } from "@design-sharingan/core";
 import {
   DRIFT_REPORT_FILE,
-  atomicWriteDocument,
+  commitAuditGenerationUnderLock,
   incrementGovernanceRevision,
-  machineStateDirectory,
   readEvidenceCatalog,
   readGenome,
   readGovernanceDocument,
   safeProjectId,
   withGovernanceLock,
-  writeEvidenceCatalogUnderLock,
 } from "./genome-store";
 import { readScreenRegistry } from "./screen-registry";
 import {
@@ -75,13 +74,109 @@ function mergeCatalog(
   return entries;
 }
 
+function unresolvedFindings(
+  previous: ReadonlyArray<DriftReport["findings"][number]>,
+  next: ReadonlyArray<DriftReport["findings"][number]>,
+): DriftReport["findings"] {
+  const nextByIdentity = new Map(next.map((finding) => [`${finding.scope}\0${finding.genomeRuleId}`, finding]));
+  const retained = previous.filter((finding) => {
+    if (finding.status === "INTENTIONAL" || finding.status === "RESOLVED") return false;
+    const replacement = nextByIdentity.get(`${finding.scope}\0${finding.genomeRuleId}`);
+    return replacement === undefined || (replacement.status !== "INTENTIONAL" && replacement.status !== "RESOLVED");
+  });
+  const order = [
+    "UX_NAVIGATION",
+    "ACCESSIBILITY_REQUIRED_STATES",
+    "PRODUCT_IDENTITY_SCREEN_FAMILY",
+    "COMPONENTS_TOKENS",
+    "HIERARCHY",
+    "MOTION",
+    "POLISH",
+  ];
+  return [...retained, ...next].sort((left, right) =>
+    order.indexOf(left.category) - order.indexOf(right.category) ||
+    `${left.scope}\0${left.genomeRuleId}`.localeCompare(`${right.scope}\0${right.genomeRuleId}`),
+  );
+}
+
 function authenticatedRenderIds(entries: readonly GovernanceEvidenceCatalogEntry[]): Set<string> {
   return new Set(entries.filter((entry) =>
     entry.kind === "RENDER" &&
     entry.authenticatedRenderId !== undefined &&
+    entry.renderState !== undefined &&
     entry.renderCapturedAt !== undefined &&
     entry.renderSourceRevisionFingerprint !== undefined,
   ).map(({ id }) => id));
+}
+
+function scopeKey(route: string, state: string): string {
+  return `${route}#${state}`;
+}
+
+function reportScopeMatchesRegistry(report: DriftReport, records: readonly ScreenRecord[]): boolean {
+  if (report.expectedScope.length !== records.length) return false;
+  const expected = new Map(report.expectedScope.map((entry) => [entry.screen, entry.states]));
+  return records.every((record) => {
+    const states = expected.get(record.route);
+    return states !== undefined && states.length === record.requiredStates.length &&
+      states.every((state) => record.requiredStates.includes(state));
+  });
+}
+
+function validateIntrinsicReportTruth(
+  report: DriftReport,
+  records: readonly ScreenRecord[],
+  catalog: readonly GovernanceEvidenceCatalogEntry[],
+  genome: import("@design-sharingan/core").DesignGenome,
+): void {
+  if (!reportScopeMatchesRegistry(report, records)) {
+    throw new Error("Drift Report scope no longer exactly matches the current Screen Registry");
+  }
+  const catalogById = new Map(catalog.map((entry) => [entry.id, entry]));
+  const inspected = new Set(report.inspectedScope);
+  const unavailable = new Set([...report.unavailableScope, ...report.unverifiedScope]);
+  for (const record of records) {
+    for (const state of record.requiredStates) {
+      const key = scopeKey(record.route, state);
+      if (!inspected.has(key)) {
+        if (![...unavailable].some((value) => value.startsWith(`${key}:`))) {
+          throw new Error("Drift Report must explicitly enumerate unavailable required state evidence");
+        }
+        continue;
+      }
+      const matching = report.evidenceIds
+        .map((id) => catalogById.get(id))
+        .some((entry) => entry?.kind === "RENDER" && entry.route === record.route &&
+          entry.renderState === state && entry.authenticatedRenderId !== undefined &&
+          entry.renderCapturedAt !== undefined && entry.renderSourceRevisionFingerprint !== undefined);
+      if (!matching) {
+        throw new Error("Inspected Drift Report scope requires authenticated state-bound render evidence");
+      }
+    }
+  }
+  for (const finding of report.findings) {
+    const [route] = finding.scope.split("#", 1);
+    const validRule = [
+      genome.productIdentity,
+      ...genome.uxInvariants,
+      ...genome.visualInvariants,
+      ...genome.motionRules,
+      ...genome.accessibilityRules,
+      ...genome.componentDNA,
+      ...genome.screenFamilies,
+    ].includes(finding.expectedRule);
+    const expectedRuleId = `genome-rule-${createHash("sha256")
+      .update(`${finding.category}\0${finding.expectedRule}`, "utf8")
+      .digest("hex")
+      .slice(0, 24)}`;
+    if (
+      !validRule || finding.genomeRuleId !== expectedRuleId || finding.evidenceIds.length === 0 ||
+      finding.evidenceIds.some((id) => !report.evidenceIds.includes(id) || catalogById.get(id)?.route !== route)
+    ) throw new Error("Drift finding is not bound to authenticated evidence and an approved Genome rule");
+  }
+  if (report.overallStatus === "PASS" || report.overallStatus === "PASS_WITH_DEBT") {
+    throw new Error("Drift Report cannot self-authenticate deterministic analysis or release readiness");
+  }
 }
 
 function registryWithVerification(
@@ -100,9 +195,16 @@ function registryWithVerification(
       verification.states.some((state) => !record.requiredStates.includes(state))) {
       throw new Error("Registry verification must cover every required screen state");
     }
+    if (verification.status === "PASS") {
+      throw new Error("Registry PASS cannot be inferred from absent drift observations");
+    }
     if (verification.evidenceIds.length === 0 || verification.evidenceIds.some((id) => !validRenderIds.has(id))) {
       throw new Error("Registry verification requires authenticated current render evidence");
     }
+    if (verification.states.some((state) => !verification.evidenceIds.some((id) => {
+      const entry = catalog.find((candidate) => candidate.id === id);
+      return entry?.route === record.route && entry.renderState === state;
+    }))) throw new Error("Registry verification must bind every state to its authenticated render");
     exactIso(verification.lastVerified, "Registry verification time");
     return {
       ...record,
@@ -131,13 +233,14 @@ export async function readDriftReport(
     metadata.genomeVersion !== genome.value.version ||
     metadata.genomeRevision > genome.metadata.revision ||
     metadata.registryEntityId !== registry.metadata.entityId ||
-    metadata.registryRevision > registry.metadata.revision
+    metadata.registryRevision !== registry.metadata.revision
   ) throw new Error("Drift Report is not related to the active governance documents");
   const catalogIds = new Set(catalog.map(({ id }) => id));
   if (
     metadata.evidenceIds.some((id) => !catalogIds.has(id)) ||
     metadata.value.evidenceIds.some((id) => !catalogIds.has(id))
   ) throw new Error("Drift Report evidence is not authenticated by the durable evidence catalog");
+  validateIntrinsicReportTruth(metadata.value, registry.records, catalog, genome.value);
   return document(metadata);
 }
 
@@ -169,6 +272,7 @@ export async function saveDriftReport(input: SaveDriftReportInput): Promise<Drif
     }
     const catalog = mergeCatalog(currentCatalog, input.evidenceCatalog);
     const reportEvidenceIds = [...new Set([
+      ...(existingReport?.kind === "DRIFT_REPORT" ? existingReport.value.evidenceIds : []),
       ...input.report.evidenceIds,
       ...input.evidenceCatalog.map(({ id }) => id),
       ...(input.verifiedRegistry ?? []).flatMap(({ evidenceIds }) => evidenceIds),
@@ -176,16 +280,15 @@ export async function saveDriftReport(input: SaveDriftReportInput): Promise<Drif
     if (reportEvidenceIds.some((id) => !catalog.some((entry) => entry.id === id))) {
       throw new Error("Drift Report references evidence outside the authenticated catalog");
     }
-    const report: DriftReport = { ...input.report, evidenceIds: reportEvidenceIds };
-
-    // The catalog is atomically authenticated under the same governance lock before
-    // any Registry status or report can become visible as verified.
-    await writeEvidenceCatalogUnderLock(
-      input.rootPath,
-      input.projectId,
-      await machineStateDirectory(input.rootPath, false),
-      catalog,
-    );
+    const report: DriftReport = {
+      ...input.report,
+      findings: unresolvedFindings(
+        existingReport?.kind === "DRIFT_REPORT" ? existingReport.value.findings : [],
+        input.report.findings,
+      ),
+      evidenceIds: reportEvidenceIds,
+    };
+    validateIntrinsicReportTruth(report, registry.records, catalog, genome.value);
 
     const records = registryWithVerification(
       registry.records,
@@ -203,12 +306,6 @@ export async function saveDriftReport(input: SaveDriftReportInput): Promise<Drif
         authenticatedVerificationEvidenceIds: [...authenticatedRenderIds(catalog)],
       }),
     };
-    await atomicWriteDocument(
-      directory,
-      "SCREEN-REGISTRY.md",
-      renderScreenRegistry(registryMetadata),
-    );
-
     const metadata: DriftReportMetadata = {
       schemaVersion: 1,
       kind: "DRIFT_REPORT",
@@ -224,7 +321,18 @@ export async function saveDriftReport(input: SaveDriftReportInput): Promise<Drif
       auditedAt,
       value: report,
     };
-    await atomicWriteDocument(directory, DRIFT_REPORT_FILE, renderDriftReport(metadata));
+    await commitAuditGenerationUnderLock({
+      rootPath: input.rootPath,
+      projectId: input.projectId,
+      governanceDirectory: directory,
+      registryMarkdown: renderScreenRegistry(registryMetadata),
+      registryEntityId: registryMetadata.entityId,
+      registryRevision: registryMetadata.revision,
+      reportMarkdown: renderDriftReport(metadata),
+      reportEntityId: metadata.entityId,
+      reportRevision: metadata.revision,
+      catalog,
+    });
     return document(metadata);
   });
 }

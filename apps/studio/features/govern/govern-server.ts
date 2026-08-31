@@ -92,28 +92,33 @@ async function workspaceFor(project: Project): Promise<ProjectWorkspace> {
 
 async function freshRenderEvidenceIds(
   project: Project,
-): Promise<Set<string>> {
+): Promise<{ ids: Set<string>; sourceRevisionFingerprint?: string }> {
   const [workspace, catalog] = await Promise.all([
     workspaceFor(project),
     readEvidenceCatalog(project.rootPath, project.id),
   ]);
   const current = await captureWorkspaceSourceRevision(workspace).catch(() => undefined);
-  if (current?.available !== true) return new Set();
-  return new Set(catalog.filter((entry) =>
+  if (current?.available !== true) return { ids: new Set() };
+  return {
+    sourceRevisionFingerprint: current.worktreeFingerprint,
+    ids: new Set(catalog.filter((entry) =>
     entry.kind === "RENDER" &&
     entry.authenticatedRenderId !== undefined &&
+    entry.renderState !== undefined &&
     entry.renderCapturedAt !== undefined &&
     entry.renderSourceRevisionFingerprint === current.worktreeFingerprint,
-  ).map(({ id }) => id));
+    ).map(({ id }) => id)),
+  };
 }
 
 async function evaluateProjectReleaseGate(
   project: Project,
   report: DriftReport,
 ): Promise<GovernReleaseProjection> {
-  const [registry, decisions, freshEvidence] = await Promise.all([
+  const [registry, decisions, catalog, freshEvidence] = await Promise.all([
     readScreenRegistry(project.rootPath, project.id),
     readDesignDecisions(project.rootPath, project.id),
+    readEvidenceCatalog(project.rootPath, project.id),
     freshRenderEvidenceIds(project),
   ]);
   const verifiedAt = registry.records.flatMap(({ lastVerified }) => lastVerified === undefined ? [] : [lastVerified])
@@ -121,7 +126,7 @@ async function evaluateProjectReleaseGate(
     .at(-1);
   const allRegistered = registry.records.length > 0 && registry.records.every(({ driftStatus }) => driftStatus !== "NOT_VERIFIED");
   const allFresh = allRegistered && registry.records.every((record) =>
-    record.evidence.some((id) => freshEvidence.has(id)),
+    record.evidence.some((id) => freshEvidence.ids.has(id)),
   );
   const requiredStates = report.unavailableScope.length === 0 && report.unverifiedScope.length === 0;
   const critical = report.findings.some(({ severity }) => severity === "CRITICAL");
@@ -131,6 +136,20 @@ async function evaluateProjectReleaseGate(
   const evidence = report.evidenceIds.length > 0 && verifiedAt !== undefined
     ? { evidence: report.evidenceIds, lastVerified: verifiedAt }
     : { evidence: [] };
+  const authenticatedEvidence = catalog.flatMap((entry) => {
+    if (!report.evidenceIds.includes(entry.id) || entry.renderCapturedAt === undefined || entry.renderSourceRevisionFingerprint === undefined) return [];
+    return [{
+      id: entry.id,
+      projectId: project.id,
+      route: entry.route,
+      state: entry.renderState ?? "default",
+      kind: entry.kind === "RENDER" ? "RENDER" as const : "EVIDENCE" as const,
+      capturedAt: entry.renderCapturedAt,
+      sourceRevisionFingerprint: entry.renderSourceRevisionFingerprint,
+      ...(report.findings.some((finding) => finding.severity === "POLISH" && finding.evidenceIds.includes(entry.id))
+        ? { findingCategory: "POLISH" as const } : {}),
+    }];
+  });
   return evaluateReleaseGate({
     scope: {
       requestedScope: report.requestedScope,
@@ -147,6 +166,19 @@ async function evaluateProjectReleaseGate(
     freshRenders: allFresh ? "PASS" : "FAIL",
     decisions: decisions.decisions.some(({ status }) => status === "DRAFT") ? "NOT_VERIFIED" : "PASS",
     functionalVerification: "NOT_VERIFIED",
+    projectId: project.id,
+    currentSourceRevisionFingerprint: freshEvidence.sourceRevisionFingerprint,
+    authenticatedEvidence,
+    approvedDecisionIds: decisions.decisions
+      .filter((decision) => decision.status === "APPROVED" && decision.approvedBy === "local-user")
+      .map(({ id }) => id),
+    unresolvedFindings: report.findings
+      .filter((finding) => finding.status !== "RESOLVED" && finding.status !== "INTENTIONAL")
+      .map((finding) => ({
+        finding: `${finding.scope}: ${finding.expectedRule}`,
+        severity: finding.severity,
+        evidenceIds: finding.evidenceIds,
+      })),
     evidence: {
       criticalDrift: evidence,
       newDesignRules: evidence,
@@ -323,6 +355,7 @@ export async function auditProjectDrift(
       if (
         entry.kind === "RENDER" &&
         entry.authenticatedRenderId !== undefined &&
+        entry.renderState !== undefined &&
         entry.renderCapturedAt !== undefined &&
         entry.renderSourceRevisionFingerprint === currentRevision.worktreeFingerprint
       ) {
@@ -355,11 +388,12 @@ export async function auditProjectDrift(
   const verifiedRegistry = registry.records.flatMap((record) => {
     const states = record.requiredStates;
     const evidenceIds = states.flatMap((state) => state === "default" ? freshRenderByRoute.get(record.route) ?? [] : []);
-    return states.length > 0 && evidenceIds.length > 0 && states.every((state) => state === "default")
+    const hasObservedDrift = report.findings.some((finding) => finding.scope.startsWith(`${record.route}#`));
+    return hasObservedDrift && states.length > 0 && evidenceIds.length > 0 && states.every((state) => state === "default")
       ? [{
           screen: record.route,
           states,
-          status: report.findings.some((finding) => finding.scope.startsWith(`${record.route}#`)) ? "DRIFT" as const : "PASS" as const,
+          status: "DRIFT" as const,
           evidenceIds,
           lastVerified: new Date().toISOString(),
         }]

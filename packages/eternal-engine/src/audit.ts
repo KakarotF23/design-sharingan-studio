@@ -8,6 +8,8 @@ import type {
   DriftReport,
   DriftSeverity,
 } from "@design-sharingan/core";
+import { createHash } from "node:crypto";
+import { normalizeGovernanceRoute } from "@design-sharingan/core";
 
 export const AUDIT_ORDER: readonly DriftAuditCategory[] = [
   "UX_NAVIGATION",
@@ -50,7 +52,29 @@ function text(value: string, label: string): string {
 }
 
 function scopeKey(screen: string, state: string): string {
-  return `${text(screen, "Screen")}#${text(state, "State")}`;
+  return `${canonicalScreen(screen, "Screen")}#${text(state, "State")}`;
+}
+
+function canonicalScreen(value: string, label: string): string {
+  const screen = text(value, label);
+  return screen.startsWith("/") ? normalizeGovernanceRoute(screen) : screen;
+}
+
+function approvedRules(genome: DesignGenome | undefined, category: DriftAuditCategory): string[] {
+  if (genome === undefined) return [];
+  switch (category) {
+    case "UX_NAVIGATION": return genome.uxInvariants;
+    case "ACCESSIBILITY_REQUIRED_STATES": return genome.accessibilityRules;
+    case "PRODUCT_IDENTITY_SCREEN_FAMILY": return [genome.productIdentity, ...genome.screenFamilies];
+    case "COMPONENTS_TOKENS": return [...genome.componentDNA, ...genome.visualInvariants];
+    case "HIERARCHY": return genome.visualInvariants;
+    case "MOTION": return genome.motionRules;
+    case "POLISH": return genome.visualInvariants;
+  }
+}
+
+function genomeRuleId(category: DriftAuditCategory, rule: string): string {
+  return `genome-rule-${createHash("sha256").update(`${category}\0${rule}`, "utf8").digest("hex").slice(0, 24)}`;
 }
 
 function normalizeExpectedScope(
@@ -58,7 +82,7 @@ function normalizeExpectedScope(
 ): DriftAuditScopeEntry[] {
   if (expectedScope === undefined) return [];
   const normalized = expectedScope.map(({ screen, states }) => {
-    text(screen, "Expected screen");
+    const canonical = canonicalScreen(screen, "Expected screen");
     if (!Array.isArray(states) || states.length === 0 || states.length > 64) {
       throw new Error("Expected screen states must be explicitly enumerated");
     }
@@ -66,7 +90,7 @@ function normalizeExpectedScope(
     if (new Set(uniqueStates).size !== uniqueStates.length) {
       throw new Error("Expected screen states must be unique");
     }
-    return { screen, states: uniqueStates };
+    return { screen: canonical, states: uniqueStates };
   });
   if (normalized.length > 64 || new Set(normalized.map(({ screen }) => screen)).size !== normalized.length) {
     throw new Error("Expected audit screens must be unique and bounded");
@@ -74,9 +98,14 @@ function normalizeExpectedScope(
   return normalized;
 }
 
-function findingsFromEvidence(evidence: readonly DriftAuditEvidenceInput[]): DriftFinding[] {
+function findingsFromEvidence(
+  evidence: readonly DriftAuditEvidenceInput[],
+  genome: DesignGenome | undefined,
+  unverifiedScope: string[],
+): DriftFinding[] {
   const findings: DriftFinding[] = [];
   for (const entry of evidence) {
+    if (entry.status !== "INSPECTED") continue;
     for (const observation of entry.observations ?? []) {
       if (!AUDIT_ORDER.includes(observation.category)) {
         throw new Error("Drift observation category is invalid");
@@ -89,11 +118,17 @@ function findingsFromEvidence(evidence: readonly DriftAuditEvidenceInput[]): Dri
         throw new Error("Repeated drift must identify at least two screens");
       }
       const requiresDesignDecision = observation.requiresDesignDecision === true || repeated.length > 0;
+      const expectedRule = text(observation.expectedRule, "Expected rule");
+      if (!approvedRules(genome, observation.category).includes(expectedRule)) {
+        unverifiedScope.push(`${observation.category}: Observation is not bound to an approved Genome rule.`);
+      }
       findings.push({
         category: observation.category,
         severity: observation.severity,
         scope: entry.state === undefined ? entry.screen : scopeKey(entry.screen, entry.state),
-        expectedRule: text(observation.expectedRule, "Expected rule"),
+        evidenceIds: [...new Set(entry.evidenceIds ?? [])],
+        genomeRuleId: genomeRuleId(observation.category, expectedRule),
+        expectedRule,
         observedEvidence: observation.observedEvidence.map((value) => text(value, "Observed evidence")),
         whyItMatters: text(observation.whyItMatters, "Drift impact"),
         recommendedFix: text(observation.recommendedFix, "Drift fix"),
@@ -123,7 +158,7 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
   const expectedScope = normalizeExpectedScope(input.expectedScope);
   const evidence = input.evidence.map((entry) => ({
     ...entry,
-    screen: text(entry.screen, "Evidence screen"),
+    screen: canonicalScreen(entry.screen, "Evidence screen"),
     ...(entry.state === undefined ? {} : { state: text(entry.state, "Evidence state") }),
     evidenceIds: [...new Set((entry.evidenceIds ?? []).map((id) => text(id, "Evidence identity")))],
   }));
@@ -147,8 +182,18 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
     .map((entry) => `${entry.state === undefined ? entry.screen : scopeKey(entry.screen, entry.state)}: ${entry.reason ?? "Evidence is unavailable."}`);
   const unverifiedScope = [...unavailableScope];
 
+  for (const entry of evidence.filter(({ status }) => status === "INSPECTED")) {
+    const key = entry.state === undefined ? entry.screen : scopeKey(entry.screen, entry.state);
+    if ((entry.evidenceIds ?? []).length === 0) {
+      unverifiedScope.push(`${key}: Authenticated rendered evidence is missing.`);
+    }
+  }
+
   if (input.requestedScope === "WHOLE_APP" && expectedScope.length === 0) {
     unverifiedScope.unshift("Whole-product scope was not explicitly enumerated.");
+  }
+  if (input.requestedScope === "WHOLE_APP" && expectedScope.length < 2) {
+    unverifiedScope.unshift("Whole-product scope requires more than one distinct canonical screen.");
   }
   for (const expected of expectedScope) {
     for (const state of expected.states) {
@@ -159,11 +204,22 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
       }
     }
   }
-  if (input.requestedScope === "WHOLE_APP" && evidence.length === 1) {
-    unverifiedScope.unshift("Whole-product scope cannot be established from one inspected screen.");
+  if (input.requestedScope === "WHOLE_APP") {
+    const expectedScreens = new Set(expectedScope.map(({ screen }) => screen));
+    const inspectedScreens = new Set(evidence.filter(({ status }) => status === "INSPECTED").map(({ screen }) => screen));
+    if (
+      expectedScreens.size !== inspectedScreens.size ||
+      [...expectedScreens].some((screen) => !inspectedScreens.has(screen)) ||
+      [...inspectedScreens].some((screen) => !expectedScreens.has(screen))
+    ) unverifiedScope.unshift("Whole-product inspected screens do not exactly match the explicit expected screen set.");
   }
 
-  const findings = findingsFromEvidence(evidence);
+  for (const category of AUDIT_ORDER) {
+    if (!evidence.some((entry) => (entry.observations ?? []).some((observation) => observation.category === category))) {
+      unverifiedScope.push(`${category}: Deterministic analysis is unavailable.`);
+    }
+  }
+  const findings = findingsFromEvidence(evidence, input.approvedGenome, unverifiedScope);
   const evidenceIds = [...new Set(evidence.flatMap(({ evidenceIds }) => evidenceIds ?? []))];
   return {
     requestedScope: input.requestedScope,

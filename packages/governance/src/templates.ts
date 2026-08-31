@@ -285,6 +285,8 @@ export function renderDriftReport(metadata: DriftReportMetadata): string {
   const findings = report.findings.map((finding) => `## ${finding.severity} / ${finding.category}
 
 - **Scope:** ${quoted(finding.scope)}
+- **Genome rule:** ${quoted(finding.genomeRuleId)}
+- **Evidence IDs:** ${markdownList(finding.evidenceIds, "No authenticated evidence IDs.")}
 - **Expected rule:** ${quoted(finding.expectedRule)}
 - **Decision required:** ${finding.requiresDesignDecision ? "Yes" : "No"}
 - **Status:** ${quoted(finding.status)}
@@ -611,7 +613,7 @@ function parseDriftFinding(value: unknown): DriftFinding {
   const finding = objectValue(value, "Drift finding");
   exactKeys(
     finding,
-    ["category", "severity", "scope", "expectedRule", "observedEvidence", "whyItMatters", "recommendedFix", "requiresDesignDecision", "status"],
+    ["category", "severity", "scope", "evidenceIds", "genomeRuleId", "expectedRule", "observedEvidence", "whyItMatters", "recommendedFix", "requiresDesignDecision", "status"],
     [],
     "Drift finding",
   );
@@ -631,6 +633,9 @@ function parseDriftFinding(value: unknown): DriftFinding {
   if (!Array.isArray(finding.observedEvidence) || finding.observedEvidence.length > MAX_RULES) {
     throw new Error("Drift finding observed evidence must be bounded");
   }
+  if (!Array.isArray(finding.evidenceIds) || finding.evidenceIds.length === 0 || finding.evidenceIds.length > MAX_RULES) {
+    throw new Error("Drift finding authenticated evidence must be bounded and non-empty");
+  }
   if (typeof finding.requiresDesignDecision !== "boolean") {
     throw new Error("Drift finding decision requirement is invalid");
   }
@@ -638,6 +643,8 @@ function parseDriftFinding(value: unknown): DriftFinding {
     category: finding.category as DriftFinding["category"],
     severity: finding.severity as DriftFinding["severity"],
     scope: boundedString(finding.scope, "Drift finding scope", MAX_SHORT_TEXT_LENGTH),
+    evidenceIds: finding.evidenceIds.map((entry, index) => evidenceId(entry, `Drift finding evidence[${index}]`)),
+    genomeRuleId: safeId(finding.genomeRuleId, "Drift Genome rule identity"),
     expectedRule: boundedString(finding.expectedRule, "Drift expected rule"),
     observedEvidence: finding.observedEvidence.map((entry, index) => boundedString(
       entry,

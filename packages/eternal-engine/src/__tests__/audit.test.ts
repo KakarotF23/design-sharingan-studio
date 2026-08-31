@@ -30,6 +30,34 @@ describe("Drift audit", () => {
     expect(report.unverifiedScope.length).toBeGreaterThan(0);
   });
 
+  it("requires distinct canonical expected and inspected screens for a whole-app audit", async () => {
+    const report = await runDriftAudit({
+      requestedScope: "WHOLE_APP",
+      expectedScope: [{ screen: "/overview", states: ["default", "loading"] }],
+      evidence: [
+        { screen: "/overview", state: "default", status: "INSPECTED", evidenceIds: ["ev_render_scope_01"] },
+        { screen: "/overview", state: "loading", status: "INSPECTED", evidenceIds: ["ev_render_scope_02"] },
+      ],
+    });
+
+    expect(report.overallStatus).toBe("NOT_VERIFIED");
+    expect(report.unverifiedScope).toContain("Whole-product scope requires more than one distinct canonical screen.");
+  });
+
+  it("does not treat an inspected row without an authenticated evidence identity or analysis as a pass", async () => {
+    const report = await runDriftAudit({
+      requestedScope: "SELECTED_SCREENS",
+      expectedScope: [{ screen: "/overview", states: ["default"] }],
+      evidence: [{ screen: "/overview", state: "default", status: "INSPECTED" }],
+    });
+
+    expect(report.overallStatus).toBe("NOT_VERIFIED");
+    expect(report.unverifiedScope).toEqual(expect.arrayContaining([
+      "/overview#default: Authenticated rendered evidence is missing.",
+      "UX_NAVIGATION: Deterministic analysis is unavailable.",
+    ]));
+  });
+
   it("marks an enumerated required state unavailable instead of treating the screen as complete", async () => {
     const report = await runDriftAudit({
       requestedScope: "WHOLE_APP",

@@ -2,6 +2,7 @@ import { evaluateReleaseGate } from "../../packages/eternal-engine/src/release-g
 import { expect, test } from "@playwright/test";
 
 const verifiedAt = "2026-08-31T12:00:00.000Z";
+const sourceRevisionFingerprint = "a".repeat(64);
 const checks = {
   navigation: "PASS" as const,
   accessibility: "PASS" as const,
@@ -17,6 +18,15 @@ const evidence = Object.fromEntries(Object.keys(checks).map((name) => [name, {
   evidence: [`ev_${name}_01`],
   lastVerified: verifiedAt,
 }])) as Parameters<typeof evaluateReleaseGate>[0]["evidence"];
+const authenticatedEvidence = Object.keys(checks).map((name) => ({
+  id: `ev_${name}_01`,
+  projectId: "project-a",
+  route: "/overview",
+  state: "default",
+  kind: name === "requiredStates" || name === "freshRenders" ? "RENDER" as const : "EVIDENCE" as const,
+  capturedAt: verifiedAt,
+  sourceRevisionFingerprint,
+}));
 const scope = {
   requestedScope: "WHOLE_APP" as const,
   expectedScope: [
@@ -33,6 +43,9 @@ test("does not release a no-critical-drift audit when a required state has no re
     scope,
     requiredStates: "FAIL",
     evidence: { ...evidence, requiredStates: { evidence: [], blockingReason: "Loading state is unavailable." } },
+    projectId: "project-a",
+    currentSourceRevisionFingerprint: sourceRevisionFingerprint,
+    authenticatedEvidence,
   }).status).toBe("NOT_VERIFIED");
 });
 
@@ -41,14 +54,34 @@ test("classifies documented polish debt as PASS_WITH_DEBT", () => {
     ...checks,
     scope,
     evidence,
+    projectId: "project-a",
+    currentSourceRevisionFingerprint: sourceRevisionFingerprint,
+    authenticatedEvidence: [...authenticatedEvidence, {
+      id: "ev_polish_01", projectId: "project-a", route: "/overview", state: "default",
+      kind: "EVIDENCE" as const, capturedAt: verifiedAt, sourceRevisionFingerprint, findingCategory: "POLISH" as const,
+    }],
+    approvedDecisionIds: ["design-decision-42"],
+    unresolvedFindings: [{
+      finding: "Align the lower divider to the shared inset token.",
+      severity: "POLISH",
+      evidenceIds: ["ev_polish_01"],
+    }],
     polishDebt: [{
       finding: "Align the lower divider to the shared inset token.",
       rationale: "The discrepancy is non-blocking visual polish.",
       documentedBy: "design-decision-42",
+      evidenceIds: ["ev_polish_01"],
     }],
   }).status).toBe("PASS_WITH_DEBT");
 });
 
 test("requires complete fresh evidence for PASS", () => {
-  expect(evaluateReleaseGate({ ...checks, scope, evidence }).status).toBe("PASS");
+  expect(evaluateReleaseGate({
+    ...checks,
+    scope,
+    evidence,
+    projectId: "project-a",
+    currentSourceRevisionFingerprint: sourceRevisionFingerprint,
+    authenticatedEvidence,
+  }).status).toBe("PASS");
 });

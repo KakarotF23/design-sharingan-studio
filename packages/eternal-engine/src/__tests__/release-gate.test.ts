@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { evaluateReleaseGate } from "../release-gate";
 
 const verifiedAt = "2026-08-31T12:00:00.000Z";
+const sourceRevisionFingerprint = "a".repeat(64);
 const wholeProductScope = {
   requestedScope: "WHOLE_APP" as const,
   expectedScope: [
@@ -40,6 +41,26 @@ function checkedInput() {
       decisions: { evidence: ["ev_decisions_01"], lastVerified: verifiedAt },
       functionalVerification: { evidence: ["ev_functional_01"], lastVerified: verifiedAt },
     },
+    projectId: "project-a",
+    currentSourceRevisionFingerprint: sourceRevisionFingerprint,
+    authenticatedEvidence: [
+      "ev_navigation_01",
+      "ev_accessibility_01",
+      "ev_drift_01",
+      "ev_decisions_01",
+      "ev_registry_01",
+      "ev_states_01",
+      "ev_render_01",
+      "ev_functional_01",
+    ].map((id) => ({
+      id,
+      projectId: "project-a",
+      route: "/overview",
+      state: "default",
+      kind: id === "ev_states_01" || id === "ev_render_01" ? "RENDER" as const : "EVIDENCE" as const,
+      capturedAt: verifiedAt,
+      sourceRevisionFingerprint,
+    })),
   };
 }
 
@@ -84,8 +105,28 @@ describe("Release gate", () => {
       polishDebt: [{
         finding: "Align the lower divider to the shared inset token.",
         rationale: "The offset is visible but does not affect task completion or accessibility.",
-        documentedBy: "design-decision-42",
-      }],
+      documentedBy: "design-decision-42",
+      evidenceIds: ["ev_polish_01"],
+    }],
+    approvedDecisionIds: ["design-decision-42"],
+    unresolvedFindings: [{
+      finding: "Align the lower divider to the shared inset token.",
+      severity: "POLISH",
+      evidenceIds: ["ev_polish_01"],
+    }],
+    authenticatedEvidence: [
+      ...checkedInput().authenticatedEvidence,
+      {
+        id: "ev_polish_01",
+        projectId: "project-a",
+        route: "/overview",
+        state: "default",
+        kind: "EVIDENCE",
+        capturedAt: verifiedAt,
+        sourceRevisionFingerprint,
+        findingCategory: "POLISH",
+      },
+    ],
     });
 
     expect(result.status).toBe("PASS_WITH_DEBT");
@@ -139,6 +180,35 @@ describe("Release gate", () => {
     expect(result.status).toBe("NOT_VERIFIED");
   });
 
+  it("requires the exact canonical inspected screen set rather than a superset of rows", () => {
+    const result = evaluateReleaseGate({
+      ...checkedInput(),
+      scope: {
+        ...wholeProductScope,
+        inspectedScope: [...wholeProductScope.inspectedScope, "/unregistered#default"],
+      },
+    });
+
+    expect(result.status).toBe("NOT_VERIFIED");
+  });
+
+  it("does not count encoded aliases of one route as distinct whole-product screens", () => {
+    const result = evaluateReleaseGate({
+      ...checkedInput(),
+      scope: {
+        requestedScope: "WHOLE_APP",
+        expectedScope: [
+          { screen: "/overview", states: ["default"] },
+          { screen: "/over%76iew", states: ["default"] },
+        ],
+        inspectedScope: ["/overview#default", "/over%76iew#default"],
+        unavailableScope: [],
+      },
+    });
+
+    expect(result.status).toBe("NOT_VERIFIED");
+  });
+
   it("blocks release when a known critical regression is unresolved", () => {
     const result = evaluateReleaseGate({
       ...checkedInput(),
@@ -154,5 +224,95 @@ describe("Release gate", () => {
     });
 
     expect(result.status).toBe("BLOCKED");
+  });
+
+  it("does not trust forged or non-canonical verification times as release evidence", () => {
+    const result = evaluateReleaseGate({
+      ...checkedInput(),
+      evidence: {
+        ...checkedInput().evidence,
+        freshRenders: {
+          evidence: ["ev_render_01"],
+          lastVerified: "2026-08-31T12:00:00Z",
+        },
+      },
+    });
+
+    expect(result.status).toBe("NOT_VERIFIED");
+    expect(result.checks.find(({ name }) => name === "freshRenders")?.status).toBe("NOT_VERIFIED");
+  });
+
+  it("fails closed rather than throwing when a verification timestamp is malformed", () => {
+    const input = {
+      ...checkedInput(),
+      evidence: {
+        ...checkedInput().evidence,
+        freshRenders: { evidence: ["ev_render_01"], lastVerified: "not-a-timestamp" },
+      },
+    };
+
+    expect(() => evaluateReleaseGate(input)).not.toThrow();
+    expect(evaluateReleaseGate(input).status).toBe("NOT_VERIFIED");
+  });
+
+  it("does not downgrade non-polish or undocumented residual release failures into debt", () => {
+    expect(() => evaluateReleaseGate({
+      ...checkedInput(),
+      polishDebt: [{
+        finding: "Primary navigation is unavailable.",
+        rationale: "This is not polish.",
+        documentedBy: "unapproved-decision",
+        evidenceIds: ["ev_navigation_01"],
+      }],
+    })).toThrow(/documented decision/i);
+  });
+
+  it("does not treat a catalog-bound polish item as the sole residual issue when an important finding remains", () => {
+    const input = {
+      ...checkedInput(),
+      polishDebt: [{
+        finding: "Align the lower divider to the shared inset token.",
+        rationale: "The offset is visible but does not affect task completion or accessibility.",
+        documentedBy: "design-decision-42",
+        evidenceIds: ["ev_polish_01"],
+      }],
+      approvedDecisionIds: ["design-decision-42"],
+      authenticatedEvidence: [
+        ...checkedInput().authenticatedEvidence,
+        {
+          id: "ev_polish_01",
+          projectId: "project-a",
+          route: "/overview",
+          state: "default",
+          kind: "EVIDENCE" as const,
+          capturedAt: verifiedAt,
+          sourceRevisionFingerprint,
+          findingCategory: "POLISH" as const,
+        },
+      ],
+      unresolvedFindings: [
+        { finding: "Align the lower divider to the shared inset token.", severity: "POLISH" as const, evidenceIds: ["ev_polish_01"] },
+        { finding: "The primary action no longer exposes the approved decision path.", severity: "IMPORTANT" as const, evidenceIds: ["ev_navigation_01"] },
+      ],
+    };
+
+    expect(() => evaluateReleaseGate(input)).toThrow(/sole residual|polish/i);
+  });
+
+  it("does not PASS when a catalog ID is forged or its final render belongs to an older source revision", () => {
+    const forged = evaluateReleaseGate({
+      ...checkedInput(),
+      evidence: {
+        ...checkedInput().evidence,
+        freshRenders: { evidence: ["ev_not_in_catalog_01"], lastVerified: verifiedAt },
+      },
+    });
+    const staleSource = evaluateReleaseGate({
+      ...checkedInput(),
+      currentSourceRevisionFingerprint: "b".repeat(64),
+    });
+
+    expect(forged.status).toBe("NOT_VERIFIED");
+    expect(staleSource.status).toBe("NOT_VERIFIED");
   });
 });
