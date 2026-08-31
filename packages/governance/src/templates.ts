@@ -630,8 +630,8 @@ function parseDriftFinding(value: unknown): DriftFinding {
   if (!categories.has(finding.category as string) || !severities.has(finding.severity as string)) {
     throw new Error("Drift finding category or severity is invalid");
   }
-  if (!Array.isArray(finding.observedEvidence) || finding.observedEvidence.length > MAX_RULES) {
-    throw new Error("Drift finding observed evidence must be bounded");
+  if (!Array.isArray(finding.observedEvidence) || finding.observedEvidence.length === 0 || finding.observedEvidence.length > MAX_RULES) {
+    throw new Error("Drift finding observed evidence must be bounded and non-empty");
   }
   if (!Array.isArray(finding.evidenceIds) || finding.evidenceIds.length === 0 || finding.evidenceIds.length > MAX_RULES) {
     throw new Error("Drift finding authenticated evidence must be bounded and non-empty");

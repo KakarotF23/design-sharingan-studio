@@ -14,19 +14,34 @@ const checks = {
   decisions: "PASS" as const,
   functionalVerification: "PASS" as const,
 };
-const evidence = Object.fromEntries(Object.keys(checks).map((name) => [name, {
+const stateRenderEvidence = [
+  { route: "/overview", state: "default", requiredId: "ev_requiredStates_01", freshId: "ev_freshRenders_01" },
+  { route: "/overview", state: "loading", requiredId: "ev_requiredStates_loading_01", freshId: "ev_freshRenders_loading_01" },
+  { route: "/overview", state: "error", requiredId: "ev_requiredStates_error_01", freshId: "ev_freshRenders_error_01" },
+  { route: "/reports", state: "default", requiredId: "ev_requiredStates_reports_01", freshId: "ev_freshRenders_reports_01" },
+];
+const evidence = {
+  ...Object.fromEntries(Object.keys(checks).map((name) => [name, {
   evidence: [`ev_${name}_01`],
   lastVerified: verifiedAt,
-}])) as Parameters<typeof evaluateReleaseGate>[0]["evidence"];
-const authenticatedEvidence = Object.keys(checks).map((name) => ({
+  }])),
+  requiredStates: { evidence: stateRenderEvidence.map(({ requiredId }) => requiredId), lastVerified: verifiedAt },
+  freshRenders: { evidence: stateRenderEvidence.map(({ freshId }) => freshId), lastVerified: verifiedAt },
+} as Parameters<typeof evaluateReleaseGate>[0]["evidence"];
+const authenticatedEvidence = Object.keys(checks)
+  .filter((name) => name !== "requiredStates" && name !== "freshRenders")
+  .map((name) => ({
   id: `ev_${name}_01`,
   projectId: "project-a",
   route: "/overview",
   state: "default",
-  kind: name === "requiredStates" || name === "freshRenders" ? "RENDER" as const : "EVIDENCE" as const,
+  kind: "EVIDENCE" as const,
   capturedAt: verifiedAt,
   sourceRevisionFingerprint,
-}));
+})).concat(stateRenderEvidence.flatMap(({ route, state, requiredId, freshId }) => [
+  { id: requiredId, projectId: "project-a", route, state, kind: "RENDER" as const, capturedAt: verifiedAt, sourceRevisionFingerprint },
+  { id: freshId, projectId: "project-a", route, state, kind: "RENDER" as const, capturedAt: verifiedAt, sourceRevisionFingerprint },
+]));
 const scope = {
   requestedScope: "WHOLE_APP" as const,
   expectedScope: [
@@ -84,4 +99,19 @@ test("requires complete fresh evidence for PASS", () => {
     currentSourceRevisionFingerprint: sourceRevisionFingerprint,
     authenticatedEvidence,
   }).status).toBe("PASS");
+});
+
+test("does not let default-only render identities cover loading, error, or another route", () => {
+  expect(evaluateReleaseGate({
+    ...checks,
+    scope,
+    evidence: {
+      ...evidence,
+      requiredStates: { evidence: ["ev_requiredStates_01"], lastVerified: verifiedAt },
+      freshRenders: { evidence: ["ev_freshRenders_01"], lastVerified: verifiedAt },
+    },
+    projectId: "project-a",
+    currentSourceRevisionFingerprint: sourceRevisionFingerprint,
+    authenticatedEvidence,
+  }).status).toBe("NOT_VERIFIED");
 });

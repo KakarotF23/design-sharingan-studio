@@ -19,6 +19,25 @@ function approvedGenome(): DesignGenome {
   };
 }
 
+function completeIntentionalObservations() {
+  return [
+    ["UX_NAVIGATION", "Keep human decisions explicit."],
+    ["ACCESSIBILITY_REQUIRED_STATES", "Maintain visible focus."],
+    ["PRODUCT_IDENTITY_SCREEN_FAMILY", "A calm local-first design intelligence environment."],
+    ["COMPONENTS_TOKENS", "Use restrained contrast."],
+    ["HIERARCHY", "Use restrained contrast."],
+    ["MOTION", "Reserve motion for state transitions."],
+    ["POLISH", "Use restrained contrast."],
+  ].map(([category, expectedRule]) => ({
+    category: category as (typeof AUDIT_ORDER)[number],
+    severity: "INTENTIONAL" as const,
+    expectedRule,
+    observedEvidence: ["The deterministic comparator inspected the authenticated render."],
+    whyItMatters: "The approved rule remains explicitly verified.",
+    recommendedFix: "No change is required.",
+  }));
+}
+
 describe("Drift audit", () => {
   it("cannot call a one-screen audit a whole-app audit", async () => {
     const report = await runDriftAudit({
@@ -56,6 +75,99 @@ describe("Drift audit", () => {
       "/overview#default: Authenticated rendered evidence is missing.",
       "UX_NAVIGATION: Deterministic analysis is unavailable.",
     ]));
+  });
+
+  it("does not accept an untrusted raw Genome value as authoritative audit input", async () => {
+    const report = await runDriftAudit({
+      requestedScope: "SELECTED_SCREENS",
+      approvedGenome: approvedGenome() as unknown as import("@design-sharingan/governance").GenomeDocument,
+      expectedScope: [{ screen: "/overview", states: ["default"] }],
+      evidence: [{
+        screen: "/overview",
+        state: "default",
+        status: "INSPECTED",
+        evidenceIds: ["ev_render_overview_04"],
+        observations: completeIntentionalObservations(),
+      }],
+    });
+
+    expect(report.overallStatus).toBe("NOT_VERIFIED");
+    expect(report.unverifiedScope).toEqual(expect.arrayContaining([
+      expect.stringMatching(/authoritative.*Genome/i),
+    ]));
+  });
+
+  it("marks an extra inspected canonical state outside the expected state set as unverified", async () => {
+    const report = await runDriftAudit({
+      requestedScope: "SELECTED_SCREENS",
+      approvedGenome: approvedGenome() as unknown as import("@design-sharingan/governance").GenomeDocument,
+      expectedScope: [{ screen: "/overview", states: ["default"] }],
+      evidence: [
+        {
+          screen: "/overview",
+          state: "default",
+          status: "INSPECTED",
+          evidenceIds: ["ev_render_overview_05"],
+          observations: completeIntentionalObservations(),
+        },
+        {
+          screen: "/overview",
+          state: "loading",
+          status: "INSPECTED",
+          evidenceIds: ["ev_render_overview_loading_05"],
+        },
+      ],
+    });
+
+    expect(report.overallStatus).toBe("NOT_VERIFIED");
+    expect(report.unverifiedScope).toEqual(expect.arrayContaining([
+      "/overview#loading: Evidence is outside the explicit expected state scope.",
+    ]));
+  });
+
+  it("marks an out-of-scope extra state unavailable rather than silently ignoring it", async () => {
+    const report = await runDriftAudit({
+      requestedScope: "SELECTED_SCREENS",
+      approvedGenome: approvedGenome() as unknown as import("@design-sharingan/governance").GenomeDocument,
+      expectedScope: [{ screen: "/overview", states: ["default"] }],
+      evidence: [
+        {
+          screen: "/overview",
+          state: "default",
+          status: "INSPECTED",
+          evidenceIds: ["ev_render_overview_05"],
+          observations: completeIntentionalObservations(),
+        },
+        {
+          screen: "/overview",
+          state: "loading",
+          status: "OUT_OF_SCOPE",
+          reason: "The loading state is not in the registered audit scope.",
+        },
+      ],
+    });
+
+    expect(report.overallStatus).toBe("NOT_VERIFIED");
+    expect(report.unverifiedScope).toEqual(expect.arrayContaining([
+      "/overview#loading: Evidence is outside the explicit expected state scope.",
+    ]));
+  });
+
+  it("rejects a drift observation without bounded observed evidence", async () => {
+    await expect(runDriftAudit({
+      requestedScope: "SELECTED_SCREENS",
+      approvedGenome: approvedGenome() as unknown as import("@design-sharingan/governance").GenomeDocument,
+      expectedScope: [{ screen: "/overview", states: ["default"] }],
+      evidence: [{
+        screen: "/overview",
+        state: "default",
+        status: "INSPECTED",
+        evidenceIds: ["ev_render_overview_06"],
+        observations: completeIntentionalObservations().map((observation, index) => index === 0
+          ? { ...observation, observedEvidence: [] }
+          : observation),
+      }],
+    })).rejects.toThrow(/observed evidence/i);
   });
 
   it("marks an enumerated required state unavailable instead of treating the screen as complete", async () => {
@@ -137,7 +249,7 @@ describe("Drift audit", () => {
 
     const report = await runDriftAudit({
       requestedScope: "SELECTED_SCREENS",
-      approvedGenome: genome,
+      approvedGenome: genome as unknown as import("@design-sharingan/governance").GenomeDocument,
       expectedScope: [{ screen: "/overview", states: ["default"] }],
       evidence: [{
         screen: "/overview",

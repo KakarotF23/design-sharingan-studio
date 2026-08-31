@@ -10,6 +10,10 @@ import type {
 } from "@design-sharingan/core";
 import { createHash } from "node:crypto";
 import { normalizeGovernanceRoute } from "@design-sharingan/core";
+import {
+  isAuthenticatedGenomeDocument,
+  type GenomeDocument,
+} from "@design-sharingan/governance";
 
 export const AUDIT_ORDER: readonly DriftAuditCategory[] = [
   "UX_NAVIGATION",
@@ -41,7 +45,8 @@ export interface RunDriftAuditInput {
   requestedScope: DriftAuditScope;
   expectedScope?: DriftAuditScopeEntry[];
   evidence: DriftAuditEvidenceInput[];
-  approvedGenome?: DesignGenome;
+  /** A Task 12-attested Genome document; raw Genome values are never authoritative. */
+  approvedGenome?: GenomeDocument;
 }
 
 function text(value: string, label: string): string {
@@ -117,6 +122,12 @@ function findingsFromEvidence(
       if (repeated.length > 0 && repeated.length < 2) {
         throw new Error("Repeated drift must identify at least two screens");
       }
+      if (!Array.isArray(observation.observedEvidence) || observation.observedEvidence.length === 0) {
+        throw new Error("Drift observation requires non-empty observed evidence");
+      }
+      if ((entry.evidenceIds ?? []).length === 0) {
+        throw new Error("Drift observation requires authenticated evidence identities");
+      }
       const requiresDesignDecision = observation.requiresDesignDecision === true || repeated.length > 0;
       const expectedRule = text(observation.expectedRule, "Expected rule");
       if (!approvedRules(genome, observation.category).includes(expectedRule)) {
@@ -181,6 +192,12 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
     .filter(({ status }) => status === "UNAVAILABLE")
     .map((entry) => `${entry.state === undefined ? entry.screen : scopeKey(entry.screen, entry.state)}: ${entry.reason ?? "Evidence is unavailable."}`);
   const unverifiedScope = [...unavailableScope];
+  const authoritativeGenome = input.approvedGenome !== undefined && isAuthenticatedGenomeDocument(input.approvedGenome)
+    ? input.approvedGenome.value
+    : undefined;
+  if (authoritativeGenome === undefined) {
+    unverifiedScope.unshift("Authoritative approved Genome attestation is unavailable.");
+  }
 
   for (const entry of evidence.filter(({ status }) => status === "INSPECTED")) {
     const key = entry.state === undefined ? entry.screen : scopeKey(entry.screen, entry.state);
@@ -195,6 +212,10 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
   if (input.requestedScope === "WHOLE_APP" && expectedScope.length < 2) {
     unverifiedScope.unshift("Whole-product scope requires more than one distinct canonical screen.");
   }
+  const expectedStateKeys = new Set(expectedScope.flatMap(({ screen, states }) =>
+    states.map((state) => scopeKey(screen, state)),
+  ));
+  const inspectedStateKeys = new Set(inspectedScope);
   for (const expected of expectedScope) {
     for (const state of expected.states) {
       const key = scopeKey(expected.screen, state);
@@ -202,6 +223,23 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
       if (matching?.status !== "INSPECTED" && !unverifiedScope.some((entry) => entry.startsWith(`${key}:`))) {
         unverifiedScope.push(`${key}: Evidence is not inspected.`);
       }
+    }
+  }
+  for (const key of inspectedStateKeys) {
+    if (!expectedStateKeys.has(key)) {
+      unverifiedScope.push(`${key}: Evidence is outside the explicit expected state scope.`);
+    }
+  }
+  for (const entry of evidence.filter(({ status }) => status === "UNAVAILABLE")) {
+    const key = entry.state === undefined ? entry.screen : scopeKey(entry.screen, entry.state);
+    if (!expectedStateKeys.has(key)) {
+      unverifiedScope.push(`${key}: Evidence is outside the explicit expected state scope.`);
+    }
+  }
+  for (const entry of evidence.filter(({ status }) => status === "OUT_OF_SCOPE")) {
+    const key = entry.state === undefined ? entry.screen : scopeKey(entry.screen, entry.state);
+    if (!expectedStateKeys.has(key)) {
+      unverifiedScope.push(`${key}: Evidence is outside the explicit expected state scope.`);
     }
   }
   if (input.requestedScope === "WHOLE_APP") {
@@ -219,7 +257,7 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
       unverifiedScope.push(`${category}: Deterministic analysis is unavailable.`);
     }
   }
-  const findings = findingsFromEvidence(evidence, input.approvedGenome, unverifiedScope);
+  const findings = findingsFromEvidence(evidence, authoritativeGenome, unverifiedScope);
   const evidenceIds = [...new Set(evidence.flatMap(({ evidenceIds }) => evidenceIds ?? []))];
   return {
     requestedScope: input.requestedScope,

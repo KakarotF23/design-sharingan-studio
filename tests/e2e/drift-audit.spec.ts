@@ -25,6 +25,8 @@ test("records partial audit coverage as NOT_VERIFIED and preserves human-readabl
 
   await page.goto((studioPath as string).replace(/\/overview$/, "/govern"));
   await page.getByRole("button", { name: "Initialize Draft Genome" }).click();
+  await page.getByRole("button", { name: "Approve Genome" }).click();
+  await expect(page.getByLabel("Design Genome").getByText("AUTHORITATIVE", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Run drift audit" }).click();
 
   await expect(page.getByRole("heading", { name: "Drift audit" })).toBeVisible();

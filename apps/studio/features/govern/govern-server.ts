@@ -368,7 +368,7 @@ export async function auditProjectDrift(
   }
   const report = await runDriftAudit({
     requestedScope: "WHOLE_APP",
-    approvedGenome: genome.value,
+    approvedGenome: genome,
     expectedScope: registry.records.map(({ route, requiredStates }) => ({
       screen: route,
       states: requiredStates,

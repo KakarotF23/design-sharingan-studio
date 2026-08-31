@@ -145,7 +145,24 @@ interface ActiveAuditGeneration {
   registryRevision: number;
   reportEntityId: string;
   reportRevision: number;
+  registryDigest: string;
+  reportDigest: string;
+  catalogDigest: string;
   createdAt: string;
+  signature: string;
+}
+
+interface AuditGenerationManifest {
+  kind: "DESIGN_SHARINGAN_AUDIT_GENERATION";
+  projectId: string;
+  generationId: string;
+  registryEntityId: string;
+  registryRevision: number;
+  reportEntityId: string;
+  reportRevision: number;
+  registryDigest: string;
+  reportDigest: string;
+  catalogDigest: string;
   signature: string;
 }
 
@@ -459,10 +476,14 @@ async function readAuthenticatedEvidenceCatalogAtPath(
   rootPath: string,
   projectId: string,
   path: string,
+  expectedDigest?: string,
 ): Promise<GovernanceEvidenceCatalogEntry[]> {
   safeProjectId(projectId);
   const canonicalRoot = await canonicalProjectRoot(rootPath);
   const raw = await readBoundedDocument(path);
+  if (expectedDigest !== undefined && documentDigest(raw) !== expectedDigest) {
+    throw new Error("Active audit generation catalog digest does not match its signed pointer");
+  }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { throw new Error("Governance evidence catalog is malformed"); }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -528,6 +549,34 @@ function activeAuditGenerationSignature(
   return createHmac("sha256", key).update(activeAuditGenerationPayload(value), "utf8").digest("hex");
 }
 
+function auditGenerationManifestPayload(
+  value: Omit<AuditGenerationManifest, "signature">,
+): string {
+  return JSON.stringify(value);
+}
+
+function auditGenerationManifestSignature(
+  key: Buffer,
+  value: Omit<AuditGenerationManifest, "signature">,
+): string {
+  return createHmac("sha256", key).update(auditGenerationManifestPayload(value), "utf8").digest("hex");
+}
+
+function documentDigest(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function activeDigestForFile(pointer: ActiveAuditGeneration, fileName: string): string {
+  if (fileName === SCREEN_REGISTRY_FILE) return pointer.registryDigest;
+  if (fileName === DRIFT_REPORT_FILE) return pointer.reportDigest;
+  if (fileName === EVIDENCE_CATALOG_FILE) return pointer.catalogDigest;
+  throw new Error("Audit generation file has no authenticated digest");
+}
+
 async function readActiveAuditGeneration(
   rootPath: string,
   projectId: string,
@@ -542,7 +591,7 @@ async function readActiveAuditGeneration(
     throw new Error("Active audit generation pointer is malformed");
   }
   const pointer = parsed as Record<string, unknown>;
-  exactObjectKeys(pointer, ["kind", "projectId", "generationId", "registryEntityId", "registryRevision", "reportEntityId", "reportRevision", "createdAt", "signature"], "Active audit generation pointer");
+  exactObjectKeys(pointer, ["kind", "projectId", "generationId", "registryEntityId", "registryRevision", "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest", "createdAt", "signature"], "Active audit generation pointer");
   if (
     pointer.kind !== "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION" || pointer.projectId !== projectId ||
     typeof pointer.generationId !== "string" || !/^[a-f0-9-]{36}$/.test(pointer.generationId) ||
@@ -550,10 +599,26 @@ async function readActiveAuditGeneration(
     !Number.isSafeInteger(pointer.registryRevision) || (pointer.registryRevision as number) < 1 ||
     typeof pointer.reportEntityId !== "string" || !SAFE_ID_PATTERN.test(pointer.reportEntityId) ||
     !Number.isSafeInteger(pointer.reportRevision) || (pointer.reportRevision as number) < 1 ||
+    !isDigest(pointer.registryDigest) || !isDigest(pointer.reportDigest) || !isDigest(pointer.catalogDigest) ||
     typeof pointer.createdAt !== "string" || new Date(pointer.createdAt).toISOString() !== pointer.createdAt ||
     typeof pointer.signature !== "string" || !/^[a-f0-9]{64}$/.test(pointer.signature)
   ) throw new Error("Active audit generation pointer is invalid");
   const normalized = pointer as unknown as ActiveAuditGeneration;
+  const canonicalPointer = `${JSON.stringify({
+    kind: normalized.kind,
+    projectId: normalized.projectId,
+    generationId: normalized.generationId,
+    registryEntityId: normalized.registryEntityId,
+    registryRevision: normalized.registryRevision,
+    reportEntityId: normalized.reportEntityId,
+    reportRevision: normalized.reportRevision,
+    registryDigest: normalized.registryDigest,
+    reportDigest: normalized.reportDigest,
+    catalogDigest: normalized.catalogDigest,
+    createdAt: normalized.createdAt,
+    signature: normalized.signature,
+  })}\n`;
+  if (raw !== canonicalPointer) throw new Error("Active audit generation pointer is not canonical");
   const { signature, ...unsigned } = normalized;
   const key = await authorityKey(rootPath, false);
   const expected = Buffer.from(activeAuditGenerationSignature(key, unsigned), "hex");
@@ -572,17 +637,49 @@ async function readActiveAuditGeneration(
       return [name, path] as const;
     }),
   ));
-  const registry = parseGovernanceMetadata(await readBoundedDocument(files.get(SCREEN_REGISTRY_FILE)!));
-  const report = parseGovernanceMetadata(await readBoundedDocument(files.get(DRIFT_REPORT_FILE)!));
+  const registryRaw = await readBoundedDocument(files.get(SCREEN_REGISTRY_FILE)!);
+  const reportRaw = await readBoundedDocument(files.get(DRIFT_REPORT_FILE)!);
+  const catalogPath = files.get(EVIDENCE_CATALOG_FILE)!;
+  const catalogRaw = await readBoundedDocument(catalogPath);
+  if (
+    documentDigest(registryRaw) !== normalized.registryDigest ||
+    documentDigest(reportRaw) !== normalized.reportDigest ||
+    documentDigest(catalogRaw) !== normalized.catalogDigest
+  ) throw new Error("Active audit generation member digest does not match its signed pointer");
+  const registry = parseGovernanceMetadata(registryRaw);
+  const report = parseGovernanceMetadata(reportRaw);
+  const manifestRaw = await readBoundedDocument(files.get(AUDIT_GENERATION_MANIFEST_FILE)!);
   let manifest: unknown;
-  try { manifest = JSON.parse(await readBoundedDocument(files.get(AUDIT_GENERATION_MANIFEST_FILE)!)); } catch {
+  try { manifest = JSON.parse(manifestRaw); } catch {
     throw new Error("Active audit generation manifest is malformed");
   }
   if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
     throw new Error("Active audit generation manifest is malformed");
   }
   const manifestValue = manifest as Record<string, unknown>;
-  exactObjectKeys(manifestValue, ["kind", "projectId", "generationId", "registryEntityId", "registryRevision", "reportEntityId", "reportRevision"], "Active audit generation manifest");
+  exactObjectKeys(manifestValue, ["kind", "projectId", "generationId", "registryEntityId", "registryRevision", "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest", "signature"], "Active audit generation manifest");
+  if (!isDigest(manifestValue.signature)) throw new Error("Active audit generation manifest signature is invalid");
+  const normalizedManifest = manifestValue as unknown as AuditGenerationManifest;
+  const canonicalManifest = `${JSON.stringify({
+    kind: normalizedManifest.kind,
+    projectId: normalizedManifest.projectId,
+    generationId: normalizedManifest.generationId,
+    registryEntityId: normalizedManifest.registryEntityId,
+    registryRevision: normalizedManifest.registryRevision,
+    reportEntityId: normalizedManifest.reportEntityId,
+    reportRevision: normalizedManifest.reportRevision,
+    registryDigest: normalizedManifest.registryDigest,
+    reportDigest: normalizedManifest.reportDigest,
+    catalogDigest: normalizedManifest.catalogDigest,
+    signature: normalizedManifest.signature,
+  })}\n`;
+  if (manifestRaw !== canonicalManifest) throw new Error("Active audit generation manifest is not canonical");
+  const { signature: manifestSignature, ...manifestUnsigned } = normalizedManifest;
+  const manifestExpected = Buffer.from(auditGenerationManifestSignature(key, manifestUnsigned), "hex");
+  const manifestActual = Buffer.from(manifestSignature, "hex");
+  if (manifestActual.length !== manifestExpected.length || !timingSafeEqual(manifestActual, manifestExpected)) {
+    throw new Error("Active audit generation manifest is not authenticated");
+  }
   if (
     registry.kind !== "SCREEN_REGISTRY" || report.kind !== "DRIFT_REPORT" ||
     registry.entityId !== normalized.registryEntityId || registry.revision !== normalized.registryRevision ||
@@ -591,34 +688,41 @@ async function readActiveAuditGeneration(
     manifestValue.kind !== "DESIGN_SHARINGAN_AUDIT_GENERATION" ||
     manifestValue.projectId !== projectId || manifestValue.generationId !== normalized.generationId ||
     manifestValue.registryEntityId !== normalized.registryEntityId || manifestValue.registryRevision !== normalized.registryRevision ||
-    manifestValue.reportEntityId !== normalized.reportEntityId || manifestValue.reportRevision !== normalized.reportRevision
+    manifestValue.reportEntityId !== normalized.reportEntityId || manifestValue.reportRevision !== normalized.reportRevision ||
+    manifestValue.registryDigest !== normalized.registryDigest || manifestValue.reportDigest !== normalized.reportDigest ||
+    manifestValue.catalogDigest !== normalized.catalogDigest
   ) throw new Error("Active audit generation is internally inconsistent with its pointer");
-  await readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, files.get(EVIDENCE_CATALOG_FILE)!);
+  await readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, catalogPath, normalized.catalogDigest);
   return { pointer: normalized, directory };
 }
 
-async function activeAuditGenerationFile(
+async function activeAuditGenerationMember(
   rootPath: string,
   projectId: string,
   fileName: string,
-): Promise<string | undefined> {
+): Promise<{ path: string; digest: string } | undefined> {
   if (fileName !== SCREEN_REGISTRY_FILE && fileName !== DRIFT_REPORT_FILE && fileName !== EVIDENCE_CATALOG_FILE) {
     return undefined;
   }
   const active = await readActiveAuditGeneration(rootPath, projectId);
-  return active === undefined ? undefined : assertPathInsideWorkspace(active.directory, join(active.directory, fileName));
+  return active === undefined ? undefined : {
+    path: assertPathInsideWorkspace(active.directory, join(active.directory, fileName)),
+    digest: activeDigestForFile(active.pointer, fileName),
+  };
 }
 
 export async function commitAuditGenerationUnderLock(
   input: CommitAuditGenerationInput,
 ): Promise<void> {
   const machineDirectory = await machineStateDirectory(input.rootPath, false);
+  const previous = await readActiveAuditGeneration(input.rootPath, input.projectId);
   const generationRoot = await ensurePrivateDirectory(machineDirectory, AUDIT_GENERATIONS_DIRECTORY);
   const generationId = randomUUID();
   const generationDirectory = assertPathInsideWorkspace(generationRoot, join(generationRoot, generationId));
   await mkdir(generationDirectory, { mode: 0o700 });
   const renderedCatalog = await renderAuthenticatedEvidenceCatalog(input.rootPath, input.projectId, input.catalog);
-  const manifest = JSON.stringify({
+  const key = await authorityKey(input.rootPath, false);
+  const manifestUnsigned: Omit<AuditGenerationManifest, "signature"> = {
     kind: "DESIGN_SHARINGAN_AUDIT_GENERATION",
     projectId: input.projectId,
     generationId,
@@ -626,14 +730,29 @@ export async function commitAuditGenerationUnderLock(
     registryRevision: input.registryRevision,
     reportEntityId: input.reportEntityId,
     reportRevision: input.reportRevision,
-  });
+    registryDigest: documentDigest(input.registryMarkdown),
+    reportDigest: documentDigest(input.reportMarkdown),
+    catalogDigest: documentDigest(renderedCatalog.markdown),
+  };
+  const manifest: AuditGenerationManifest = {
+    ...manifestUnsigned,
+    signature: auditGenerationManifestSignature(key, manifestUnsigned),
+  };
   try {
     await atomicWriteDocument(generationDirectory, SCREEN_REGISTRY_FILE, input.registryMarkdown);
     await atomicWriteDocument(generationDirectory, DRIFT_REPORT_FILE, input.reportMarkdown);
     await atomicWriteDocument(generationDirectory, EVIDENCE_CATALOG_FILE, renderedCatalog.markdown);
-    await atomicWriteDocument(generationDirectory, AUDIT_GENERATION_MANIFEST_FILE, `${manifest}\n`);
-    const registry = parseGovernanceMetadata(await readBoundedDocument(join(generationDirectory, SCREEN_REGISTRY_FILE)));
-    const report = parseGovernanceMetadata(await readBoundedDocument(join(generationDirectory, DRIFT_REPORT_FILE)));
+    await atomicWriteDocument(generationDirectory, AUDIT_GENERATION_MANIFEST_FILE, `${JSON.stringify(manifest)}\n`);
+    const registryRaw = await readBoundedDocument(join(generationDirectory, SCREEN_REGISTRY_FILE));
+    const reportRaw = await readBoundedDocument(join(generationDirectory, DRIFT_REPORT_FILE));
+    const catalogRaw = await readBoundedDocument(join(generationDirectory, EVIDENCE_CATALOG_FILE));
+    if (
+      documentDigest(registryRaw) !== manifest.registryDigest ||
+      documentDigest(reportRaw) !== manifest.reportDigest ||
+      documentDigest(catalogRaw) !== manifest.catalogDigest
+    ) throw new Error("Staged audit generation document digests are inconsistent");
+    const registry = parseGovernanceMetadata(registryRaw);
+    const report = parseGovernanceMetadata(reportRaw);
     if (
       registry.kind !== "SCREEN_REGISTRY" || report.kind !== "DRIFT_REPORT" ||
       registry.entityId !== input.registryEntityId || registry.revision !== input.registryRevision ||
@@ -642,7 +761,6 @@ export async function commitAuditGenerationUnderLock(
     ) throw new Error("Staged audit generation is internally inconsistent");
     await syncDirectory(generationDirectory);
     throwAuditTransactionFault("after-stage");
-    const key = await authorityKey(input.rootPath, false);
     const unsigned: Omit<ActiveAuditGeneration, "signature"> = {
       kind: "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION",
       projectId: input.projectId,
@@ -651,6 +769,9 @@ export async function commitAuditGenerationUnderLock(
       registryRevision: input.registryRevision,
       reportEntityId: input.reportEntityId,
       reportRevision: input.reportRevision,
+      registryDigest: manifest.registryDigest,
+      reportDigest: manifest.reportDigest,
+      catalogDigest: manifest.catalogDigest,
       createdAt: new Date().toISOString(),
     };
     const pointer: ActiveAuditGeneration = {
@@ -665,6 +786,9 @@ export async function commitAuditGenerationUnderLock(
     await atomicWriteDocument(input.governanceDirectory, SCREEN_REGISTRY_FILE, input.registryMarkdown);
     await atomicWriteDocument(input.governanceDirectory, DRIFT_REPORT_FILE, input.reportMarkdown);
     await atomicWriteDocument(machineDirectory, EVIDENCE_CATALOG_FILE, renderedCatalog.markdown);
+    if (previous !== undefined && previous.pointer.generationId !== generationId) {
+      await rm(previous.directory, { recursive: true, force: false });
+    }
   } catch (error) {
     const active = await readActiveAuditGeneration(input.rootPath, input.projectId).catch(() => undefined);
     if (active?.pointer.generationId !== generationId) {
@@ -719,9 +843,9 @@ export async function readEvidenceCatalog(
 ): Promise<GovernanceEvidenceCatalogEntry[]> {
   safeProjectId(projectId);
   const machineDirectory = await machineStateDirectory(rootPath, false);
-  const path = (await activeAuditGenerationFile(rootPath, projectId, EVIDENCE_CATALOG_FILE)) ??
-    assertPathInsideWorkspace(machineDirectory, join(machineDirectory, EVIDENCE_CATALOG_FILE));
-  return readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, path);
+  const active = await activeAuditGenerationMember(rootPath, projectId, EVIDENCE_CATALOG_FILE);
+  const path = active?.path ?? assertPathInsideWorkspace(machineDirectory, join(machineDirectory, EVIDENCE_CATALOG_FILE));
+  return readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, path, active?.digest);
 }
 
 function assertGenomeEvidenceRelationships(
@@ -907,9 +1031,13 @@ export async function readGovernanceDocument(
 ): Promise<GovernanceMetadata> {
   safeProjectId(projectId);
   const directory = await governanceDirectory(rootPath, false);
-  const path = (await activeAuditGenerationFile(rootPath, projectId, fileName)) ??
-    assertPathInsideWorkspace(directory, join(directory, fileName));
-  const metadata = parseGovernanceMetadata(await readBoundedDocument(path));
+  const active = await activeAuditGenerationMember(rootPath, projectId, fileName);
+  const path = active?.path ?? assertPathInsideWorkspace(directory, join(directory, fileName));
+  const raw = await readBoundedDocument(path);
+  if (active !== undefined && documentDigest(raw) !== active.digest) {
+    throw new Error("Active audit generation document digest does not match its signed pointer");
+  }
+  const metadata = parseGovernanceMetadata(raw);
   if (metadata.projectId !== projectId) {
     throw new Error("Governance project identity does not match the active project");
   }

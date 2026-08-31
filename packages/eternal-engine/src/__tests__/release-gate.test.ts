@@ -17,6 +17,12 @@ const wholeProductScope = {
   ],
   unavailableScope: [],
 };
+const stateRenderEvidence = [
+  { route: "/overview", state: "default", requiredId: "ev_states_01", freshId: "ev_render_01" },
+  { route: "/overview", state: "loading", requiredId: "ev_states_loading_01", freshId: "ev_render_loading_01" },
+  { route: "/overview", state: "error", requiredId: "ev_states_error_01", freshId: "ev_render_error_01" },
+  { route: "/reports", state: "default", requiredId: "ev_states_reports_01", freshId: "ev_render_reports_01" },
+];
 
 function checkedInput() {
   return {
@@ -36,31 +42,48 @@ function checkedInput() {
       criticalDrift: { evidence: ["ev_drift_01"], lastVerified: verifiedAt },
       newDesignRules: { evidence: ["ev_decisions_01"], lastVerified: verifiedAt },
       screenRegistration: { evidence: ["ev_registry_01"], lastVerified: verifiedAt },
-      requiredStates: { evidence: ["ev_states_01"], lastVerified: verifiedAt },
-      freshRenders: { evidence: ["ev_render_01"], lastVerified: verifiedAt },
+      requiredStates: { evidence: stateRenderEvidence.map(({ requiredId }) => requiredId), lastVerified: verifiedAt },
+      freshRenders: { evidence: stateRenderEvidence.map(({ freshId }) => freshId), lastVerified: verifiedAt },
       decisions: { evidence: ["ev_decisions_01"], lastVerified: verifiedAt },
       functionalVerification: { evidence: ["ev_functional_01"], lastVerified: verifiedAt },
     },
     projectId: "project-a",
     currentSourceRevisionFingerprint: sourceRevisionFingerprint,
-    authenticatedEvidence: [
+    authenticatedEvidence: [...[
       "ev_navigation_01",
       "ev_accessibility_01",
       "ev_drift_01",
       "ev_decisions_01",
       "ev_registry_01",
-      "ev_states_01",
-      "ev_render_01",
       "ev_functional_01",
     ].map((id) => ({
       id,
       projectId: "project-a",
       route: "/overview",
       state: "default",
-      kind: id === "ev_states_01" || id === "ev_render_01" ? "RENDER" as const : "EVIDENCE" as const,
+      kind: "EVIDENCE" as const,
       capturedAt: verifiedAt,
       sourceRevisionFingerprint,
-    })),
+    })), ...stateRenderEvidence.flatMap(({ route, state, requiredId, freshId }) => [
+      {
+        id: requiredId,
+        projectId: "project-a",
+        route,
+        state,
+        kind: "RENDER" as const,
+        capturedAt: verifiedAt,
+        sourceRevisionFingerprint,
+      },
+      {
+        id: freshId,
+        projectId: "project-a",
+        route,
+        state,
+        kind: "RENDER" as const,
+        capturedAt: verifiedAt,
+        sourceRevisionFingerprint,
+      },
+    ])],
   };
 }
 
@@ -140,6 +163,22 @@ describe("Release gate", () => {
     expect(result.checks).toHaveLength(9);
     expect(result.checks.every(({ evidence, lastVerified }) => evidence.length > 0 && lastVerified === verifiedAt))
       .toBe(true);
+  });
+
+  it("does not accept default-only renders as coverage for every required canonical route state", () => {
+    const complete = checkedInput();
+    const result = evaluateReleaseGate({
+      ...complete,
+      evidence: {
+        ...complete.evidence,
+        requiredStates: { evidence: ["ev_states_01"], lastVerified: verifiedAt },
+        freshRenders: { evidence: ["ev_render_01"], lastVerified: verifiedAt },
+      },
+    });
+
+    expect(result.status).toBe("NOT_VERIFIED");
+    expect(result.requiredStates).toBe("NOT_VERIFIED");
+    expect(result.freshRenders).toBe("NOT_VERIFIED");
   });
 
   it("never treats bare PASS strings as release evidence or partial evidence as whole-product coverage", () => {
@@ -297,6 +336,19 @@ describe("Release gate", () => {
     };
 
     expect(() => evaluateReleaseGate(input)).toThrow(/sole residual|polish/i);
+  });
+
+  it("does not PASS when a server-derived unresolved finding has no documented debt path", () => {
+    const result = evaluateReleaseGate({
+      ...checkedInput(),
+      unresolvedFindings: [{
+        finding: "The primary action no longer exposes the approved decision path.",
+        severity: "IMPORTANT",
+        evidenceIds: ["ev_navigation_01"],
+      }],
+    });
+
+    expect(result.status).toBe("NOT_VERIFIED");
   });
 
   it("does not PASS when a catalog ID is forged or its final render belongs to an older source revision", () => {

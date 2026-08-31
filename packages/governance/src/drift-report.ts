@@ -1,14 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import type {
+  DesignGenome,
   DriftReport,
   GovernanceEvidenceCatalogEntry,
   ScreenRecord,
 } from "@design-sharingan/core";
+import { normalizeGovernanceRoute } from "@design-sharingan/core";
 import {
   DRIFT_REPORT_FILE,
   commitAuditGenerationUnderLock,
   incrementGovernanceRevision,
+  isAuthenticatedGenomeDocument,
   readEvidenceCatalog,
   readGenome,
   readGovernanceDocument,
@@ -123,6 +126,38 @@ function reportScopeMatchesRegistry(report: DriftReport, records: readonly Scree
   });
 }
 
+function approvedRulesForCategory(genome: DesignGenome, category: DriftReport["findings"][number]["category"]): string[] {
+  switch (category) {
+    case "UX_NAVIGATION": return genome.uxInvariants;
+    case "ACCESSIBILITY_REQUIRED_STATES": return genome.accessibilityRules;
+    case "PRODUCT_IDENTITY_SCREEN_FAMILY": return [genome.productIdentity, ...genome.screenFamilies];
+    case "COMPONENTS_TOKENS": return [...genome.componentDNA, ...genome.visualInvariants];
+    case "HIERARCHY": return genome.visualInvariants;
+    case "MOTION": return genome.motionRules;
+    case "POLISH": return genome.visualInvariants;
+  }
+}
+
+function evidenceClaimCategories(category: DriftReport["findings"][number]["category"]): string[] {
+  switch (category) {
+    case "UX_NAVIGATION": return ["UX_INVARIANT"];
+    case "ACCESSIBILITY_REQUIRED_STATES": return ["ACCESSIBILITY_RULE"];
+    case "PRODUCT_IDENTITY_SCREEN_FAMILY": return ["PRODUCT_IDENTITY", "SCREEN_FAMILY"];
+    case "COMPONENTS_TOKENS": return ["COMPONENT_DNA", "VISUAL_INVARIANT"];
+    case "HIERARCHY": return ["VISUAL_INVARIANT"];
+    case "MOTION": return ["MOTION_RULE"];
+    case "POLISH": return ["VISUAL_INVARIANT"];
+  }
+}
+
+function findingScope(scope: string): { route: string; state: string } {
+  const split = scope.lastIndexOf("#");
+  if (split <= 0 || !/^[a-z][a-z0-9_-]{0,63}$/.test(scope.slice(split + 1))) {
+    throw new Error("Drift finding scope must identify one canonical route and state");
+  }
+  return { route: normalizeGovernanceRoute(scope.slice(0, split)), state: scope.slice(split + 1) };
+}
+
 function validateIntrinsicReportTruth(
   report: DriftReport,
   records: readonly ScreenRecord[],
@@ -133,7 +168,11 @@ function validateIntrinsicReportTruth(
     throw new Error("Drift Report scope no longer exactly matches the current Screen Registry");
   }
   const catalogById = new Map(catalog.map((entry) => [entry.id, entry]));
+  const expectedStateKeys = new Set(records.flatMap((record) => record.requiredStates.map((state) => scopeKey(record.route, state))));
   const inspected = new Set(report.inspectedScope);
+  if (report.inspectedScope.some((key) => !expectedStateKeys.has(key))) {
+    throw new Error("Drift Report inspected scope contains a state outside the current Screen Registry");
+  }
   const unavailable = new Set([...report.unavailableScope, ...report.unverifiedScope]);
   for (const record of records) {
     for (const state of record.requiredStates) {
@@ -155,23 +194,24 @@ function validateIntrinsicReportTruth(
     }
   }
   for (const finding of report.findings) {
-    const [route] = finding.scope.split("#", 1);
-    const validRule = [
-      genome.productIdentity,
-      ...genome.uxInvariants,
-      ...genome.visualInvariants,
-      ...genome.motionRules,
-      ...genome.accessibilityRules,
-      ...genome.componentDNA,
-      ...genome.screenFamilies,
-    ].includes(finding.expectedRule);
+    const { route, state } = findingScope(finding.scope);
+    const validRule = approvedRulesForCategory(genome, finding.category).includes(finding.expectedRule);
     const expectedRuleId = `genome-rule-${createHash("sha256")
       .update(`${finding.category}\0${finding.expectedRule}`, "utf8")
       .digest("hex")
       .slice(0, 24)}`;
     if (
       !validRule || finding.genomeRuleId !== expectedRuleId || finding.evidenceIds.length === 0 ||
-      finding.evidenceIds.some((id) => !report.evidenceIds.includes(id) || catalogById.get(id)?.route !== route)
+      finding.evidenceIds.some((id) => {
+        const entry = catalogById.get(id);
+        return !report.evidenceIds.includes(id) || entry?.kind !== "RENDER" || entry.route !== route ||
+          entry.renderState !== state || entry.authenticatedRenderId === undefined ||
+          entry.renderCapturedAt === undefined || entry.renderSourceRevisionFingerprint === undefined ||
+          !entry.verifiedClaims.some((claim) =>
+            evidenceClaimCategories(finding.category).includes(claim.category) &&
+            claim.statement === finding.expectedRule && claim.scope.routes.length === 1 && claim.scope.routes[0] === route,
+          );
+      })
     ) throw new Error("Drift finding is not bound to authenticated evidence and an approved Genome rule");
   }
   if (report.overallStatus === "PASS" || report.overallStatus === "PASS_WITH_DEBT") {
@@ -228,10 +268,13 @@ export async function readDriftReport(
     readScreenRegistry(rootPath, projectId),
     readEvidenceCatalog(rootPath, projectId),
   ]);
+  if (!isAuthenticatedGenomeDocument(genome)) {
+    throw new Error("Drift Report requires the current authoritative approved Genome attestation");
+  }
   if (
     metadata.genomeEntityId !== genome.metadata.entityId ||
     metadata.genomeVersion !== genome.value.version ||
-    metadata.genomeRevision > genome.metadata.revision ||
+    metadata.genomeRevision !== genome.metadata.revision ||
     metadata.registryEntityId !== registry.metadata.entityId ||
     metadata.registryRevision !== registry.metadata.revision
   ) throw new Error("Drift Report is not related to the active governance documents");
@@ -267,6 +310,9 @@ export async function saveDriftReport(input: SaveDriftReportInput): Promise<Drif
       readScreenRegistry(input.rootPath, input.projectId),
       readEvidenceCatalog(input.rootPath, input.projectId),
     ]);
+    if (!isAuthenticatedGenomeDocument(genome)) {
+      throw new Error("Drift Report persistence requires the current authoritative approved Genome attestation");
+    }
     if (registry.metadata.revision !== input.expectedRevision) {
       throw new Error("Screen Registry revision is stale");
     }
