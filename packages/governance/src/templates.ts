@@ -3,6 +3,9 @@ import {
   normalizeGovernanceRoute,
   type DesignDecision,
   type DesignGenome,
+  type DriftAuditScopeEntry,
+  type DriftFinding,
+  type DriftReport,
   type GovernanceClaimCitation,
   type GovernanceClaimCategory,
   type GovernanceInspectedScope,
@@ -78,7 +81,23 @@ export interface DesignDecisionsMetadata {
   decisions: DesignDecision[];
 }
 
-export type GovernanceMetadata = GenomeMetadata | ScreenRegistryMetadata | DesignDecisionsMetadata;
+export interface DriftReportMetadata {
+  schemaVersion: typeof GOVERNANCE_SCHEMA_VERSION;
+  kind: "DRIFT_REPORT";
+  projectId: string;
+  entityId: string;
+  revision: number;
+  genomeEntityId: string;
+  genomeVersion: string;
+  genomeRevision: number;
+  registryEntityId: string;
+  registryRevision: number;
+  evidenceIds: string[];
+  auditedAt: string;
+  value: DriftReport;
+}
+
+export type GovernanceMetadata = GenomeMetadata | ScreenRegistryMetadata | DesignDecisionsMetadata | DriftReportMetadata;
 
 export interface ScreenRelationContext {
   genome: DesignGenome;
@@ -255,6 +274,66 @@ ${markdownList(decision.genomeChanges)}`).join("\n\n---\n\n");
 **Recorded decisions:** ${metadata.decisions.length}
 
 ${decisions || "_No design decisions recorded._"}
+`;
+}
+
+export function renderDriftReport(metadata: DriftReportMetadata): string {
+  const report = metadata.value;
+  const scope = report.expectedScope.map(({ screen, states }) =>
+    `- **${quoted(screen)}:** ${markdownList(states, "No required states.")}`,
+  ).join("\n");
+  const findings = report.findings.map((finding) => `## ${finding.severity} / ${finding.category}
+
+- **Scope:** ${quoted(finding.scope)}
+- **Expected rule:** ${quoted(finding.expectedRule)}
+- **Decision required:** ${finding.requiresDesignDecision ? "Yes" : "No"}
+- **Status:** ${quoted(finding.status)}
+
+### Observed Evidence
+
+${markdownList(finding.observedEvidence)}
+
+### Why It Matters
+
+${quoted(finding.whyItMatters)}
+
+### Smallest Coherent Fix
+
+${quoted(finding.recommendedFix)}`).join("\n\n---\n\n");
+  return `${metadataLine(metadata)}
+# Drift Report
+
+**Status:** ${report.overallStatus}
+**Requested scope:** ${report.requestedScope}
+**Audited at:** ${quoted(metadata.auditedAt)}
+**Genome identity:** ${quoted(metadata.genomeEntityId)}
+**Genome version:** ${quoted(metadata.genomeVersion)}
+**Genome revision:** ${metadata.genomeRevision}
+**Registry revision:** ${metadata.registryRevision}
+
+This report records only explicitly enumerated rendered evidence. Unavailable scope is not silently inferred as a pass, and repeated drift remains a Design Decision candidate rather than a Genome rewrite.
+
+## Expected Scope
+
+${scope || "_No scope was enumerated._"}
+
+## Inspected Scope
+
+${markdownList(report.inspectedScope, "No screen states were inspected.")}
+
+## Unavailable Scope
+
+${markdownList(report.unavailableScope, "No unavailable scope recorded.")}
+
+## Unverified Scope
+
+${markdownList(report.unverifiedScope, "No unverified scope recorded.")}
+
+## Authenticated Evidence
+
+${markdownList(metadata.evidenceIds, "No authenticated evidence recorded.")}
+
+${findings || "## Findings\n\n_No drift findings recorded._"}
 `;
 }
 
@@ -504,6 +583,119 @@ function validateDecisions(
   return decisions;
 }
 
+function parseDriftScopeEntries(value: unknown): DriftAuditScopeEntry[] {
+  if (!Array.isArray(value) || value.length > MAX_RECORDS) {
+    throw new Error("Drift expected scope must be bounded");
+  }
+  const entries = value.map((entry) => {
+    const record = objectValue(entry, "Drift expected scope entry");
+    exactKeys(record, ["screen", "states"], [], "Drift expected scope entry");
+    if (!Array.isArray(record.states) || record.states.length === 0 || record.states.length > MAX_RULES) {
+      throw new Error("Drift expected states must be explicitly enumerated");
+    }
+    const states = record.states.map((state, index) => boundedString(
+      state,
+      `Drift expected state[${index}]`,
+      MAX_SHORT_TEXT_LENGTH,
+    ));
+    if (new Set(states).size !== states.length) throw new Error("Drift expected states must be unique");
+    return { screen: safeRoute(record.screen), states };
+  });
+  if (new Set(entries.map(({ screen }) => screen)).size !== entries.length) {
+    throw new Error("Drift expected screen routes must be unique");
+  }
+  return entries;
+}
+
+function parseDriftFinding(value: unknown): DriftFinding {
+  const finding = objectValue(value, "Drift finding");
+  exactKeys(
+    finding,
+    ["category", "severity", "scope", "expectedRule", "observedEvidence", "whyItMatters", "recommendedFix", "requiresDesignDecision", "status"],
+    [],
+    "Drift finding",
+  );
+  const categories = new Set([
+    "UX_NAVIGATION",
+    "ACCESSIBILITY_REQUIRED_STATES",
+    "PRODUCT_IDENTITY_SCREEN_FAMILY",
+    "COMPONENTS_TOKENS",
+    "HIERARCHY",
+    "MOTION",
+    "POLISH",
+  ]);
+  const severities = new Set(["CRITICAL", "IMPORTANT", "POLISH", "INTENTIONAL"]);
+  if (!categories.has(finding.category as string) || !severities.has(finding.severity as string)) {
+    throw new Error("Drift finding category or severity is invalid");
+  }
+  if (!Array.isArray(finding.observedEvidence) || finding.observedEvidence.length > MAX_RULES) {
+    throw new Error("Drift finding observed evidence must be bounded");
+  }
+  if (typeof finding.requiresDesignDecision !== "boolean") {
+    throw new Error("Drift finding decision requirement is invalid");
+  }
+  return {
+    category: finding.category as DriftFinding["category"],
+    severity: finding.severity as DriftFinding["severity"],
+    scope: boundedString(finding.scope, "Drift finding scope", MAX_SHORT_TEXT_LENGTH),
+    expectedRule: boundedString(finding.expectedRule, "Drift expected rule"),
+    observedEvidence: finding.observedEvidence.map((entry, index) => boundedString(
+      entry,
+      `Drift observed evidence[${index}]`,
+    )),
+    whyItMatters: boundedString(finding.whyItMatters, "Drift impact"),
+    recommendedFix: boundedString(finding.recommendedFix, "Drift recommendation"),
+    requiresDesignDecision: finding.requiresDesignDecision,
+    status: boundedString(finding.status, "Drift finding status", MAX_SHORT_TEXT_LENGTH),
+  };
+}
+
+function parseDriftReport(value: unknown): DriftReport {
+  const report = objectValue(value, "Drift report");
+  exactKeys(
+    report,
+    ["requestedScope", "expectedScope", "inspectedScope", "unavailableScope", "unverifiedScope", "evidenceIds", "findings", "overallStatus"],
+    [],
+    "Drift report",
+  );
+  if (report.requestedScope !== "WHOLE_APP" && report.requestedScope !== "SELECTED_SCREENS") {
+    throw new Error("Drift requested scope is invalid");
+  }
+  const list = (entry: unknown, label: string): string[] => {
+    if (!Array.isArray(entry) || entry.length > MAX_RECORDS) throw new Error(`${label} must be bounded`);
+    const values = entry.map((item, index) => boundedString(item, `${label}[${index}]`));
+    if (new Set(values).size !== values.length) throw new Error(`${label} must be unique`);
+    return values;
+  };
+  if (!Array.isArray(report.evidenceIds) || report.evidenceIds.length > MAX_RECORDS) {
+    throw new Error("Drift report evidence must be bounded");
+  }
+  const evidenceIds = report.evidenceIds.map((entry, index) => evidenceId(entry, `Drift evidence[${index}]`));
+  if (new Set(evidenceIds).size !== evidenceIds.length) throw new Error("Drift report evidence must be unique");
+  if (!Array.isArray(report.findings) || report.findings.length > MAX_RECORDS) {
+    throw new Error("Drift findings must be bounded");
+  }
+  const overallStatus = report.overallStatus;
+  if (
+    typeof overallStatus !== "string" ||
+    !(["PASS", "PASS_WITH_DEBT", "NOT_VERIFIED", "BLOCKED"] as const).includes(
+      overallStatus as "PASS" | "PASS_WITH_DEBT" | "NOT_VERIFIED" | "BLOCKED",
+    )
+  ) {
+    throw new Error("Drift report status is invalid");
+  }
+  return {
+    requestedScope: report.requestedScope,
+    expectedScope: parseDriftScopeEntries(report.expectedScope),
+    inspectedScope: list(report.inspectedScope, "Drift inspected scope"),
+    unavailableScope: list(report.unavailableScope, "Drift unavailable scope"),
+    unverifiedScope: list(report.unverifiedScope, "Drift unverified scope"),
+    evidenceIds,
+    findings: report.findings.map(parseDriftFinding),
+    overallStatus: overallStatus as DriftReport["overallStatus"],
+  };
+}
+
 export function parseGovernanceMetadata(markdown: string): GovernanceMetadata {
   const lineEnd = markdown.indexOf("\n");
   const firstLine = lineEnd === -1 ? markdown : markdown.slice(0, lineEnd);
@@ -548,8 +740,35 @@ export function parseGovernanceMetadata(markdown: string): GovernanceMetadata {
     const approvalProofs = metadata.approvalProofs.map(parseDecisionProof);
     const decisions = assertDesignDecisions(metadata.decisions, approvalProofs);
     normalized = { schemaVersion: GOVERNANCE_SCHEMA_VERSION, kind: "DESIGN_DECISIONS", projectId: metadata.projectId as string, entityId: metadata.entityId as string, revision: metadata.revision as number, genomeEntityId: safeId(metadata.genomeEntityId, "Decisions Genome identity"), genomeVersion: boundedString(metadata.genomeVersion, "Decisions Genome version", MAX_SHORT_TEXT_LENGTH), genomeRevision: positiveRevision(metadata.genomeRevision), approvalProofs, decisions };
+  } else if (metadata.kind === "DRIFT_REPORT") {
+    exactKeys(metadata, ["schemaVersion", "kind", "projectId", "entityId", "revision", "genomeEntityId", "genomeVersion", "genomeRevision", "registryEntityId", "registryRevision", "evidenceIds", "auditedAt", "value"], [], "Drift Report metadata");
+    assertBaseMetadata(metadata, "DRIFT_REPORT");
+    if (!Array.isArray(metadata.evidenceIds) || metadata.evidenceIds.length > MAX_RECORDS) {
+      throw new Error("Drift Report evidence identifiers must be bounded");
+    }
+    const evidenceIds = metadata.evidenceIds.map((entry, index) => evidenceId(entry, `Drift Report evidence[${index}]`));
+    if (new Set(evidenceIds).size !== evidenceIds.length) throw new Error("Drift Report evidence identifiers must be unique");
+    const value = parseDriftReport(metadata.value);
+    if (value.evidenceIds.length !== evidenceIds.length || value.evidenceIds.some((id) => !evidenceIds.includes(id))) {
+      throw new Error("Drift Report value evidence does not match metadata evidence");
+    }
+    normalized = {
+      schemaVersion: GOVERNANCE_SCHEMA_VERSION,
+      kind: "DRIFT_REPORT",
+      projectId: metadata.projectId as string,
+      entityId: metadata.entityId as string,
+      revision: metadata.revision as number,
+      genomeEntityId: safeId(metadata.genomeEntityId, "Drift Report Genome identity"),
+      genomeVersion: boundedString(metadata.genomeVersion, "Drift Report Genome version", MAX_SHORT_TEXT_LENGTH),
+      genomeRevision: positiveRevision(metadata.genomeRevision),
+      registryEntityId: safeId(metadata.registryEntityId, "Drift Report Registry identity"),
+      registryRevision: positiveRevision(metadata.registryRevision),
+      evidenceIds,
+      auditedAt: isoTimestamp(metadata.auditedAt, "Drift Report audit time"),
+      value,
+    };
   } else throw new Error("Governance document kind is invalid");
-  const canonical = normalized.kind === "DESIGN_GENOME" ? renderGenome(normalized) : normalized.kind === "SCREEN_REGISTRY" ? renderScreenRegistry(normalized) : renderDesignDecisions(normalized);
+  const canonical = normalized.kind === "DESIGN_GENOME" ? renderGenome(normalized) : normalized.kind === "SCREEN_REGISTRY" ? renderScreenRegistry(normalized) : normalized.kind === "DESIGN_DECISIONS" ? renderDesignDecisions(normalized) : renderDriftReport(normalized);
   if (canonical !== markdown) throw new Error("Governance Markdown body or metadata is not canonical");
   return normalized;
 }

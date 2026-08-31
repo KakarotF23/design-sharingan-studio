@@ -50,6 +50,14 @@ export async function readScreenRegistry(
     genome: genome.value,
     evidenceIds: evidenceCatalog.map(({ id }) => id),
     evidenceRoutes: Object.fromEntries(evidenceCatalog.map(({ id, route }) => [id, route])),
+    authenticatedVerificationEvidenceIds: evidenceCatalog
+      .filter((entry) =>
+        entry.kind === "RENDER" &&
+        entry.authenticatedRenderId !== undefined &&
+        entry.renderCapturedAt !== undefined &&
+        entry.renderSourceRevisionFingerprint !== undefined,
+      )
+      .map(({ id }) => id),
   });
   return document(metadata);
 }
@@ -73,6 +81,14 @@ export async function saveScreenRegistry(
       genome: genome.value,
       evidenceIds: evidenceCatalog.map(({ id }) => id),
       evidenceRoutes: Object.fromEntries(evidenceCatalog.map(({ id, route }) => [id, route])),
+      authenticatedVerificationEvidenceIds: evidenceCatalog
+        .filter((entry) =>
+          entry.kind === "RENDER" &&
+          entry.authenticatedRenderId !== undefined &&
+          entry.renderCapturedAt !== undefined &&
+          entry.renderSourceRevisionFingerprint !== undefined,
+        )
+        .map(({ id }) => id),
     });
     const metadata: ScreenRegistryMetadata = {
       ...current.metadata,

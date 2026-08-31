@@ -17,6 +17,8 @@ export interface AdapterGovernanceEvidence {
   excerpt: string;
   route: string;
   authenticatedRenderId?: string;
+  renderCapturedAt?: string;
+  renderSourceRevisionFingerprint?: string;
   verifiedClaims: GovernanceVerifiedClaim[];
 }
 
@@ -224,6 +226,12 @@ export async function collectGovernanceEvidence(
           excerpt: `Authenticated current render ${scrub(artifact.id)} captured for this route.`,
           route: artifact.route,
           authenticatedRenderId: artifact.id,
+          ...(artifact.sourceRevision.available
+            ? {
+                renderCapturedAt: artifact.capturedAt,
+                renderSourceRevisionFingerprint: artifact.sourceRevision.worktreeFingerprint,
+              }
+            : {}),
           verifiedClaims: [],
         });
       }

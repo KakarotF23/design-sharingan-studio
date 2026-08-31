@@ -50,6 +50,7 @@ export const GOVERNANCE_DIRECTORY = "design-governance";
 export const DESIGN_GENOME_FILE = "DESIGN-GENOME.md";
 export const SCREEN_REGISTRY_FILE = "SCREEN-REGISTRY.md";
 export const DESIGN_DECISIONS_FILE = "DESIGN-DECISIONS.md";
+export const DRIFT_REPORT_FILE = "DRIFT-REPORT.md";
 const LOCK_FILE = "governance.lock";
 const MAX_DOCUMENT_BYTES = 256 * 1024;
 const MAX_LOCK_ATTEMPTS = 100;
@@ -180,7 +181,7 @@ function rootFingerprint(canonicalRoot: string): string {
     .digest("hex");
 }
 
-async function machineStateDirectory(rootPath: string, create: boolean): Promise<string> {
+export async function machineStateDirectory(rootPath: string, create: boolean): Promise<string> {
   const root = await canonicalProjectRoot(rootPath);
   const directory = assertPathInsideWorkspace(root, join(root, MACHINE_STATE_DIRECTORY));
   if (!(await entryExists(directory))) {
@@ -286,11 +287,14 @@ function normalizeEvidenceCatalog(
       throw new Error(`Governance evidence catalog entry ${index} is invalid`);
     }
     const entry = raw as Record<string, unknown>;
+    const renderMetadataPresent = entry.renderCapturedAt !== undefined || entry.renderSourceRevisionFingerprint !== undefined;
     exactObjectKeys(
       entry,
       entry.authenticatedRenderId === undefined
         ? ["id", "kind", "route", "excerpt", "verifiedClaims"]
-        : ["id", "kind", "route", "excerpt", "verifiedClaims", "authenticatedRenderId"],
+        : renderMetadataPresent
+          ? ["id", "kind", "route", "excerpt", "verifiedClaims", "authenticatedRenderId", "renderCapturedAt", "renderSourceRevisionFingerprint"]
+          : ["id", "kind", "route", "excerpt", "verifiedClaims", "authenticatedRenderId"],
       `Governance evidence catalog entry ${index}`,
     );
     if (typeof entry.id !== "string" || !EVIDENCE_ID_PATTERN.test(entry.id)) {
@@ -345,6 +349,15 @@ function normalizeEvidenceCatalog(
       authenticatedRenderId !== undefined &&
       (typeof authenticatedRenderId !== "string" || !SAFE_ID_PATTERN.test(authenticatedRenderId))
     ) throw new Error("Authenticated render identity is invalid");
+    if (renderMetadataPresent && authenticatedRenderId === undefined) {
+      throw new Error("Render verification metadata requires an authenticated render identity");
+    }
+    const renderCapturedAt = entry.renderCapturedAt;
+    const renderSourceRevisionFingerprint = entry.renderSourceRevisionFingerprint;
+    if (renderMetadataPresent && (
+      typeof renderCapturedAt !== "string" || new Date(renderCapturedAt).toISOString() !== renderCapturedAt ||
+      typeof renderSourceRevisionFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(renderSourceRevisionFingerprint)
+    )) throw new Error("Authenticated render verification metadata is invalid");
     return {
       id: entry.id,
       kind: entry.kind as GovernanceEvidenceCatalogEntry["kind"],
@@ -352,6 +365,10 @@ function normalizeEvidenceCatalog(
       excerpt: entry.excerpt,
       verifiedClaims,
       ...(authenticatedRenderId === undefined ? {} : { authenticatedRenderId }),
+      ...(renderMetadataPresent ? {
+        renderCapturedAt: renderCapturedAt as string,
+        renderSourceRevisionFingerprint: renderSourceRevisionFingerprint as string,
+      } : {}),
     };
   });
   if (new Set(entries.map(({ id }) => id)).size !== entries.length) {
@@ -367,7 +384,7 @@ function evidenceCatalogSignature(
   return createHmac("sha256", key).update(JSON.stringify(value), "utf8").digest("hex");
 }
 
-async function writeEvidenceCatalog(
+export async function writeEvidenceCatalogUnderLock(
   rootPath: string,
   projectId: string,
   machineDirectory: string,
@@ -1127,7 +1144,7 @@ export async function initializeGovernance(
       }));
       await syncDirectory(payloadDirectory);
       await syncDirectory(ownerDirectory);
-      catalogOwnership = await writeEvidenceCatalog(
+      catalogOwnership = await writeEvidenceCatalogUnderLock(
         input.rootPath,
         projectId,
         machineDirectory,

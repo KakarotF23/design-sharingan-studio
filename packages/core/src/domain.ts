@@ -73,6 +73,7 @@ export type FindingCategory =
   | "RESPONSIVE"
   | "GENOME";
 export type ReleaseGateStatus = "PASS" | "PASS_WITH_DEBT" | "NOT_VERIFIED" | "BLOCKED";
+export type ReleaseCheckStatus = "PASS" | "PASS_WITH_DEBT" | "FAIL" | "NOT_VERIFIED" | "BLOCKED";
 export type DesignSessionType =
   | "REFERENCE_SCAN"
   | "ASSIMILATION"
@@ -498,6 +499,8 @@ export interface GovernanceEvidenceCatalogEntry {
   excerpt: string;
   verifiedClaims: GovernanceVerifiedClaim[];
   authenticatedRenderId?: string;
+  renderCapturedAt?: ISODateTime;
+  renderSourceRevisionFingerprint?: string;
 }
 
 export interface ScreenRecord {
@@ -529,6 +532,7 @@ export interface DesignDecision {
 }
 
 export interface DriftFinding {
+  category: DriftAuditCategory;
   severity: DriftSeverity;
   scope: string;
   expectedRule: string;
@@ -539,17 +543,72 @@ export interface DriftFinding {
   status: string;
 }
 
+export type DriftAuditCategory =
+  | "UX_NAVIGATION"
+  | "ACCESSIBILITY_REQUIRED_STATES"
+  | "PRODUCT_IDENTITY_SCREEN_FAMILY"
+  | "COMPONENTS_TOKENS"
+  | "HIERARCHY"
+  | "MOTION"
+  | "POLISH";
+
+export type DriftAuditScope = "WHOLE_APP" | "SELECTED_SCREENS";
+export type DriftAuditEvidenceStatus = "INSPECTED" | "UNAVAILABLE" | "OUT_OF_SCOPE";
+
+export interface DriftAuditScopeEntry {
+  screen: string;
+  states: string[];
+}
+
+export interface DriftAuditEvidence {
+  screen: string;
+  state?: string;
+  status: DriftAuditEvidenceStatus;
+  evidenceIds?: string[];
+  reason?: string;
+}
+
+export interface DriftReport {
+  requestedScope: DriftAuditScope;
+  expectedScope: DriftAuditScopeEntry[];
+  inspectedScope: string[];
+  unavailableScope: string[];
+  unverifiedScope: string[];
+  evidenceIds: string[];
+  findings: DriftFinding[];
+  overallStatus: ReleaseGateStatus;
+}
+
+export type ReleaseGateCheckName =
+  | "navigation"
+  | "accessibility"
+  | "criticalDrift"
+  | "newDesignRules"
+  | "screenRegistration"
+  | "requiredStates"
+  | "freshRenders"
+  | "decisions"
+  | "functionalVerification";
+
+export interface ReleaseGateCheck {
+  name: ReleaseGateCheckName;
+  status: ReleaseCheckStatus;
+  evidence: string[];
+  lastVerified?: ISODateTime;
+  blockingReason?: string;
+}
+
 export interface ReleaseGate {
   scope: string;
-  checks: string[];
-  navigation: ReleaseGateStatus;
-  accessibility: ReleaseGateStatus;
-  criticalDrift: ReleaseGateStatus;
-  newDesignRules: ReleaseGateStatus;
-  screenRegistration: ReleaseGateStatus;
-  requiredStates: ReleaseGateStatus;
-  freshRenders: ReleaseGateStatus;
-  decisions: ReleaseGateStatus;
-  functionalVerification: ReleaseGateStatus;
+  checks: ReleaseGateCheck[];
+  navigation: ReleaseCheckStatus;
+  accessibility: ReleaseCheckStatus;
+  criticalDrift: ReleaseCheckStatus;
+  newDesignRules: ReleaseCheckStatus;
+  screenRegistration: ReleaseCheckStatus;
+  requiredStates: ReleaseCheckStatus;
+  freshRenders: ReleaseCheckStatus;
+  decisions: ReleaseCheckStatus;
+  functionalVerification: ReleaseCheckStatus;
   status: ReleaseGateStatus;
 }

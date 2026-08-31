@@ -9,13 +9,20 @@ import {
 import type {
   GovernanceProjection,
   GovernGenomeProjection,
+  GovernReleaseProjection,
+  GovernScreenProjection,
 } from "./govern-server";
+import { DriftView } from "./drift-view";
+import { ReleaseGateView } from "./release-gate-view";
 import { ScreenRegistry } from "./screen-registry";
+import type { DriftReport } from "@design-sharingan/core";
 
 interface GovernanceResponse {
   initialized?: boolean;
   genome?: GovernGenomeProjection;
-  screens?: GovernanceProjection extends { initialized: true; screens: infer T } ? T : never;
+  screens?: GovernScreenProjection[];
+  drift?: DriftReport;
+  release?: GovernReleaseProjection;
   error?: string;
 }
 
@@ -121,6 +128,8 @@ export function GovernWorkspace() {
       initialized: true,
       genome: payload.genome,
       screens: payload.screens,
+      ...(payload.drift === undefined ? {} : { drift: payload.drift }),
+      ...(payload.release === undefined ? {} : { release: payload.release }),
     } as GovernanceProjection;
   }, [project.id]);
 
@@ -140,7 +149,7 @@ export function GovernWorkspace() {
       });
   }, [load, setShellGenome]);
 
-  async function action(endpoint: "initialize" | "approve") {
+  async function action(endpoint: "initialize" | "approve" | "audit" | "release") {
     setBusy(true);
     setError(undefined);
     try {
@@ -172,6 +181,8 @@ export function GovernWorkspace() {
         initialized: true,
         genome: payload.genome,
         screens: payload.screens,
+        ...(payload.drift === undefined ? {} : { drift: payload.drift }),
+        ...(payload.release === undefined ? {} : { release: payload.release }),
       });
       setShellGenome({
         state: "INITIALIZED",
@@ -229,6 +240,17 @@ export function GovernWorkspace() {
             onApprove={() => action("approve")}
           />
           <ScreenRegistry screens={projection.screens} />
+          <DriftView
+            report={projection.drift}
+            busy={busy}
+            onAudit={() => action("audit")}
+            executeHref={`/projects/${encodeURIComponent(project.id)}/execute`}
+          />
+          <ReleaseGateView
+            release={projection.release}
+            busy={busy}
+            onEvaluate={() => action("release")}
+          />
         </>
       ) : null}
     </div>
