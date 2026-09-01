@@ -59,12 +59,19 @@ const STAGING_DIRECTORY = "governance-staging";
 const EVIDENCE_CATALOG_FILE = "governance-evidence.json";
 const AUDIT_GENERATIONS_DIRECTORY = "audit-generations";
 const AUDIT_GENERATION_POINTER_FILE = "active-audit-generation.json";
+const AUDIT_GENERATION_INVALIDATION_FILE = "inactive-audit-generation.json";
 const AUDIT_GENERATION_MANIFEST_FILE = "manifest.json";
 const AUDIT_GENERATION_COMMIT_FILE = "commit.json";
+const AUDIT_GENERATION_ACTIVATION_FILE = "activation.json";
 const MAX_AUDIT_GENERATIONS = 16;
 const AUDIT_GENESIS_DIGEST = "0".repeat(64);
 
-export type AuditTransactionFault = "after-stage" | "before-pointer" | "after-pointer";
+export type AuditTransactionFault =
+  | "after-stage"
+  | "before-pointer"
+  | "after-commit-before-pointer"
+  | "after-pointer-before-activation"
+  | "after-pointer";
 let auditTransactionFault: AuditTransactionFault | undefined;
 
 /** Test-only fault injection for the generation promotion boundaries. */
@@ -179,10 +186,33 @@ interface AuditGenerationCommit extends AuditGenerationRelations {
   signature: string;
 }
 
+interface AuditGenerationActivation extends AuditGenerationRelations {
+  kind: "DESIGN_SHARINGAN_AUDIT_ACTIVATION";
+  commitDigest: string;
+  pointer: ActiveAuditGeneration;
+  previousActivationDigest: string;
+  activatedAt: string;
+  signature: string;
+}
+
+interface AuditGenerationInvalidation {
+  kind: "DESIGN_SHARINGAN_AUDIT_INVALIDATION";
+  projectId: string;
+  rootFingerprint: string;
+  activationDigest: string;
+  invalidatedAt: string;
+  signature: string;
+}
+
 interface CompleteAuditGeneration {
   commit: AuditGenerationCommit;
   commitDigest: string;
   directory: string;
+}
+
+interface ActivatedAuditGeneration extends CompleteAuditGeneration {
+  activation: AuditGenerationActivation;
+  activationDigest: string;
 }
 
 export interface CommitAuditGenerationInput {
@@ -592,13 +622,20 @@ function auditGenerationHeadDigest(value: AuditGenerationRelations): string {
 function activeAuditGenerationPayload(
   value: Omit<ActiveAuditGeneration, "signature">,
 ): string {
-  return JSON.stringify({
+  return JSON.stringify(activeAuditGenerationRecord(value));
+}
+
+function activeAuditGenerationRecord<T extends Omit<ActiveAuditGeneration, "signature"> | ActiveAuditGeneration>(
+  value: T,
+): T {
+  return {
     kind: value.kind,
     ...auditGenerationRelationPayload(value),
     headDigest: value.headDigest,
     commitDigest: value.commitDigest,
     createdAt: value.createdAt,
-  });
+    ...("signature" in value ? { signature: value.signature } : {}),
+  } as T;
 }
 
 function activeAuditGenerationSignature(
@@ -645,14 +682,7 @@ function auditGenerationCommitSignature(
 }
 
 function renderActiveAuditGeneration(value: ActiveAuditGeneration): string {
-  return `${JSON.stringify({
-    kind: value.kind,
-    ...auditGenerationRelationPayload(value),
-    headDigest: value.headDigest,
-    commitDigest: value.commitDigest,
-    createdAt: value.createdAt,
-    signature: value.signature,
-  })}\n`;
+  return `${JSON.stringify(activeAuditGenerationRecord(value))}\n`;
 }
 
 function renderAuditGenerationManifest(value: AuditGenerationManifest): string {
@@ -673,6 +703,58 @@ function renderAuditGenerationCommit(value: AuditGenerationCommit): string {
     committedAt: value.committedAt,
     signature: value.signature,
   })}\n`;
+}
+
+function auditGenerationActivationPayload(
+  value: Omit<AuditGenerationActivation, "signature">,
+): string {
+  return JSON.stringify(auditGenerationActivationRecord(value));
+}
+
+function auditGenerationActivationRecord<T extends Omit<AuditGenerationActivation, "signature"> | AuditGenerationActivation>(
+  value: T,
+): T {
+  return {
+    kind: value.kind,
+    ...auditGenerationRelationPayload(value),
+    commitDigest: value.commitDigest,
+    pointer: activeAuditGenerationRecord(value.pointer),
+    previousActivationDigest: value.previousActivationDigest,
+    activatedAt: value.activatedAt,
+    ...("signature" in value ? { signature: value.signature } : {}),
+  } as T;
+}
+
+function auditGenerationActivationSignature(
+  key: Buffer,
+  value: Omit<AuditGenerationActivation, "signature">,
+): string {
+  return createHmac("sha256", key)
+    .update(auditGenerationActivationPayload(value), "utf8")
+    .digest("hex");
+}
+
+function renderAuditGenerationActivation(value: AuditGenerationActivation): string {
+  return `${JSON.stringify(auditGenerationActivationRecord(value))}\n`;
+}
+
+function auditGenerationInvalidationPayload(
+  value: Omit<AuditGenerationInvalidation, "signature">,
+): string {
+  return JSON.stringify(value);
+}
+
+function auditGenerationInvalidationSignature(
+  key: Buffer,
+  value: Omit<AuditGenerationInvalidation, "signature">,
+): string {
+  return createHmac("sha256", key)
+    .update(auditGenerationInvalidationPayload(value), "utf8")
+    .digest("hex");
+}
+
+function renderAuditGenerationInvalidation(value: AuditGenerationInvalidation): string {
+  return `${JSON.stringify(value)}\n`;
 }
 
 function sameAuditGenerationRelations(
@@ -712,6 +794,35 @@ function assertAuditGenerationRelations(
 function assertAuditGenerationHead(value: AuditGenerationRelations & Record<string, unknown>): void {
   if (!isDigest(value.headDigest) || value.headDigest !== auditGenerationHeadDigest(value)) {
     throw new Error("Audit generation head relation is invalid");
+  }
+}
+
+function assertActiveAuditGenerationPointer(
+  value: Record<string, unknown>,
+  projectId: string,
+  canonicalRoot: string,
+  key: Buffer,
+): asserts value is Record<string, unknown> & ActiveAuditGeneration {
+  exactObjectKeys(value, [
+    "kind", "projectId", "rootFingerprint", "generationId", "sequence", "previousGenerationId",
+    "previousCommitDigest", "previousHeadDigest", "registryEntityId", "registryRevision",
+    "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest",
+    "headDigest", "commitDigest", "createdAt", "signature",
+  ], "Active audit generation pointer");
+  if (
+    value.kind !== "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION" ||
+    typeof value.createdAt !== "string" || new Date(value.createdAt).toISOString() !== value.createdAt ||
+    !isDigest(value.commitDigest) || !isDigest(value.signature)
+  ) throw new Error("Active audit generation pointer is invalid");
+  assertAuditGenerationRelations(value, projectId, canonicalRoot);
+  assertAuditGenerationHead(value);
+  const pointer = value as unknown as ActiveAuditGeneration;
+  if (`${JSON.stringify(pointer)}\n` !== renderActiveAuditGeneration(pointer)) {
+    throw new Error("Active audit generation pointer is not canonical");
+  }
+  const { signature, ...unsigned } = pointer;
+  if (!authenticatedSignatureMatches(signature, activeAuditGenerationSignature(key, unsigned))) {
+    throw new Error("Active audit generation pointer is not authenticated");
   }
 }
 
@@ -910,11 +1021,28 @@ async function readCompleteAuditGenerations(
   return generations;
 }
 
-async function readActiveAuditGeneration(
-  rootPath: string,
+function pointerMatchesCommittedGeneration(
+  pointer: ActiveAuditGeneration,
+  generation: CompleteAuditGeneration,
+): boolean {
+  return sameAuditGenerationRelations(pointer, generation.commit) &&
+    pointer.headDigest === generation.commit.headDigest &&
+    pointer.commitDigest === generation.commitDigest;
+}
+
+function sameActiveAuditGenerationPointer(
+  left: ActiveAuditGeneration,
+  right: ActiveAuditGeneration,
+): boolean {
+  return renderActiveAuditGeneration(left) === renderActiveAuditGeneration(right);
+}
+
+async function readAuditGenerationPointer(
+  machineDirectory: string,
   projectId: string,
-): Promise<{ pointer: ActiveAuditGeneration; directory: string } | undefined> {
-  const machineDirectory = await machineStateDirectory(rootPath, false);
+  canonicalRoot: string,
+  key: Buffer,
+): Promise<ActiveAuditGeneration | undefined> {
   const pointerPath = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATION_POINTER_FILE));
   if (!(await entryExists(pointerPath))) return undefined;
   const raw = await readBoundedDocument(pointerPath);
@@ -924,41 +1052,190 @@ async function readActiveAuditGeneration(
     throw new Error("Active audit generation pointer is malformed");
   }
   const pointerValue = parsed as Record<string, unknown>;
-  exactObjectKeys(pointerValue, [
+  assertActiveAuditGenerationPointer(pointerValue, projectId, canonicalRoot, key);
+  const pointer = pointerValue as unknown as ActiveAuditGeneration;
+  if (raw !== renderActiveAuditGeneration(pointer)) {
+    throw new Error("Active audit generation pointer is not canonical");
+  }
+  return pointer;
+}
+
+async function readAuditGenerationInvalidation(
+  machineDirectory: string,
+  projectId: string,
+  canonicalRoot: string,
+  key: Buffer,
+): Promise<AuditGenerationInvalidation | undefined> {
+  const invalidationPath = assertPathInsideWorkspace(
+    machineDirectory,
+    join(machineDirectory, AUDIT_GENERATION_INVALIDATION_FILE),
+  );
+  if (!(await entryExists(invalidationPath))) return undefined;
+  const raw = await readBoundedDocument(invalidationPath);
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("Audit generation invalidation is malformed"); }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Audit generation invalidation is malformed");
+  }
+  const value = parsed as Record<string, unknown>;
+  exactObjectKeys(value, ["kind", "projectId", "rootFingerprint", "activationDigest", "invalidatedAt", "signature"], "Audit generation invalidation");
+  if (
+    value.kind !== "DESIGN_SHARINGAN_AUDIT_INVALIDATION" ||
+    value.projectId !== projectId || value.rootFingerprint !== rootFingerprint(canonicalRoot) ||
+    !isDigest(value.activationDigest) || typeof value.invalidatedAt !== "string" ||
+    new Date(value.invalidatedAt).toISOString() !== value.invalidatedAt || !isDigest(value.signature)
+  ) throw new Error("Audit generation invalidation is invalid");
+  const invalidation = value as unknown as AuditGenerationInvalidation;
+  if (raw !== renderAuditGenerationInvalidation(invalidation)) {
+    throw new Error("Audit generation invalidation is not canonical");
+  }
+  const { signature, ...unsigned } = invalidation;
+  if (!authenticatedSignatureMatches(signature, auditGenerationInvalidationSignature(key, unsigned))) {
+    throw new Error("Audit generation invalidation is not authenticated");
+  }
+  return invalidation;
+}
+
+async function readActivatedAuditGeneration(
+  projectId: string,
+  canonicalRoot: string,
+  key: Buffer,
+  complete: CompleteAuditGeneration,
+): Promise<ActivatedAuditGeneration | undefined> {
+  const activationPath = assertPathInsideWorkspace(
+    complete.directory,
+    join(complete.directory, AUDIT_GENERATION_ACTIVATION_FILE),
+  );
+  if (!(await entryExists(activationPath))) return undefined;
+  const activationRaw = await readBoundedDocument(activationPath);
+  let parsed: unknown;
+  try { parsed = JSON.parse(activationRaw); } catch {
+    throw new Error("Committed audit generation activation is malformed");
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Committed audit generation activation is malformed");
+  }
+  const activationValue = parsed as Record<string, unknown>;
+  exactObjectKeys(activationValue, [
     "kind", "projectId", "rootFingerprint", "generationId", "sequence", "previousGenerationId",
     "previousCommitDigest", "previousHeadDigest", "registryEntityId", "registryRevision",
     "reportEntityId", "reportRevision", "registryDigest", "reportDigest", "catalogDigest",
-    "headDigest", "commitDigest", "createdAt", "signature",
-  ], "Active audit generation pointer");
-  const canonicalRoot = await canonicalProjectRoot(rootPath);
+    "commitDigest", "pointer", "previousActivationDigest", "activatedAt", "signature",
+  ], "Audit generation activation");
   if (
-    pointerValue.kind !== "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION" ||
-    typeof pointerValue.createdAt !== "string" || new Date(pointerValue.createdAt).toISOString() !== pointerValue.createdAt ||
-    !isDigest(pointerValue.commitDigest) || !isDigest(pointerValue.signature)
-  ) throw new Error("Active audit generation pointer is invalid");
-  assertAuditGenerationRelations(pointerValue, projectId, canonicalRoot);
-  assertAuditGenerationHead(pointerValue);
-  const normalized = pointerValue as unknown as ActiveAuditGeneration;
-  if (raw !== renderActiveAuditGeneration(normalized)) {
-    throw new Error("Active audit generation pointer is not canonical");
+    activationValue.kind !== "DESIGN_SHARINGAN_AUDIT_ACTIVATION" ||
+    !isDigest(activationValue.commitDigest) || !isDigest(activationValue.previousActivationDigest) ||
+    typeof activationValue.activatedAt !== "string" ||
+    new Date(activationValue.activatedAt).toISOString() !== activationValue.activatedAt ||
+    !isDigest(activationValue.signature) ||
+    activationValue.pointer === null || typeof activationValue.pointer !== "object" ||
+    Array.isArray(activationValue.pointer)
+  ) throw new Error("Committed audit generation activation is invalid");
+  assertAuditGenerationRelations(activationValue, projectId, canonicalRoot);
+  const pointerValue = activationValue.pointer as Record<string, unknown>;
+  assertActiveAuditGenerationPointer(pointerValue, projectId, canonicalRoot, key);
+  const activation = activationValue as unknown as AuditGenerationActivation;
+  if (
+    !sameAuditGenerationRelations(activation, complete.commit) ||
+    activation.commitDigest !== complete.commitDigest ||
+    !pointerMatchesCommittedGeneration(activation.pointer, complete) ||
+    activationRaw !== renderAuditGenerationActivation(activation)
+  ) throw new Error("Committed audit generation activation relation is inconsistent");
+  const { signature, ...unsigned } = activation;
+  if (!authenticatedSignatureMatches(signature, auditGenerationActivationSignature(key, unsigned))) {
+    throw new Error("Committed audit generation activation is not authenticated");
   }
-  const { signature, ...unsigned } = normalized;
-  const key = await authorityKey(rootPath, false);
-  const expected = Buffer.from(activeAuditGenerationSignature(key, unsigned), "hex");
-  const actual = Buffer.from(signature, "hex");
-  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
-    throw new Error("Active audit generation pointer is not authenticated");
-  }
+  return {
+    ...complete,
+    activation,
+    activationDigest: documentDigest(activationRaw),
+  };
+}
 
+async function readActivatedAuditGenerations(
+  projectId: string,
+  canonicalRoot: string,
+  key: Buffer,
+  complete: CompleteAuditGeneration[],
+): Promise<ActivatedAuditGeneration[]> {
+  const activated: ActivatedAuditGeneration[] = [];
+  let encounteredUnactivatedGeneration = false;
+  for (const generation of complete) {
+    const current = await readActivatedAuditGeneration(projectId, canonicalRoot, key, generation);
+    if (current === undefined) {
+      encounteredUnactivatedGeneration = true;
+      continue;
+    }
+    if (encounteredUnactivatedGeneration) {
+      throw new Error("Audit generation activation chain is incomplete or replayed");
+    }
+    activated.push(current);
+  }
+  return activated;
+}
+
+function assertAuditGenerationActivationChain(generations: ActivatedAuditGeneration[]): void {
+  for (let index = 0; index < generations.length; index += 1) {
+    const current = generations[index]!;
+    const previous = generations[index - 1];
+    if (index === 0) {
+      if (
+        current.activation.sequence !== 1 ||
+        current.activation.previousActivationDigest !== AUDIT_GENESIS_DIGEST
+      ) throw new Error("Audit generation activation has an invalid genesis head");
+      continue;
+    }
+    if (
+      previous === undefined ||
+      current.activation.sequence !== incrementAuditGenerationSequence(previous.activation.sequence) ||
+      current.activation.previousActivationDigest !== previous.activationDigest
+    ) throw new Error("Audit generation activation chain is incomplete or replayed");
+  }
+}
+
+async function readActiveAuditGeneration(
+  rootPath: string,
+  projectId: string,
+): Promise<{ pointer: ActiveAuditGeneration; directory: string } | undefined> {
+  const machineDirectory = await machineStateDirectory(rootPath, false);
+  const canonicalRoot = await canonicalProjectRoot(rootPath);
+  const key = await authorityKey(rootPath, false);
+  const pointer = await readAuditGenerationPointer(machineDirectory, projectId, canonicalRoot, key);
+  const invalidation = await readAuditGenerationInvalidation(machineDirectory, projectId, canonicalRoot, key);
   const complete = await readCompleteAuditGenerations(rootPath, projectId, machineDirectory, canonicalRoot, key);
-  if (complete.length === 0) throw new Error("Active audit generation pointer has no committed generation");
+  if (complete.length === 0) {
+    if (pointer !== undefined || invalidation !== undefined) {
+      throw new Error("Audit generation authority record has no committed generation");
+    }
+    return undefined;
+  }
   assertAuditGenerationChain(complete);
-  const latest = complete.at(-1)!;
-  if (
-    !sameAuditGenerationRelations(normalized, latest.commit) ||
-    normalized.headDigest !== latest.commit.headDigest || normalized.commitDigest !== latest.commitDigest
-  ) throw new Error("Active audit generation pointer is behind or does not match the committed head");
-  return { pointer: normalized, directory: latest.directory };
+  const activated = await readActivatedAuditGenerations(projectId, canonicalRoot, key, complete);
+  assertAuditGenerationActivationChain(activated);
+  if (activated.length === 0) {
+    if (invalidation !== undefined) throw new Error("Audit generation invalidation has no activated head");
+    if (pointer !== undefined && !pointerMatchesCommittedGeneration(pointer, complete.at(-1)!)) {
+      throw new Error("Active audit generation pointer does not match the pending committed generation");
+    }
+    return undefined;
+  }
+  const latest = activated.at(-1)!;
+  if (invalidation?.activationDigest === latest.activationDigest) {
+    // A direct Registry mutation deliberately invalidates its prior audit. The
+    // tombstone is the only allowed missing-pointer state for an activated head.
+    return undefined;
+  }
+  if (pointer === undefined) throw new Error("Active audit generation pointer is missing from the activated head");
+  if (sameActiveAuditGenerationPointer(pointer, latest.activation.pointer)) {
+    return { pointer: latest.activation.pointer, directory: latest.directory };
+  }
+  const pending = complete.slice(activated.length);
+  if (pending.length > 0 && pointerMatchesCommittedGeneration(pointer, pending.at(-1)!)) {
+    // A commit and pointer can survive a crash before its signed activation.
+    // That generation is recoverable residue, never active truth.
+    return { pointer: latest.activation.pointer, directory: latest.directory };
+  }
+  throw new Error("Active audit generation pointer is behind or does not match the activated head");
 }
 
 async function activeAuditGenerationMember(
@@ -976,25 +1253,67 @@ async function activeAuditGenerationMember(
   };
 }
 
+async function discardUnactivatedAuditGenerationsUnderLock(
+  machineDirectory: string,
+  generationRoot: string,
+  active: { pointer: ActiveAuditGeneration; directory: string } | undefined,
+  complete: CompleteAuditGeneration[],
+  activated: ActivatedAuditGeneration[],
+): Promise<CompleteAuditGeneration[]> {
+  const unactivated = complete.slice(activated.length);
+  if (unactivated.length === 0) return complete;
+  const pointerPath = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATION_POINTER_FILE));
+  if (active !== undefined) {
+    // Restore the exact pointer sealed by the last activation before removing
+    // a pending promotion that may have replaced it immediately before a crash.
+    await atomicWriteDocument(machineDirectory, AUDIT_GENERATION_POINTER_FILE, renderActiveAuditGeneration(active.pointer));
+  } else if (await entryExists(pointerPath)) {
+    const pointer = await assertRegularDocument(pointerPath);
+    await unlink(pointerPath);
+    await syncDirectory(machineDirectory);
+    const current = await lstat(pointerPath).catch(() => undefined);
+    if (current !== undefined && current.dev === pointer.dev && current.ino === pointer.ino) {
+      throw new Error("Pending audit generation pointer could not be cleared");
+    }
+  }
+  for (const generation of unactivated) {
+    await rm(generation.directory, { recursive: true, force: false });
+  }
+  await syncDirectory(generationRoot);
+  return complete.slice(0, activated.length);
+}
+
 export async function commitAuditGenerationUnderLock(
   input: CommitAuditGenerationInput,
 ): Promise<void> {
   const machineDirectory = await machineStateDirectory(input.rootPath, false);
-  const previous = await readActiveAuditGeneration(input.rootPath, input.projectId);
   const generationRoot = await ensurePrivateDirectory(machineDirectory, AUDIT_GENERATIONS_DIRECTORY);
-  const existing = await readCompleteAuditGenerations(
+  const canonicalRoot = await canonicalProjectRoot(input.rootPath);
+  const key = await authorityKey(input.rootPath, false);
+  const previous = await readActiveAuditGeneration(input.rootPath, input.projectId);
+  let existing = await readCompleteAuditGenerations(
     input.rootPath,
     input.projectId,
     machineDirectory,
-    await canonicalProjectRoot(input.rootPath),
-    await authorityKey(input.rootPath, false),
+    canonicalRoot,
+    key,
   );
   assertAuditGenerationChain(existing);
-  const prior = existing.at(-1);
+  const activated = await readActivatedAuditGenerations(input.projectId, canonicalRoot, key, existing);
+  assertAuditGenerationActivationChain(activated);
+  const activeCommitted = activated.at(-1);
   if (previous !== undefined && (
-    prior === undefined || previous.pointer.generationId !== prior.commit.generationId ||
-    previous.pointer.commitDigest !== prior.commitDigest
+    activeCommitted === undefined || previous.pointer.generationId !== activeCommitted.commit.generationId ||
+    previous.pointer.commitDigest !== activeCommitted.commitDigest
   )) throw new Error("Active audit generation is not the committed head");
+  existing = await discardUnactivatedAuditGenerationsUnderLock(
+    machineDirectory,
+    generationRoot,
+    previous,
+    existing,
+    activated,
+  );
+  const prior = existing.at(-1);
   if (existing.length >= MAX_AUDIT_GENERATIONS) {
     throw new Error("Audit generation retention limit prevents another committed generation");
   }
@@ -1002,8 +1321,6 @@ export async function commitAuditGenerationUnderLock(
   const generationDirectory = assertPathInsideWorkspace(generationRoot, join(generationRoot, generationId));
   await mkdir(generationDirectory, { mode: 0o700 });
   const renderedCatalog = await renderAuthenticatedEvidenceCatalog(input.rootPath, input.projectId, input.catalog);
-  const key = await authorityKey(input.rootPath, false);
-  const canonicalRoot = await canonicalProjectRoot(input.rootPath);
   const relations: AuditGenerationRelations = {
     projectId: input.projectId,
     rootFingerprint: rootFingerprint(canonicalRoot),
@@ -1030,6 +1347,7 @@ export async function commitAuditGenerationUnderLock(
     ...manifestUnsigned,
     signature: auditGenerationManifestSignature(key, manifestUnsigned),
   };
+  let committed = false;
   try {
     await atomicWriteDocument(generationDirectory, SCREEN_REGISTRY_FILE, input.registryMarkdown);
     await atomicWriteDocument(generationDirectory, DRIFT_REPORT_FILE, input.reportMarkdown);
@@ -1056,9 +1374,8 @@ export async function commitAuditGenerationUnderLock(
     throwAuditTransactionFault("after-stage");
     throwAuditTransactionFault("before-pointer");
 
-    // The signed commit record is the durable transition. Once this has been
-    // synced, later pointer replay cannot make an earlier complete generation
-    // authoritative, because readers enumerate and validate this chain first.
+    // A signed commit proves that this generation is complete and durable, but
+    // not active. Activation is a later, separately signed authority step.
     const commitUnsigned: Omit<AuditGenerationCommit, "signature"> = {
       kind: "DESIGN_SHARINGAN_AUDIT_COMMIT",
       ...relations,
@@ -1073,6 +1390,9 @@ export async function commitAuditGenerationUnderLock(
     const commitMarkdown = renderAuditGenerationCommit(commit);
     await atomicWriteDocument(generationDirectory, AUDIT_GENERATION_COMMIT_FILE, commitMarkdown);
     await syncDirectory(generationDirectory);
+    committed = true;
+    throwAuditTransactionFault("after-commit-before-pointer");
+
     const unsigned: Omit<ActiveAuditGeneration, "signature"> = {
       kind: "DESIGN_SHARINGAN_ACTIVE_AUDIT_GENERATION",
       ...relations,
@@ -1085,6 +1405,31 @@ export async function commitAuditGenerationUnderLock(
       signature: activeAuditGenerationSignature(key, unsigned),
     };
     await atomicWriteDocument(machineDirectory, AUDIT_GENERATION_POINTER_FILE, renderActiveAuditGeneration(pointer));
+    throwAuditTransactionFault("after-pointer-before-activation");
+
+    // A complete generation becomes authoritative only here. The activation
+    // seals the exact pointer that was atomically promoted, so a signed commit
+    // left by an interrupted promotion cannot outrank the prior active head.
+    const priorActivation = activated.at(-1);
+    const activationUnsigned: Omit<AuditGenerationActivation, "signature"> = {
+      kind: "DESIGN_SHARINGAN_AUDIT_ACTIVATION",
+      ...relations,
+      commitDigest: documentDigest(commitMarkdown),
+      pointer,
+      previousActivationDigest: priorActivation?.activationDigest ?? AUDIT_GENESIS_DIGEST,
+      activatedAt: new Date().toISOString(),
+    };
+    const activation: AuditGenerationActivation = {
+      ...activationUnsigned,
+      signature: auditGenerationActivationSignature(key, activationUnsigned),
+    };
+    await atomicWriteDocument(
+      generationDirectory,
+      AUDIT_GENERATION_ACTIVATION_FILE,
+      renderAuditGenerationActivation(activation),
+    );
+    await syncDirectory(generationDirectory);
+    // Kept for compatibility with the existing post-authority crash test.
     throwAuditTransactionFault("after-pointer");
 
     // These remain human-readable projections. Readers use the authenticated
@@ -1093,8 +1438,7 @@ export async function commitAuditGenerationUnderLock(
     await atomicWriteDocument(input.governanceDirectory, DRIFT_REPORT_FILE, input.reportMarkdown);
     await atomicWriteDocument(machineDirectory, EVIDENCE_CATALOG_FILE, renderedCatalog.markdown);
   } catch (error) {
-    const active = await readActiveAuditGeneration(input.rootPath, input.projectId).catch(() => undefined);
-    if (active?.pointer.generationId !== generationId) {
+    if (!committed) {
       await rm(generationDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
     throw error;
@@ -1131,6 +1475,30 @@ export async function clearActiveAuditGenerationUnderLock(
   if (active === undefined) return;
   const machineDirectory = await machineStateDirectory(rootPath, false);
   const pointerPath = assertPathInsideWorkspace(machineDirectory, join(machineDirectory, AUDIT_GENERATION_POINTER_FILE));
+  const canonicalRoot = await canonicalProjectRoot(rootPath);
+  const key = await authorityKey(rootPath, false);
+  const complete = await readCompleteAuditGenerations(rootPath, projectId, machineDirectory, canonicalRoot, key);
+  assertAuditGenerationChain(complete);
+  const activated = await readActivatedAuditGenerations(projectId, canonicalRoot, key, complete);
+  assertAuditGenerationActivationChain(activated);
+  const latest = activated.at(-1);
+  if (latest === undefined) throw new Error("Active audit generation has no activation");
+  const invalidationUnsigned: Omit<AuditGenerationInvalidation, "signature"> = {
+    kind: "DESIGN_SHARINGAN_AUDIT_INVALIDATION",
+    projectId,
+    rootFingerprint: rootFingerprint(canonicalRoot),
+    activationDigest: latest.activationDigest,
+    invalidatedAt: new Date().toISOString(),
+  };
+  const invalidation: AuditGenerationInvalidation = {
+    ...invalidationUnsigned,
+    signature: auditGenerationInvalidationSignature(key, invalidationUnsigned),
+  };
+  await atomicWriteDocument(
+    machineDirectory,
+    AUDIT_GENERATION_INVALIDATION_FILE,
+    renderAuditGenerationInvalidation(invalidation),
+  );
   const pointer = await assertRegularDocument(pointerPath);
   await unlink(pointerPath);
   await syncDirectory(machineDirectory);
