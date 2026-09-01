@@ -623,7 +623,7 @@ function isMutationEvidence(value: unknown): value is SafeMutationEvidence {
   );
 }
 
-function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
+export function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
   if (!isSafeBase(value)) return false;
   const session = value as Partial<SafeExecutionSession> & Record<string, unknown>;
   switch (session.status) {

@@ -19,6 +19,7 @@ import {
   type StudioProjectState,
   type WorkspaceKind,
 } from "./project-state";
+import { StudioActivityPanel } from "../activity/studio-activity-panel";
 
 const ProjectStateContext = createContext<StudioProjectState | undefined>(
   undefined,
@@ -166,6 +167,16 @@ export function ProjectShell({
               project.status === "READY"
                 ? "Project ready for a deliberate next action"
                 : "Project configuration required before execution"
+            }
+            activityPanel={
+              <StudioActivityPanel
+                projectId={project.id}
+                currentStatus={
+                  project.status === "READY"
+                    ? "Project ready for a deliberate next action"
+                    : "Project configuration required before execution"
+                }
+              />
             }
           >
             {children}

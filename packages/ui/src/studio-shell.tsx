@@ -8,6 +8,7 @@ export interface StudioShellProps {
   activePath: string;
   context: readonly ContextEntry[];
   activityStatus: string;
+  activityPanel?: ReactNode;
   genome: SidebarGenomeState;
   children: ReactNode;
 }
@@ -17,6 +18,7 @@ export function StudioShell({
   activePath,
   context,
   activityStatus,
+  activityPanel,
   genome,
   children,
 }: StudioShellProps) {
@@ -25,7 +27,7 @@ export function StudioShell({
       <Sidebar project={project} activePath={activePath} genome={genome} />
       <main className="ds-workspace">{children}</main>
       <ContextPanel entries={context} />
-      <ActivityPanel currentStatus={activityStatus} />
+      {activityPanel ?? <ActivityPanel currentStatus={activityStatus} />}
     </div>
   );
 }

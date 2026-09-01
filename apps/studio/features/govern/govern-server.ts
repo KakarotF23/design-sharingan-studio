@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { rm } from "node:fs/promises";
 import type { DriftReport, Project, ReleaseGate } from "@design-sharingan/core";
 import {
@@ -19,6 +20,8 @@ import {
 import {
   collectGovernanceEvidence,
   detectProject,
+  loadSession,
+  saveSession,
   type ProjectWorkspace,
 } from "@design-sharingan/project-adapters";
 import { captureWorkspaceSourceRevision } from "@design-sharingan/render-engine";
@@ -68,6 +71,38 @@ export type GovernanceProjection =
       drift?: DriftReport;
       release?: GovernReleaseProjection;
     };
+
+type GovernanceSessionType = "GENOME_INIT" | "DRIFT_AUDIT" | "RELEASE_GATE";
+
+async function persistGovernanceSession(
+  project: Project,
+  type: GovernanceSessionType,
+  status: string,
+  fingerprint: unknown,
+): Promise<void> {
+  const id = `gov_${createHash("sha256").update(`${type}\u0000${JSON.stringify(fingerprint)}`).digest("hex")}`;
+  try {
+    const existing = await loadSession(project.rootPath, project.id, id);
+    if (existing.type === type && existing.status === status) return;
+    if (existing.type !== type) throw new Error("Governance session identity conflicts with retained evidence");
+    await saveSession(project.rootPath, {
+      ...existing,
+      status,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+    const timestamp = new Date().toISOString();
+    await saveSession(project.rootPath, {
+      id,
+      projectId: project.id,
+      type,
+      status,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+  }
+}
 
 function missingDriftReport(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
@@ -306,7 +341,13 @@ export async function initializeProjectGovernance(
     inspectedScope: result.inspectedScope,
     claimCitations: result.claimCitations,
   });
-  return loadGovernanceProjection(project);
+  const projection = await loadGovernanceProjection(project);
+  if (!projection.initialized) throw new Error("Initialized Genome projection is unavailable");
+  await persistGovernanceSession(project, "GENOME_INIT", projection.genome.status, {
+    payloadHash: projection.genome.payloadHash,
+    status: projection.genome.status,
+  });
+  return projection;
 }
 
 export async function approveProjectGenome(
@@ -319,7 +360,13 @@ export async function approveProjectGenome(
     expectedRevision,
     expectedPayloadHash,
   });
-  return loadGovernanceProjection(project);
+  const projection = await loadGovernanceProjection(project);
+  if (!projection.initialized) throw new Error("Approved Genome projection is unavailable");
+  await persistGovernanceSession(project, "GENOME_INIT", projection.genome.status, {
+    payloadHash: projection.genome.payloadHash,
+    status: projection.genome.status,
+  });
+  return projection;
 }
 
 export async function auditProjectDrift(
@@ -407,11 +454,25 @@ export async function auditProjectDrift(
     report,
     verifiedRegistry,
   });
-  return loadGovernanceProjection(project);
+  const projection = await loadGovernanceProjection(project);
+  if (!projection.initialized || projection.drift === undefined) {
+    throw new Error("Drift audit projection is unavailable");
+  }
+  await persistGovernanceSession(project, "DRIFT_AUDIT", projection.drift.overallStatus, {
+    evidenceIds: projection.drift.evidenceIds,
+    status: projection.drift.overallStatus,
+  });
+  return projection;
 }
 
 export async function evaluateProjectRelease(
   project: Project,
 ): Promise<GovernanceProjection> {
-  return loadGovernanceProjection(project);
+  const projection = await loadGovernanceProjection(project);
+  if (!projection.initialized || projection.release === undefined) return projection;
+  await persistGovernanceSession(project, "RELEASE_GATE", projection.release.status, {
+    checks: projection.release.checks.map(({ name, status, evidence }) => ({ name, status, evidence })),
+    status: projection.release.status,
+  });
+  return projection;
 }

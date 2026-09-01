@@ -10,9 +10,10 @@ import {
   unlink,
 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, extname, join, posix } from "node:path";
 import type {
+  ActivityEvent,
   Approval,
   DesignApproach,
   DesignDNA,
@@ -25,7 +26,12 @@ import type {
   RenderSourcePathEvidence,
   UXImpact,
 } from "@design-sharingan/core";
-import { canTransitionLearnSession } from "@design-sharingan/core";
+import {
+  canTransitionLearnSession,
+  createActivityEvent,
+  orderActivityEvents,
+  validateActivityEvent,
+} from "@design-sharingan/core";
 import { assertPathInsideWorkspace } from "./path-policy";
 
 const MACHINE_DIRECTORY = ".design-sharingan";
@@ -39,6 +45,7 @@ export interface DesignWorkspace {
   projectMetadataPath: string;
   referencesPath: string;
   sessionsPath: string;
+  activityPath: string;
   rendersPath: string;
   cachePath: string;
 }
@@ -65,6 +72,7 @@ function expectedWorkspacePaths(rootPath: string): DesignWorkspace {
     projectMetadataPath: join(machinePath, "project.json"),
     referencesPath: join(machinePath, "references"),
     sessionsPath: join(machinePath, "sessions"),
+    activityPath: join(machinePath, "activity"),
     rendersPath: join(machinePath, "renders"),
     cachePath: join(machinePath, "cache"),
   };
@@ -304,6 +312,11 @@ export async function ensureDesignWorkspace(
     join(machinePath, "sessions"),
     "Sessions directory",
   );
+  const activityPath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "activity"),
+    "Activity directory",
+  );
   const rendersPath = await validateFixedDirectory(
     machinePath,
     join(machinePath, "renders"),
@@ -320,6 +333,7 @@ export async function ensureDesignWorkspace(
     projectMetadataPath: join(machinePath, "project.json"),
     referencesPath,
     sessionsPath,
+    activityPath,
     rendersPath,
     cachePath,
   };
@@ -1082,6 +1096,192 @@ export async function loadReferenceDesignDNA(
   return persisted;
 }
 
+function activityDescriptor(session: DesignSession): {
+  category: ActivityEvent["category"];
+  message: string;
+} {
+  switch (session.type) {
+    case "REFERENCE_SCAN":
+      if (session.status === "ANALYZING") {
+        return { category: "AGENT", message: "Analyzing reference" };
+      }
+      if (session.status === "RESULT_READY") {
+        return { category: "AGENT", message: "Reference analysis evidence saved" };
+      }
+      return { category: "SYSTEM", message: "Reference scan created" };
+    case "ASSIMILATION":
+      return { category: "AGENT", message: "Assimilation evidence saved" };
+    case "FEATURE_EVOLVE":
+      if (session.status === "AWAITING_DECISION") {
+        return { category: "APPROVAL", message: "Waiting for approach approval" };
+      }
+      if (session.status === "APPROVED") {
+        return { category: "APPROVAL", message: "Design approach approved" };
+      }
+      if (session.status === "ANALYZING") {
+        return { category: "AGENT", message: "Analyzing feature impact" };
+      }
+      if (session.status === "REVISE") {
+        return { category: "APPROVAL", message: "Feature direction needs revision" };
+      }
+      if (session.status === "REJECT") {
+        return { category: "APPROVAL", message: "Feature direction rejected" };
+      }
+      return { category: "AGENT", message: "Feature EVOLVE evidence saved" };
+    case "SAFE_EXECUTION":
+      if (session.status === "WAITING_APPROVAL") {
+        return { category: "APPROVAL", message: "Waiting for approval" };
+      }
+      if (session.status === "APPROVED") {
+        return { category: "APPROVAL", message: "Mutation approval recorded" };
+      }
+      if (session.status === "REJECTED") {
+        return { category: "APPROVAL", message: "Mutation proposal rejected" };
+      }
+      if (session.status === "PREPARING") {
+        return { category: "AGENT", message: "Preparing change proposal" };
+      }
+      if (session.status === "PROPOSING") {
+        return { category: "AGENT", message: "Change proposal ready" };
+      }
+      if (session.status === "REVISING") {
+        return { category: "AGENT", message: "Revising change proposal" };
+      }
+      if (session.status === "EDITING") {
+        return { category: "GIT", message: "Safe mutation evidence saved" };
+      }
+      if (session.status === "RUNNING") {
+        return { category: "RENDER", message: "Running project" };
+      }
+      if (session.status === "CAPTURING") {
+        return { category: "RENDER", message: "Capturing configured route" };
+      }
+      if (session.status === "VERIFYING") {
+        return { category: "RENDER", message: "Verifying mutation evidence" };
+      }
+      if (session.status === "COMPLETE") {
+        return { category: "SYSTEM", message: "Safe execution verified" };
+      }
+      return { category: "SYSTEM", message: "Safe execution initialized" };
+    case "MANGEKYO_LOOP":
+      if (session.status === "CAPTURING") {
+        return { category: "RENDER", message: "Capturing configured route" };
+      }
+      if (session.status === "RUNNING") {
+        return { category: "RENDER", message: "Running project" };
+      }
+      if (session.status === "HUMAN_GATE") {
+        return { category: "APPROVAL", message: "Human decision required" };
+      }
+      if (session.status === "COMPARING") {
+        return { category: "AGENT", message: "Comparing render evidence" };
+      }
+      if (session.status === "POLICY_CHECK") {
+        return { category: "APPROVAL", message: "Checking autonomy policy" };
+      }
+      if (session.status === "EDITING") {
+        return { category: "GIT", message: "Applying approved visual change" };
+      }
+      if (session.status === "PREPARING") {
+        return { category: "AGENT", message: "Preparing visual round" };
+      }
+      if (session.status === "DECIDING") {
+        return { category: "AGENT", message: "Evaluating visual findings" };
+      }
+      if (session.status === "FIXING") {
+        return { category: "AGENT", message: "Preparing next visual refinement" };
+      }
+      if (session.status === "COMPLETE") {
+        return { category: "SYSTEM", message: "Visual round verified" };
+      }
+      if (session.status === "BLOCKED") {
+        return { category: "APPROVAL", message: "Mangekyō loop blocked" };
+      }
+      if (session.status === "FAILED") {
+        return { category: "SYSTEM", message: "Mangekyō loop failed" };
+      }
+      return { category: "AGENT", message: "Mangekyō loop initialized" };
+    case "GENOME_INIT":
+      return { category: "GOVERNANCE", message: "Design Genome evidence saved" };
+    case "DRIFT_AUDIT":
+      return { category: "GOVERNANCE", message: "Drift audit evidence saved" };
+    case "RELEASE_GATE":
+      return { category: "GOVERNANCE", message: "Release evidence evaluated" };
+  }
+}
+
+function activityEventForSession(session: DesignSession): ActivityEvent {
+  const descriptor = activityDescriptor(session);
+  const digest = createHash("sha256")
+    .update(`${session.id}\u0000${session.status}\u0000${session.updatedAt}`)
+    .digest("hex");
+  return createActivityEvent({
+    id: `act_${digest}`,
+    projectId: session.projectId,
+    sessionId: session.id,
+    occurredAt: session.updatedAt,
+    category: descriptor.category,
+    message: descriptor.message,
+    evidence: [{ kind: "SESSION", id: session.id }],
+  });
+}
+
+async function persistSessionActivity(
+  workspace: DesignWorkspace,
+  session: DesignSession,
+): Promise<{ path: string; ownership?: { dev: number; ino: number } }> {
+  const event = activityEventForSession(session);
+  const path = assertPathInsideWorkspace(
+    workspace.activityPath,
+    join(workspace.activityPath, `${event.id}.json`),
+  );
+  const contents = stableJson(event);
+  try {
+    const ownership = await atomicCreate(workspace.activityPath, path, contents);
+    return { path, ownership };
+  } catch (error) {
+    if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") {
+      throw error;
+    }
+    const existing = await readBoundedJsonFile(path, "Activity record");
+    if (!validateActivityEvent(existing) || stableJson(existing) !== contents) {
+      throw new Error("Activity event identity conflicts with durable evidence");
+    }
+    return { path };
+  }
+}
+
+/**
+ * Returns a project-scoped, validated, deterministically ordered activity
+ * stream. It never reads caller-supplied paths or exposes artifact contents.
+ */
+export async function listActivityEvents(
+  rootPath: string,
+  projectId: string,
+): Promise<readonly ActivityEvent[]> {
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  const entries = await readdir(workspace.activityPath, { withFileTypes: true });
+  const events = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
+      .map(async (entry) => {
+        const id = entry.name.slice(0, -".json".length);
+        assertSafePathSegment(id, "Activity event id");
+        const path = assertPathInsideWorkspace(workspace.activityPath, join(workspace.activityPath, entry.name));
+        const event = await readBoundedJsonFile(path, "Activity record");
+        if (!validateActivityEvent(event) || event.projectId !== projectId || event.id !== id) {
+          throw new Error("Activity record is invalid");
+        }
+        const session = await loadSession(rootPath, projectId, event.sessionId);
+        if (session.projectId !== event.projectId) {
+          throw new Error("Activity record session does not belong to the active project");
+        }
+        return createActivityEvent(event);
+      }),
+  );
+  return orderActivityEvents(events);
+}
+
 export async function saveSession(
   rootPath: string,
   session: DesignSession,
@@ -1096,7 +1296,15 @@ export async function saveSession(
     join(workspace.sessionsPath, `${session.id}.json`),
   );
   const contents = boundedSessionContents(session);
-  await atomicWrite(workspace.sessionsPath, sessionPath, contents);
+  const activity = await persistSessionActivity(workspace, session);
+  try {
+    await atomicWrite(workspace.sessionsPath, sessionPath, contents);
+  } catch (error) {
+    if (activity.ownership !== undefined) {
+      await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(() => undefined);
+    }
+    throw error;
+  }
   return sessionPath;
 }
 
@@ -1426,6 +1634,17 @@ export async function approveFeatureEvolveApproach(
       join(workspace.sessionsPath, `${executeSession.id}.json`),
     );
     const originalSessionContents = stableJson(existing);
+    const approvalActivity = await persistSessionActivity(workspace, session);
+    let executionActivity: Awaited<ReturnType<typeof persistSessionActivity>>;
+    try {
+      executionActivity = await persistSessionActivity(workspace, executeSession);
+    } catch (error) {
+      if (approvalActivity.ownership !== undefined) {
+        await unlinkCreatedFileIfOwned(approvalActivity.path, approvalActivity.ownership)
+          .catch(() => undefined);
+      }
+      throw error;
+    }
 
     try {
       // The approved Feature EVOLVE record embeds the first-class Approval and
@@ -1441,6 +1660,14 @@ export async function approveFeatureEvolveApproach(
         executeSessionContents,
       );
     } catch (error) {
+      if (executionActivity.ownership !== undefined) {
+        await unlinkCreatedFileIfOwned(executionActivity.path, executionActivity.ownership)
+          .catch(() => undefined);
+      }
+      if (approvalActivity.ownership !== undefined) {
+        await unlinkCreatedFileIfOwned(approvalActivity.path, approvalActivity.ownership)
+          .catch(() => undefined);
+      }
       try {
         await atomicWrite(
           workspace.sessionsPath,
@@ -1535,7 +1762,17 @@ export function isReferenceScanPendingSession(
 ): value is ReferenceScanPendingSession {
   if (!isPersistedSession(value)) return false;
   const session = value as Partial<ReferenceScanPendingSession>;
+  const keys = Object.keys(value);
+  const allowed = [
+    "id", "projectId", "type", "status", "createdAt", "updatedAt",
+    "referenceId", "referenceTitle", "error",
+  ];
+  const required = allowed.filter((key) => key !== "error");
   return (
+    keys.length >= 8 &&
+    keys.length <= 9 &&
+    required.every((key) => keys.includes(key)) &&
+    keys.every((key) => allowed.includes(key)) &&
     session.type === "REFERENCE_SCAN" &&
     (session.status === "DRAFT" || session.status === "ANALYZING") &&
     typeof session.referenceId === "string" &&
@@ -1560,7 +1797,13 @@ export function isReferenceScanResultSession(
 ): value is ReferenceScanResultSession {
   if (!isPersistedSession(value)) return false;
   const session = value as Partial<ReferenceScanResultSession>;
+  const keys = Object.keys(value);
   return (
+    keys.length === 10 &&
+    [
+      "id", "projectId", "type", "status", "createdAt", "updatedAt",
+      "referenceId", "referenceTitle", "designDNA", "agentThreadId",
+    ].every((key) => keys.includes(key)) &&
     session.type === "REFERENCE_SCAN" &&
     session.status === "RESULT_READY" &&
     typeof session.referenceId === "string" &&
@@ -1658,6 +1901,7 @@ export async function commitReferenceScan(
   const originalDesignDNAContents = await readOptionalJsonContents(designDNAPath);
   const finalReferenceContents = stableJson(reference);
   const finalSessionContents = stableJson(session);
+  const activity = await persistSessionActivity(workspace, session);
 
   try {
     await atomicWrite(referencePath, designDNAPath, finalDesignDNAContents);
@@ -1668,6 +1912,11 @@ export async function commitReferenceScan(
     );
     await atomicWrite(workspace.sessionsPath, sessionPath, finalSessionContents);
   } catch (error) {
+    if (activity.ownership !== undefined) {
+      await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(
+        () => undefined,
+      );
+    }
     const rollbackErrors: unknown[] = [];
     await (originalDesignDNAContents === undefined
       ? unlink(designDNAPath).catch((rollbackError: unknown) => {
@@ -1713,19 +1962,25 @@ export async function listSessions(
           entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"),
       )
       .map(async (entry) => {
+        const sessionId = entry.name.slice(0, -".json".length);
+        assertSafePathSegment(sessionId, "Session id");
         const sessionPath = assertPathInsideWorkspace(
           workspace.sessionsPath,
           join(workspace.sessionsPath, entry.name),
         );
         const persisted = await readBoundedJsonFile(sessionPath, "Session record");
-        if (!isPersistedSession(persisted) || persisted.projectId !== projectId) {
+        if (
+          !isPersistedSession(persisted) ||
+          persisted.projectId !== projectId ||
+          persisted.id !== sessionId
+        ) {
           throw new Error("Session record is invalid");
         }
         return persisted;
       }),
   );
   return sessions.sort((left, right) =>
-    right.createdAt.localeCompare(left.createdAt),
+    right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id),
   );
 }
 

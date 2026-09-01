@@ -128,7 +128,7 @@ test("uploads a visual reference, runs SCAN, and saves a report", async ({
   await page.goto((studioPath as string).replace(/\/overview$/, "/reports"));
   await expect(page.getByText("REFERENCE_SCAN", { exact: true })).toBeVisible();
   await expect(page.getByText("Editorial control room", { exact: true })).toBeVisible();
-  await expect(page.getByText("RESULT_READY", { exact: true })).toBeVisible();
+  await expect(page.getByText("COMPLETE", { exact: true }).first()).toBeVisible();
 });
 
 test("project-scoped mutation envelopes stay same-origin, typed, and bounded", async () => {

@@ -6,6 +6,7 @@ export * from "./local-project-adapter";
 export * from "./mangekyo-loop-store";
 export * from "./mangekyo-worker-owner";
 export * from "./path-policy";
+export * from "./report-projection";
 export * from "./safe-execution-store";
 export * from "./types";
 export * from "./workspace-store";
