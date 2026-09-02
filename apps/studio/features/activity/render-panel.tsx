@@ -13,7 +13,7 @@ export function RenderPanel({ session }: { session?: ReportSession }) {
       {renders.length > 0 ? (
         <ul className="render-evidence">
           {renders.map((render) => (
-            <li id={`evidence-${render.kind}-${render.id}`} key={render.id}>
+            <li id={`report-render-${render.id}`} key={render.id}>
               <span>{render.label ?? render.id}</span>
               <small>Retained render evidence</small>
             </li>

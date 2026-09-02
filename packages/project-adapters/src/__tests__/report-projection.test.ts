@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { DesignSession } from "@design-sharingan/core";
 import {
   loadProjectReport,
   redactReportEvidence,
@@ -161,5 +162,76 @@ describe("read-only project report", () => {
 
     await expect(loadProjectReport(root, "project-1", { offset: 0, limit: 25 }))
       .rejects.toThrow(/reference|artifact|invalid/i);
+  });
+
+  // Fix-round probe: a six-field status record is not authenticated
+  // governance truth and must never become a successful report row.
+  it("rejects a forged governance status-shaped checkpoint", async () => {
+    const root = await projectRoot();
+    await saveSession(root, {
+      id: "gov-forged",
+      projectId: "project-1",
+      type: "GENOME_INIT",
+      status: "APPROVED",
+      createdAt: "2026-08-29T12:00:00.000Z",
+      updatedAt: "2026-08-29T12:01:00.000Z",
+    });
+
+    await expect(loadProjectReport(root, "project-1", { offset: 0, limit: 25 }))
+      .rejects.toThrow(/governance|authenticated|authority|checkpoint/i);
+  });
+
+  // Fix-round probe: an explicitly durable error must be visible as a
+  // failure, not as an apparently healthy ANALYZING session.
+  it("projects a durable scan error as FAILED", async () => {
+    const root = await projectRoot();
+    await saveReferenceArtifact(root, {
+      id: "reference-1",
+      projectId: "project-1",
+      title: "Evidence rail",
+      type: "image/png",
+      source: "upload",
+      likes: [],
+      dislikes: [],
+      tags: [],
+      analysisStatus: "UPLOADED",
+      createdAt: "2026-08-29T12:00:00.000Z",
+    }, new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
+    await saveSession(root, {
+      id: "scan-failed",
+      projectId: "project-1",
+      type: "REFERENCE_SCAN",
+      status: "ANALYZING",
+      createdAt: "2026-08-29T12:00:00.000Z",
+      updatedAt: "2026-08-29T12:01:00.000Z",
+      referenceId: "reference-1",
+      referenceTitle: "Evidence rail",
+      error: "The analyzer could not read the reference.",
+    } as DesignSession & { referenceId: string; referenceTitle: string; error: string });
+
+    const report = await loadProjectReport(root, "project-1", { offset: 0, limit: 25 });
+    expect(report.sessions).toEqual([
+      expect.objectContaining({ id: "scan-failed", result: "FAILED" }),
+    ]);
+  });
+
+  // Fix-round probe: ASSIMILATION has no authenticated retained artifact in
+  // v0.1, so the projection must be explicit NOT_VERIFIED rather than throw
+  // or imply completion.
+  it("returns an explicit NOT_VERIFIED fallback for unbound assimilation", async () => {
+    const root = await projectRoot();
+    await saveSession(root, {
+      id: "assimilation-unbound",
+      projectId: "project-1",
+      type: "ASSIMILATION",
+      status: "COMPLETE",
+      createdAt: "2026-08-29T12:00:00.000Z",
+      updatedAt: "2026-08-29T12:01:00.000Z",
+    });
+
+    const report = await loadProjectReport(root, "project-1", { offset: 0, limit: 25 });
+    expect(report.sessions).toEqual([
+      expect.objectContaining({ id: "assimilation-unbound", result: "NOT_VERIFIED" }),
+    ]);
   });
 });

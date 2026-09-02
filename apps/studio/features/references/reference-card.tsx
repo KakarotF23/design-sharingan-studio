@@ -2,7 +2,7 @@ import type { ReferenceView } from "./reference-types";
 
 export function ReferenceCard({ reference }: { reference: ReferenceView }) {
   return (
-    <article className="reference-card">
+    <article id={`reference-${reference.id}`} className="reference-card">
       <div className="reference-card__preview">
         <img
           src={`/projects/${encodeURIComponent(reference.projectId)}/references/image/${encodeURIComponent(reference.id)}`}

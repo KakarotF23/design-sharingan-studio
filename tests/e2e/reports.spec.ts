@@ -70,7 +70,27 @@ test("projects fake SCAN and Safe Mode evidence without inventing a verified res
   await expect(page.getByText("Render evidence is unavailable for this session.")).toBeVisible();
   await expect(page.getByText("Thinking…", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: /REFERENCE_SCAN/ }).click();
+  const scanEvidenceLink = page.getByRole("link", { name: "Report reference" });
+  const scanEvidenceTarget = await scanEvidenceLink.getAttribute("href");
+  expect(scanEvidenceTarget).toMatch(/\/references#reference-/);
+  await scanEvidenceLink.click();
+  await expect(page).toHaveURL(/\/references#reference-/);
+  await expect(page.locator(`[id="${(scanEvidenceTarget as string).split("#")[1]}"]`)).toBeVisible();
+  await page.goto((studioPath as string).replace(/\/overview$/, "/reports"));
   await expect(page.getByText("Reference analysis evidence saved")).toBeVisible();
+  await page.getByRole("button", { name: /FEATURE_EVOLVE/ }).click();
+  const linkedSafeEvidence = page.getByRole("link", { name: "Authenticated Safe execution" });
+  const linkedSafeTarget = await linkedSafeEvidence.getAttribute("href");
+  expect(linkedSafeTarget).toMatch(/\?session=[^#]+#report-session-/);
+  await linkedSafeEvidence.click();
+  await expect(page).toHaveURL(/\/reports\?session=[^#]+#report-session-/);
+  await expect(page.getByRole("heading", { name: "SAFE EXECUTION" })).toBeVisible();
+  await page.getByRole("button", { name: /SAFE_EXECUTION/ }).click();
+  const safeEvidenceLink = page.getByRole("link", { name: "Mutation evidence" });
+  const safeEvidenceTarget = await safeEvidenceLink.getAttribute("href");
+  expect(safeEvidenceTarget).toMatch(/^#report-git-/);
+  await safeEvidenceLink.click();
+  await expect(page.locator(safeEvidenceTarget as string)).toBeVisible();
 
   await page.addStyleTag({ content: "nextjs-portal { display: none !important; }" });
   await page.screenshot({ path: "test-results/task-14-reports-desktop.png", fullPage: true });

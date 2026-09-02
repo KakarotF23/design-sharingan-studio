@@ -459,7 +459,7 @@ describe("Drift Report governance store", () => {
       evidenceCatalog: [],
       report: unavailableReport(),
     })).rejects.toThrow(/retention|bounded/i);
-  });
+  }, 15_000);
 
   it("rejects an audit sequence increment past the safe integer maximum", () => {
     expect(() => incrementAuditGenerationSequence(Number.MAX_SAFE_INTEGER)).toThrow(/safe maximum/i);

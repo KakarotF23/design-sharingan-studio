@@ -5,6 +5,7 @@ import type {
   DesignSession,
   DesignSessionType,
 } from "@design-sharingan/core";
+import { isDesignSessionEnvelope } from "@design-sharingan/core";
 import { listActivityEvents } from "./workspace-store";
 import {
   isFeatureEvolveApprovedSession,
@@ -18,7 +19,10 @@ import {
   listSessions,
 } from "./workspace-store";
 import { isMangekyoLoopSession, loadMangekyoLoopSession } from "./mangekyo-loop-store";
-import { isSafeExecutionSession, loadSafeExecutionState } from "./safe-execution-store";
+import {
+  isSafeExecutionSession,
+  loadSafeExecutionHistory,
+} from "./safe-execution-store";
 
 const MAX_PAGE_SIZE = 50;
 const MAX_EVIDENCE = 32;
@@ -59,6 +63,7 @@ export interface ReportSession {
   filesChanged: string[];
   approvals: ReportApproval[];
   visualRounds: number;
+  error?: string;
   git?: ReportGitEvidence;
 }
 
@@ -68,6 +73,12 @@ export interface ReportGitEvidence {
   statusBefore: string;
   statusAfter: string;
   diffAfter: string;
+  truncation: {
+    branch: { truncated: boolean; limitBytes: number; originalBytes: number; retainedBytes: number };
+    statusBefore: { truncated: boolean; limitBytes: number; originalBytes: number; retainedBytes: number };
+    statusAfter: { truncated: boolean; limitBytes: number; originalBytes: number; retainedBytes: number };
+    diffAfter: { truncated: boolean; limitBytes: number; originalBytes: number; retainedBytes: number };
+  };
   note?: string;
 }
 
@@ -84,10 +95,26 @@ export interface ReportPage {
   limit: number;
 }
 
+export type GovernanceSessionAuthenticator = (
+  rootPath: string,
+  projectId: string,
+  session: DesignSession,
+) => Promise<void>;
+
+export interface ReportProjectionOptions {
+  authenticateGovernanceSession?: GovernanceSessionAuthenticator;
+}
+
 function boundedUnique(values: readonly string[], maximum: number): string[] {
-  return [...new Set(values.filter((value) => typeof value === "string" && value.length > 0))]
-    .sort((left, right) => left.localeCompare(right))
-    .slice(0, maximum);
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string" || value.length === 0 || seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+    if (result.length >= maximum) break;
+  }
+  return result;
 }
 
 export function redactReportEvidence(value: string): string {
@@ -127,12 +154,23 @@ function stableJson(value: unknown): string {
   return JSON.stringify(sort(value));
 }
 
-function resultFor(status: string): ReportSessionResult {
+function resultFor(session: DesignSession): ReportSessionResult {
+  const record = session as unknown as Record<string, unknown>;
+  if (typeof record.error === "string" && record.error.trim().length > 0) return "FAILED";
+  // Safe Mode retains an APPROVED checkpoint when execution is indeterminate so
+  // the target cannot be replayed. That durable reconciliation state is a
+  // failure outcome in Reports, even though the approval itself remains part
+  // of the audit trail.
+  if (session.type === "SAFE_EXECUTION" && Object.hasOwn(record, "executionFailure")) {
+    return "FAILED";
+  }
+  if (session.type === "ASSIMILATION") return "NOT_VERIFIED";
+  const status = session.status;
   if (["DRAFT", "IDLE", "PREPARING", "PROPOSING", "POLICY_CHECK", "FIXING"].includes(status)) return "PENDING";
   if (["ANALYZING", "EDITING", "RUNNING", "CAPTURING", "COMPARING", "DECIDING", "REVISING"].includes(status)) return "IN_PROGRESS";
   if (["WAITING_APPROVAL", "AWAITING_DECISION", "HUMAN_GATE"].includes(status)) return "AWAITING_APPROVAL";
   if (status === "APPROVED") return "APPROVED";
-  if (status === "COMPLETE" || status === "RESULT_READY") return "COMPLETE";
+  if (status === "COMPLETE" || status === "RESULT_READY" || status === "PASS" || status === "PASS_WITH_DEBT") return "COMPLETE";
   if (status === "REJECTED") return "REJECTED";
   if (status === "BLOCKED") return "BLOCKED";
   if (status === "FAILED") return "FAILED";
@@ -141,17 +179,28 @@ function resultFor(status: string): ReportSessionResult {
 
 function isGovernanceReportSession(session: DesignSession): boolean {
   const value = session as unknown as Record<string, unknown>;
-  const required = ["id", "projectId", "type", "status", "createdAt", "updatedAt"];
+  const required = [
+    "id",
+    "projectId",
+    "type",
+    "status",
+    "createdAt",
+    "updatedAt",
+    "entityId",
+    "revision",
+    "artifactFingerprint",
+    "rootFingerprint",
+  ];
   return (
     Object.keys(value).length === required.length &&
     required.every((key) => Object.hasOwn(value, key)) &&
+    isDesignSessionEnvelope(session) &&
     GOVERNANCE_SESSION_TYPES.includes(session.type as (typeof GOVERNANCE_SESSION_TYPES)[number]) &&
-    CANONICAL_IDENTIFIER.test(session.id) &&
-    CANONICAL_IDENTIFIER.test(session.projectId) &&
-    typeof session.status === "string" && session.status.length > 0 && session.status.length <= 64 &&
-    new Date(session.createdAt).toISOString() === session.createdAt &&
-    new Date(session.updatedAt).toISOString() === session.updatedAt &&
-    Date.parse(session.updatedAt) >= Date.parse(session.createdAt)
+    CANONICAL_IDENTIFIER.test(String(value.entityId)) &&
+    Number.isSafeInteger(value.revision) &&
+    (value.revision as number) > 0 &&
+    typeof value.artifactFingerprint === "string" && /^[a-f0-9]{64}$/.test(value.artifactFingerprint) &&
+    typeof value.rootFingerprint === "string" && /^[a-f0-9]{64}$/.test(value.rootFingerprint)
   );
 }
 
@@ -164,7 +213,7 @@ function baseReport(session: DesignSession): ReportSession {
     id: session.id,
     type: session.type,
     status: session.status,
-    result: resultFor(session.status),
+    result: resultFor(session),
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
     durationMs,
@@ -172,6 +221,9 @@ function baseReport(session: DesignSession): ReportSession {
     filesChanged: [],
     approvals: [],
     visualRounds: 0,
+    ...((session as unknown as { error?: unknown }).error && typeof (session as unknown as { error?: unknown }).error === "string"
+      ? { error: redactReportEvidence((session as unknown as { error: string }).error) }
+      : {}),
   };
 }
 
@@ -198,13 +250,19 @@ function reportForSession(session: DesignSession): ReportSession {
       report.evidence = boundedEvidence([
         ...report.evidence,
         { kind: "APPROVAL", id: session.approval.id, label: "Design approach approval" },
+        { kind: "SESSION", id: session.executeSessionId, label: "Authenticated Safe execution" },
       ]);
     }
     return report;
   }
+  if (session.type === "ASSIMILATION") return report;
   if (isSafeExecutionSession(session)) {
     const proposal = "proposal" in session ? session.proposal : undefined;
     const mutation = "mutationEvidence" in session ? session.mutationEvidence : undefined;
+    const executionFailure = "executionFailure" in session ? session.executionFailure : undefined;
+    if (executionFailure !== undefined) {
+      report.error = redactReportEvidence(executionFailure.reason);
+    }
     const approvals = [
       ...("mutationApproval" in session ? [session.mutationApproval] : []),
       ...("decisionApproval" in session ? [session.decisionApproval] : []),
@@ -224,11 +282,12 @@ function reportForSession(session: DesignSession): ReportSession {
     if (mutation !== undefined) {
       report.git = {
         available: mutation.git.available,
-        ...(mutation.git.branch === undefined ? {} : { branch: redactReportEvidence(mutation.git.branch) }),
-        statusBefore: redactReportEvidence(mutation.git.statusBefore),
-        statusAfter: redactReportEvidence(mutation.git.statusAfter),
-        diffAfter: redactReportEvidence(mutation.git.diffAfter),
-        ...(mutation.git.note === undefined ? {} : { note: redactReportEvidence(mutation.git.note) }),
+        ...(mutation.git.branch === undefined ? {} : { branch: mutation.git.branch }),
+        statusBefore: mutation.git.statusBefore,
+        statusAfter: mutation.git.statusAfter,
+        diffAfter: mutation.git.diffAfter,
+        truncation: mutation.git.truncation,
+        ...(mutation.git.note === undefined ? {} : { note: mutation.git.note }),
       };
     }
     return report;
@@ -259,6 +318,10 @@ function reportForSession(session: DesignSession): ReportSession {
     return report;
   }
   if (isGovernanceReportSession(session)) return report;
+  if (
+    (session.status === "FAILED" || session.status === "NOT_VERIFIED") &&
+    typeof (session as unknown as { error?: unknown }).error === "string"
+  ) return report;
   throw new Error("Report session type or durable artifact is not recognized");
 }
 
@@ -323,19 +386,51 @@ async function assertAuthenticatedSessions(
   rootPath: string,
   projectId: string,
   sessions: readonly DesignSession[],
+  options: ReportProjectionOptions,
 ): Promise<void> {
-  const safeSessions = sessions.filter(({ type }) => type === "SAFE_EXECUTION");
-  if (safeSessions.length > 0) {
-    const safe = await loadSafeExecutionState(rootPath, projectId);
-    if (safeSessions.length !== 1 || safeSessions[0]?.id !== safe.id) {
-      throw new Error("Safe execution report evidence is ambiguous");
+  const safeSessions = sessions.filter(({ type, status }) =>
+    type === "SAFE_EXECUTION" && status !== "FAILED" && status !== "NOT_VERIFIED",
+  );
+  const safeHistory = safeSessions.length > 0
+    ? await loadSafeExecutionHistory(rootPath, projectId)
+    : [];
+  const safeById = new Map(safeHistory.map((session) => [session.id, session]));
+  for (const safeSession of safeSessions) {
+    if (!safeById.has(safeSession.id)) throw new Error("Safe execution report evidence is invalid");
+  }
+  for (const session of sessions) {
+    if (session.type === "FEATURE_EVOLVE" && session.status === "APPROVED") {
+      if (!isFeatureEvolveApprovedSession(session)) throw new Error("Approved Feature EVOLVE report evidence is invalid");
+      const selectedApproach = session.approaches.find(
+        (approach) => approach.id === session.approvedApproachId,
+      );
+      if (
+        selectedApproach === undefined ||
+        session.approval.decision !== "APPROVED" ||
+        session.approval.scope !== "DESIGN_APPROACH" ||
+        session.approval.proposalId !== selectedApproach.id
+      ) throw new Error("Approved Feature EVOLVE report is missing its approved Design Approach relation");
+      const linked = safeById.get(session.executeSessionId);
+      if (linked === undefined || linked.sourceSessionId !== session.id ||
+        linked.approvedApproachId !== session.approvedApproachId ||
+        linked.approvalId !== session.approval.id) {
+        throw new Error("Approved Feature EVOLVE report is missing its authenticated Safe execution");
+      }
     }
   }
-  await Promise.all(sessions.filter(({ type }) => type === "MANGEKYO_LOOP").map(async (session) => {
+  for (const session of sessions.filter(({ type }) => type === "MANGEKYO_LOOP")) {
     const authenticated = await loadMangekyoLoopSession(rootPath, projectId, session.id);
     if (authenticated.id !== session.id) throw new Error("Mangekyō report evidence is invalid");
-  }));
-  await Promise.all(sessions.map((session) => assertReferenceEvidence(rootPath, projectId, session)));
+  }
+  for (const session of sessions) {
+    if (GOVERNANCE_SESSION_TYPES.includes(session.type as (typeof GOVERNANCE_SESSION_TYPES)[number])) {
+      if (options.authenticateGovernanceSession === undefined) {
+        throw new Error("Governance report evidence requires an authenticated loader");
+      }
+      await options.authenticateGovernanceSession(rootPath, projectId, session);
+    }
+    await assertReferenceEvidence(rootPath, projectId, session);
+  }
   for (const session of sessions) reportForSession(session);
 }
 
@@ -348,10 +443,11 @@ export async function loadProjectReport(
   rootPath: string,
   projectId: string,
   page: ReportPage,
+  options: ReportProjectionOptions = {},
 ): Promise<ProjectReport> {
   assertPage(page);
   const sessions = await listSessions(rootPath, projectId);
-  await assertAuthenticatedSessions(rootPath, projectId, sessions);
+  await assertAuthenticatedSessions(rootPath, projectId, sessions, options);
   const selected = sessions.slice(page.offset, page.offset + page.limit);
   const visibleSessionIds = new Set(selected.map(({ id }) => id));
   const [activity, reportSessions] = await Promise.all([

@@ -2305,6 +2305,12 @@ textarea:focus-visible {
   border-bottom: 1px solid var(--steel);
 }
 
+.session-ledger__header > div,
+.session-detail__header > div,
+.report-panel__header > div {
+  min-width: 0;
+}
+
 .session-ledger__header h2,
 .session-detail__header h2,
 .report-panel__header h2 {
@@ -2313,6 +2319,7 @@ textarea:focus-visible {
   font-size: 1.6rem;
   letter-spacing: -0.03em;
   line-height: 0.94;
+  overflow-wrap: anywhere;
 }
 
 .session-ledger__header > span,
@@ -2338,6 +2345,7 @@ textarea:focus-visible {
 }
 
 .session-list button {
+  min-width: 0;
   width: 100%;
   display: grid;
   gap: 0.5rem;
@@ -2358,6 +2366,7 @@ textarea:focus-visible {
 
 .session-list__meta,
 .session-list__status {
+  min-width: 0;
   display: flex;
   justify-content: space-between;
   gap: 0.8rem;
@@ -2368,12 +2377,14 @@ textarea:focus-visible {
 }
 
 .session-list__meta time {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .session-list strong {
+  min-width: 0;
   padding: 0;
   border: 0;
   color: var(--bone);
@@ -2381,6 +2392,7 @@ textarea:focus-visible {
   font-size: 1.2rem;
   font-weight: 500;
   letter-spacing: -0.025em;
+  overflow-wrap: anywhere;
 }
 
 .session-list__status {
@@ -2445,23 +2457,29 @@ textarea:focus-visible {
 }
 
 .session-detail__group li {
+  min-width: 0;
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 1rem;
   color: var(--muted);
   font-size: 0.72rem;
+  overflow-wrap: anywhere;
 }
 
 .session-detail__group a {
+  min-width: 0;
   color: var(--bone);
+  overflow-wrap: anywhere;
 }
 
 .session-detail__group li > span,
 .session-detail__group time {
+  min-width: 0;
   color: var(--dimmed);
   font-family: var(--font-mono);
   font-size: 0.58rem;
+  overflow-wrap: anywhere;
 }
 
 .session-detail__group p {
@@ -2470,9 +2488,25 @@ textarea:focus-visible {
   font-size: 0.72rem;
 }
 
+.session-detail__error pre {
+  max-height: 8rem;
+  overflow: auto;
+  margin: 0.65rem 0 0;
+  padding: 0.7rem;
+  border: 1px solid #5a3035;
+  color: #e2b9bc;
+  background: #1d1216;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .session-detail__files li {
   color: #d5b986;
   font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 .reports-workspace__panels {
@@ -2513,9 +2547,11 @@ textarea:focus-visible {
 
 .activity-log strong,
 .render-evidence span {
+  min-width: 0;
   font-size: 0.78rem;
   font-weight: 500;
   line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .git-evidence p {
@@ -2523,6 +2559,7 @@ textarea:focus-visible {
   color: var(--muted);
   font-family: var(--font-mono);
   font-size: 0.65rem;
+  overflow-wrap: anywhere;
 }
 
 .git-evidence pre {
@@ -2538,6 +2575,46 @@ textarea:focus-visible {
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.git-evidence__facts,
+.git-evidence__truncation {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0.85rem 0 0;
+}
+
+.git-evidence__facts > div,
+.git-evidence__truncation > div {
+  min-width: 0;
+}
+
+.git-evidence__facts dt,
+.git-evidence__truncation dt {
+  margin-bottom: 0.35rem;
+  color: var(--dimmed);
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.git-evidence__facts dd,
+.git-evidence__truncation dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.git-evidence__facts pre {
+  max-height: 7rem;
+}
+
+.git-evidence__truncation {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.58rem;
+  line-height: 1.4;
 }
 
 @media (max-width: 48rem) {
@@ -2602,6 +2679,10 @@ textarea:focus-visible {
   .session-detail__facts div {
     border-right: 0;
     border-bottom: 1px solid var(--steel);
+  }
+
+  .git-evidence__truncation {
+    grid-template-columns: 1fr;
   }
 
   .drift-view .govern-section-heading,

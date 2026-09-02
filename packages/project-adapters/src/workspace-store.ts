@@ -3,7 +3,6 @@ import {
   link,
   mkdir,
   open,
-  readFile,
   readdir,
   realpath,
   rename,
@@ -29,6 +28,9 @@ import type {
 import {
   canTransitionLearnSession,
   createActivityEvent,
+  isCanonicalIdentifier,
+  isCanonicalIsoDateTime,
+  isDesignSessionEnvelope,
   orderActivityEvents,
   validateActivityEvent,
 } from "@design-sharingan/core";
@@ -38,6 +40,20 @@ const MACHINE_DIRECTORY = ".design-sharingan";
 const MAX_REFERENCE_BYTES = 10 * 1024 * 1024;
 const MAX_RECORD_BYTES = 1024 * 1024;
 const MAX_RENDER_BYTES = 25 * 1024 * 1024;
+const MAX_SESSION_HISTORY_ENTRIES = 512;
+const MAX_ACTIVITY_HISTORY_ENTRIES = 1_024;
+const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
+const CHECKPOINT_SUFFIX = ".checkpoint.json";
+const ACTIVITY_ID_PATTERN = /^act_[a-f0-9]{64}$/;
+
+interface SessionCheckpoint {
+  eventId: string;
+  sessionId: string;
+  projectId: string;
+  version: number;
+  sessionHash: string;
+  session: DesignSession;
+}
 
 export interface DesignWorkspace {
   rootPath: string;
@@ -137,6 +153,14 @@ async function atomicWrite(
     ),
   );
   let temporaryFile: Awaited<ReturnType<typeof open>> | undefined;
+  const destinationBefore = await lstat(canonicalDestination).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (destinationBefore !== undefined &&
+    (!destinationBefore.isFile() || destinationBefore.isSymbolicLink() || destinationBefore.nlink !== 1)) {
+    throw new Error("Runtime record destination is not a private regular file");
+  }
 
   try {
     temporaryFile = await open(temporaryPath, "wx", 0o600);
@@ -144,7 +168,29 @@ async function atomicWrite(
     await temporaryFile.sync();
     await temporaryFile.close();
     temporaryFile = undefined;
+    const destinationAtCommit = await lstat(canonicalDestination).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (
+      destinationBefore === undefined
+        ? destinationAtCommit !== undefined
+        : destinationAtCommit === undefined ||
+          destinationAtCommit.dev !== destinationBefore.dev ||
+          destinationAtCommit.ino !== destinationBefore.ino ||
+          destinationAtCommit.nlink !== 1
+    ) {
+      throw new Error("Runtime record destination changed before atomic commit");
+    }
     await rename(temporaryPath, canonicalDestination);
+    const destinationAfter = await lstat(canonicalDestination);
+    if (
+      destinationAfter.isSymbolicLink() ||
+      !destinationAfter.isFile() ||
+      destinationAfter.nlink !== 1
+    ) {
+      throw new Error("Runtime record destination is not a private regular file after commit");
+    }
   } catch (error) {
     if (temporaryFile !== undefined) {
       await temporaryFile.close().catch(() => undefined);
@@ -191,6 +237,16 @@ async function atomicCreate(
     temporaryFile = undefined;
     await link(temporaryPath, canonicalDestination);
     await unlink(temporaryPath).catch(() => undefined);
+    const destination = await lstat(canonicalDestination);
+    if (
+      destination.isSymbolicLink() ||
+      !destination.isFile() ||
+      destination.nlink !== 1 ||
+      destination.dev !== ownership.dev ||
+      destination.ino !== ownership.ino
+    ) {
+      throw new Error("Runtime record could not be committed as a private regular file");
+    }
     return ownership;
   } catch (error) {
     if (temporaryFile !== undefined) {
@@ -205,6 +261,9 @@ async function unlinkCreatedFileIfOwned(
   path: string,
   ownership: { dev: number; ino: number },
 ): Promise<void> {
+  // Give an interleaved writer that observed the newly-created inode a chance
+  // to publish its replacement before ownership is checked for rollback.
+  await new Promise<void>((resolve) => setImmediate(resolve));
   let entry: Awaited<ReturnType<typeof lstat>>;
   try {
     entry = await lstat(path);
@@ -272,8 +331,8 @@ async function validateProjectMetadataFile(
   const metadataPath = workspace.projectMetadataPath;
   if (await pathExists(metadataPath)) {
     const entry = await lstat(metadataPath);
-    if (entry.isSymbolicLink()) {
-      throw new Error("Workspace project metadata must not be a symbolic link");
+    if (entry.isSymbolicLink() || entry.nlink !== 1) {
+      throw new Error("Workspace project metadata must be a private regular file, not a symbolic link or hard link");
     }
     if (!entry.isFile()) {
       throw new Error("Workspace project metadata must be a regular file");
@@ -283,8 +342,8 @@ async function validateProjectMetadataFile(
   }
 
   const createdEntry = await lstat(metadataPath);
-  if (createdEntry.isSymbolicLink()) {
-    throw new Error("Workspace project metadata must not be a symbolic link");
+  if (createdEntry.isSymbolicLink() || createdEntry.nlink !== 1) {
+    throw new Error("Workspace project metadata must be a private regular file, not a symbolic link or hard link");
   }
   if (!createdEntry.isFile()) {
     throw new Error("Workspace project metadata must be a regular file");
@@ -527,7 +586,7 @@ export async function loadProjectMetadata(
     }
 
     const pathEntry = await lstat(workspace.projectMetadataPath);
-    if (pathEntry.isSymbolicLink() || !pathEntry.isFile()) {
+    if (pathEntry.isSymbolicLink() || !pathEntry.isFile() || pathEntry.nlink !== 1) {
       throw invalidProjectIdentity();
     }
     metadataHandle = await open(
@@ -537,6 +596,7 @@ export async function loadProjectMetadata(
     const handleEntry = await metadataHandle.stat();
     if (
       !handleEntry.isFile() ||
+      handleEntry.nlink !== 1 ||
       handleEntry.dev !== pathEntry.dev ||
       handleEntry.ino !== pathEntry.ino
     ) {
@@ -546,6 +606,17 @@ export async function loadProjectMetadata(
     const persisted: unknown = JSON.parse(
       await metadataHandle.readFile({ encoding: "utf8" }),
     );
+    const currentEntry = await lstat(workspace.projectMetadataPath);
+    if (
+      currentEntry.isSymbolicLink() ||
+      !currentEntry.isFile() ||
+      currentEntry.nlink !== 1 ||
+      currentEntry.dev !== handleEntry.dev ||
+      currentEntry.ino !== handleEntry.ino ||
+      currentEntry.size !== handleEntry.size
+    ) {
+      throw invalidProjectIdentity();
+    }
     if (
       !isPersistedProject(persisted) ||
       persisted.id !== expectedProjectId ||
@@ -574,9 +645,10 @@ async function loadValidatedProjectContext(
   const workspace = await ensureDesignWorkspace(rootPath);
 
   try {
-    const persisted = JSON.parse(
-      await readFile(workspace.projectMetadataPath, "utf8"),
-    ) as unknown;
+    const persisted = await readBoundedJsonFile(
+      workspace.projectMetadataPath,
+      "Workspace project metadata",
+    );
     if (
       persisted === null ||
       typeof persisted !== "object" ||
@@ -708,6 +780,7 @@ async function readBoundedJsonFile(path: string, label: string): Promise<unknown
   if (
     pathEntry.isSymbolicLink() ||
     !pathEntry.isFile() ||
+    pathEntry.nlink !== 1 ||
     pathEntry.size > MAX_RECORD_BYTES
   ) {
     throw new Error(`${label} is invalid`);
@@ -717,13 +790,31 @@ async function readBoundedJsonFile(path: string, label: string): Promise<unknown
     const handleEntry = await handle.stat();
     if (
       !handleEntry.isFile() ||
+      handleEntry.nlink !== 1 ||
       handleEntry.dev !== pathEntry.dev ||
       handleEntry.ino !== pathEntry.ino ||
       handleEntry.size > MAX_RECORD_BYTES
     ) {
       throw new Error(`${label} changed while reading`);
     }
-    return JSON.parse(await handle.readFile({ encoding: "utf8" })) as unknown;
+    const contents = await handle.readFile({ encoding: "utf8" });
+    let current: Awaited<ReturnType<typeof lstat>>;
+    try {
+      current = await lstat(path);
+    } catch {
+      throw new Error(`${label} changed while reading`);
+    }
+    if (
+      current.isSymbolicLink() ||
+      !current.isFile() ||
+      current.nlink !== 1 ||
+      current.dev !== handleEntry.dev ||
+      current.ino !== handleEntry.ino ||
+      current.size !== handleEntry.size
+    ) {
+      throw new Error(`${label} changed while reading`);
+    }
+    return JSON.parse(contents) as unknown;
   } finally {
     await handle.close().catch(() => undefined);
   }
@@ -759,18 +850,7 @@ function isPersistedReference(value: unknown): value is Reference {
 }
 
 function isPersistedSession(value: unknown): value is DesignSession {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const session = value as Partial<DesignSession>;
-  return (
-    typeof session.id === "string" &&
-    typeof session.projectId === "string" &&
-    typeof session.type === "string" &&
-    typeof session.status === "string" &&
-    typeof session.createdAt === "string" &&
-    typeof session.updatedAt === "string"
-  );
+  return isDesignSessionEnvelope(value);
 }
 
 function isPersistedDesignDNA(value: unknown): value is DesignDNA {
@@ -989,6 +1069,7 @@ export async function loadReferenceImage(
   if (
     pathEntry.isSymbolicLink() ||
     !pathEntry.isFile() ||
+    pathEntry.nlink !== 1 ||
     pathEntry.size === 0 ||
     pathEntry.size > MAX_REFERENCE_BYTES
   ) {
@@ -1002,6 +1083,7 @@ export async function loadReferenceImage(
     const handleEntry = await handle.stat();
     if (
       !handleEntry.isFile() ||
+      handleEntry.nlink !== 1 ||
       handleEntry.dev !== pathEntry.dev ||
       handleEntry.ino !== pathEntry.ino ||
       handleEntry.size !== pathEntry.size
@@ -1009,6 +1091,17 @@ export async function loadReferenceImage(
       throw new Error("Reference image artifact changed while reading");
     }
     const bytes = new Uint8Array(await handle.readFile());
+    const current = await lstat(imagePath);
+    if (
+      current.isSymbolicLink() ||
+      !current.isFile() ||
+      current.nlink !== 1 ||
+      current.dev !== handleEntry.dev ||
+      current.ino !== handleEntry.ino ||
+      current.size !== handleEntry.size
+    ) {
+      throw new Error("Reference image artifact changed while reading");
+    }
     validateReferenceImage(reference.type, bytes);
     return { bytes, type: reference.type };
   } finally {
@@ -1100,6 +1193,25 @@ function activityDescriptor(session: DesignSession): {
   category: ActivityEvent["category"];
   message: string;
 } {
+  const error = (session as DesignSession & { error?: unknown }).error;
+  const hasSafeExecutionFailure = session.type === "SAFE_EXECUTION" &&
+    Object.hasOwn(session as object, "executionFailure");
+  if (
+    (typeof error === "string" && error.trim().length > 0) ||
+    session.status === "FAILED" ||
+    hasSafeExecutionFailure
+  ) {
+    return {
+      category: "SYSTEM",
+      message: `${session.type.replaceAll("_", " ")} failed`,
+    };
+  }
+  if (session.status === "NOT_VERIFIED") {
+    return {
+      category: "SYSTEM",
+      message: `${session.type.replaceAll("_", " ")} not verified`,
+    };
+  }
   switch (session.type) {
     case "REFERENCE_SCAN":
       if (session.status === "ANALYZING") {
@@ -1110,7 +1222,7 @@ function activityDescriptor(session: DesignSession): {
       }
       return { category: "SYSTEM", message: "Reference scan created" };
     case "ASSIMILATION":
-      return { category: "AGENT", message: "Assimilation evidence saved" };
+      return { category: "AGENT", message: "Assimilation not verified" };
     case "FEATURE_EVOLVE":
       if (session.status === "AWAITING_DECISION") {
         return { category: "APPROVAL", message: "Waiting for approach approval" };
@@ -1210,10 +1322,18 @@ function activityDescriptor(session: DesignSession): {
   }
 }
 
-function activityEventForSession(session: DesignSession): ActivityEvent {
+function sessionCheckpointHash(session: DesignSession): string {
+  return createHash("sha256").update(stableJson(session), "utf8").digest("hex");
+}
+
+function activityEventForSession(
+  session: DesignSession,
+  checkpointHash: string,
+  checkpointVersion: number,
+): ActivityEvent {
   const descriptor = activityDescriptor(session);
   const digest = createHash("sha256")
-    .update(`${session.id}\u0000${session.status}\u0000${session.updatedAt}`)
+    .update(`${checkpointHash}\u0000${checkpointVersion}`)
     .digest("hex");
   return createActivityEvent({
     id: `act_${digest}`,
@@ -1226,28 +1346,211 @@ function activityEventForSession(session: DesignSession): ActivityEvent {
   });
 }
 
+function isSessionCheckpoint(value: unknown): value is SessionCheckpoint {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<SessionCheckpoint>;
+  const keys = Object.keys(value).sort();
+  return keys.length === 6 &&
+    keys.join("\u0000") === [
+      "eventId",
+      "projectId",
+      "session",
+      "sessionHash",
+      "sessionId",
+      "version",
+    ].join("\u0000") &&
+    typeof record.eventId === "string" && ACTIVITY_ID_PATTERN.test(record.eventId) &&
+    typeof record.projectId === "string" && isDesignSessionEnvelope(record.session) &&
+    typeof record.sessionId === "string" && isDesignSessionEnvelope(record.session) &&
+    record.session.id === record.sessionId && record.session.projectId === record.projectId &&
+    typeof record.version === "number" && Number.isSafeInteger(record.version) &&
+    record.version > 0 && record.version <= MAX_SESSION_HISTORY_ENTRIES &&
+    typeof record.sessionHash === "string" && /^[a-f0-9]{64}$/.test(record.sessionHash) &&
+    record.sessionHash === sessionCheckpointHash(record.session);
+}
+
+interface BoundedFileEntry {
+  name: string;
+  path: string;
+  size: number;
+}
+
+async function boundedJsonDirectory(
+  directory: string,
+  label: string,
+  maximumEntries: number,
+): Promise<BoundedFileEntry[]> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  if (entries.length > maximumEntries) {
+    throw new Error(`${label} exceeds the bounded history entry budget`);
+  }
+  const candidates = entries.filter((entry) => entry.name.endsWith(".json"));
+  if (candidates.length > maximumEntries) {
+    throw new Error(`${label} exceeds the bounded history entry budget`);
+  }
+  const files: BoundedFileEntry[] = [];
+  let aggregateBytes = 0;
+  for (const entry of candidates) {
+    const path = assertPathInsideWorkspace(directory, join(directory, entry.name));
+    const identity = await lstat(path);
+    if (identity.isSymbolicLink() || !identity.isFile() || identity.nlink !== 1) {
+      throw new Error(`${label} contains an unsafe runtime record`);
+    }
+    if (identity.size > MAX_RECORD_BYTES) {
+      throw new Error(`${label} contains an oversized runtime record`);
+    }
+    aggregateBytes += identity.size;
+    if (aggregateBytes > MAX_HISTORY_BYTES) {
+      throw new Error(`${label} exceeds the bounded history byte budget`);
+    }
+    files.push({ name: entry.name, path, size: identity.size });
+  }
+  return files;
+}
+
+async function readSessionCheckpoints(
+  workspace: DesignWorkspace,
+  projectId?: string,
+): Promise<SessionCheckpoint[]> {
+  const files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_HISTORY_ENTRIES,
+  );
+  const checkpoints: SessionCheckpoint[] = [];
+  for (const file of files.filter(({ name }) => name.endsWith(CHECKPOINT_SUFFIX))) {
+    const value = await readBoundedJsonFile(file.path, "Session checkpoint");
+    if (!isSessionCheckpoint(value)) throw new Error("Session checkpoint is invalid");
+    const expectedFileName = `${value.eventId}${CHECKPOINT_SUFFIX}`;
+    if (file.name !== expectedFileName) throw new Error("Session checkpoint filename is invalid");
+    if (projectId !== undefined && value.projectId !== projectId) {
+      throw new Error("Session checkpoint project identity is invalid");
+    }
+    checkpoints.push(value);
+  }
+  return checkpoints;
+}
+
+/**
+ * Check the two-file activity journal before any caller consumes it. A
+ * checkpoint and event are deliberately separate immutable records, so an
+ * interrupted write must be either fully present or rejected as an orphan.
+ */
+async function assertActivityJournalPairing(
+  projectId: string,
+  files: BoundedFileEntry[],
+  checkpoints: readonly SessionCheckpoint[],
+): Promise<void> {
+  const events = new Set<string>();
+  const checkpointsByEvent = new Map(
+    checkpoints.map((checkpoint) => [checkpoint.eventId, checkpoint]),
+  );
+  for (const file of files.filter(({ name }) => !name.endsWith(CHECKPOINT_SUFFIX))) {
+    const id = file.name.slice(0, -".json".length);
+    if (!ACTIVITY_ID_PATTERN.test(id)) throw new Error("Activity event identity is invalid");
+    const value = await readBoundedJsonFile(file.path, "Activity record");
+    if (!validateActivityEvent(value) || value.projectId !== projectId || value.id !== id) {
+      throw new Error("Activity record is invalid");
+    }
+    if (!checkpointsByEvent.has(id)) {
+      throw new Error("Activity record checkpoint is missing");
+    }
+    events.add(id);
+  }
+  for (const checkpoint of checkpoints) {
+    if (checkpoint.projectId !== projectId || !events.has(checkpoint.eventId)) {
+      throw new Error("Activity checkpoint is orphaned or belongs to another project");
+    }
+  }
+}
+
 async function persistSessionActivity(
   workspace: DesignWorkspace,
   session: DesignSession,
-): Promise<{ path: string; ownership?: { dev: number; ino: number } }> {
-  const event = activityEventForSession(session);
+): Promise<{
+  path: string;
+  ownership?: { dev: number; ino: number };
+  checkpointPath: string;
+  checkpointOwnership?: { dev: number; ino: number };
+}> {
+  const checkpointHash = sessionCheckpointHash(session);
+  const files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_HISTORY_ENTRIES,
+  );
+  const checkpoints = await readSessionCheckpoints(workspace, session.projectId);
+  await assertActivityJournalPairing(session.projectId, files, checkpoints);
+  const sessionCheckpoints = checkpoints.filter(
+    (checkpoint) => checkpoint.sessionId === session.id && checkpoint.projectId === session.projectId,
+  );
+  const latestVersion = Math.max(0, ...sessionCheckpoints.map((checkpoint) => checkpoint.version));
+  const matchingCheckpoint = sessionCheckpoints.find(
+    (checkpoint) => checkpoint.sessionId === session.id &&
+      checkpoint.projectId === session.projectId &&
+      checkpoint.sessionHash === checkpointHash &&
+      stableJson(checkpoint.session) === stableJson(session),
+  );
+  // A retry of the current head is idempotent. A deliberate rollback to an
+  // earlier immutable checkpoint receives a new version so the head remains
+  // monotonic and its event remains auditable.
+  const existingCheckpoint = matchingCheckpoint !== undefined &&
+    matchingCheckpoint.version === latestVersion ? matchingCheckpoint : undefined;
+  const checkpointVersion = existingCheckpoint?.version ?? latestVersion + 1;
+  if (checkpointVersion > MAX_SESSION_HISTORY_ENTRIES) {
+    throw new Error("Session checkpoint history exceeds its bounded entry budget");
+  }
+  const event = activityEventForSession(session, checkpointHash, checkpointVersion);
   const path = assertPathInsideWorkspace(
     workspace.activityPath,
     join(workspace.activityPath, `${event.id}.json`),
   );
+  const checkpointPath = assertPathInsideWorkspace(
+    workspace.activityPath,
+    join(workspace.activityPath, `${event.id}${CHECKPOINT_SUFFIX}`),
+  );
   const contents = stableJson(event);
+  const checkpointContents = stableJson({
+    eventId: event.id,
+    sessionId: session.id,
+    projectId: session.projectId,
+    version: checkpointVersion,
+    sessionHash: checkpointHash,
+    session,
+  } satisfies SessionCheckpoint);
+  if (existingCheckpoint !== undefined && existingCheckpoint.eventId !== event.id) {
+    throw new Error("Session checkpoint identity could not be reproduced");
+  }
+  let checkpointOwnership: { dev: number; ino: number } | undefined;
   try {
-    const ownership = await atomicCreate(workspace.activityPath, path, contents);
-    return { path, ownership };
+    if (existingCheckpoint === undefined) {
+      checkpointOwnership = await atomicCreate(
+        workspace.activityPath,
+        checkpointPath,
+        checkpointContents,
+      );
+    }
+    try {
+      const ownership = await atomicCreate(workspace.activityPath, path, contents);
+      return { path, ownership, checkpointPath, checkpointOwnership };
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+      const existing = await readBoundedJsonFile(path, "Activity record");
+      const existingCheckpointValue = await readBoundedJsonFile(checkpointPath, "Session checkpoint");
+      if (
+        !validateActivityEvent(existing) || stableJson(existing) !== contents ||
+        !isSessionCheckpoint(existingCheckpointValue) ||
+        stableJson(existingCheckpointValue) !== checkpointContents
+      ) {
+        throw new Error("Activity event identity conflicts with durable evidence");
+      }
+      return { path, checkpointPath, checkpointOwnership };
+    }
   } catch (error) {
-    if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") {
-      throw error;
+    if (checkpointOwnership !== undefined) {
+      await unlinkCreatedFileIfOwned(checkpointPath, checkpointOwnership).catch(() => undefined);
     }
-    const existing = await readBoundedJsonFile(path, "Activity record");
-    if (!validateActivityEvent(existing) || stableJson(existing) !== contents) {
-      throw new Error("Activity event identity conflicts with durable evidence");
-    }
-    return { path };
+    throw error;
   }
 }
 
@@ -1260,25 +1563,55 @@ export async function listActivityEvents(
   projectId: string,
 ): Promise<readonly ActivityEvent[]> {
   const workspace = await loadValidatedProjectContext(rootPath, projectId);
-  const entries = await readdir(workspace.activityPath, { withFileTypes: true });
-  const events = await Promise.all(
-    entries
-      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
-      .map(async (entry) => {
-        const id = entry.name.slice(0, -".json".length);
-        assertSafePathSegment(id, "Activity event id");
-        const path = assertPathInsideWorkspace(workspace.activityPath, join(workspace.activityPath, entry.name));
-        const event = await readBoundedJsonFile(path, "Activity record");
-        if (!validateActivityEvent(event) || event.projectId !== projectId || event.id !== id) {
-          throw new Error("Activity record is invalid");
-        }
-        const session = await loadSession(rootPath, projectId, event.sessionId);
-        if (session.projectId !== event.projectId) {
-          throw new Error("Activity record session does not belong to the active project");
-        }
-        return createActivityEvent(event);
-      }),
+  const files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_HISTORY_ENTRIES,
   );
+  const checkpoints = await readSessionCheckpoints(workspace, projectId);
+  await assertActivityJournalPairing(projectId, files, checkpoints);
+  const checkpointsByEvent = new Map(checkpoints.map((checkpoint) => [checkpoint.eventId, checkpoint]));
+  const latestBySession = new Map<string, SessionCheckpoint>();
+  for (const checkpoint of checkpoints) {
+    const previous = latestBySession.get(checkpoint.sessionId);
+    if (previous !== undefined && previous.version === checkpoint.version && previous.eventId !== checkpoint.eventId) {
+      throw new Error("Session checkpoint versions are ambiguous");
+    }
+    if (previous === undefined || checkpoint.version > previous.version) latestBySession.set(checkpoint.sessionId, checkpoint);
+  }
+  const events: ActivityEvent[] = [];
+  for (const file of files.filter(({ name }) => !name.endsWith(CHECKPOINT_SUFFIX))) {
+    const id = file.name.slice(0, -".json".length);
+    if (!ACTIVITY_ID_PATTERN.test(id)) throw new Error("Activity event identity is invalid");
+    const event = await readBoundedJsonFile(file.path, "Activity record");
+    if (!validateActivityEvent(event) || event.projectId !== projectId || event.id !== id) {
+      throw new Error("Activity record is invalid");
+    }
+    const checkpoint = checkpointsByEvent.get(id);
+    if (checkpoint === undefined) throw new Error("Activity record checkpoint is missing");
+    const expected = activityEventForSession(checkpoint.session, checkpoint.sessionHash, checkpoint.version);
+    if (stableJson(expected) !== stableJson(event)) {
+      throw new Error("Activity record is stale or does not match its session checkpoint");
+    }
+    events.push(createActivityEvent(event));
+  }
+  // Every historical event is authenticated by its own immutable checkpoint;
+  // only the current session head must match the newest checkpoint. This keeps
+  // durable history readable after legitimate later transitions while still
+  // rejecting orphaned or directly replaced session records.
+  const sessions = await listSessions(rootPath, projectId, false);
+  const sessionsById = new Map(sessions.map((session) => [session.id, session]));
+  for (const [sessionId, latest] of latestBySession) {
+    const session = sessionsById.get(sessionId);
+    if (session === undefined || latest.sessionHash !== sessionCheckpointHash(session)) {
+      throw new Error("Session record does not match its latest immutable checkpoint");
+    }
+  }
+  for (const session of sessions) {
+    if (!latestBySession.has(session.id)) {
+      throw new Error("Session record checkpoint is missing");
+    }
+  }
   return orderActivityEvents(events);
 }
 
@@ -1287,6 +1620,9 @@ export async function saveSession(
   session: DesignSession,
 ): Promise<string> {
   assertSafePathSegment(session.id, "Session id");
+  if (!isDesignSessionEnvelope(session)) {
+    throw new Error("Session record envelope is invalid (including canonical timestamps)");
+  }
   const workspace = await loadValidatedProjectContext(
     rootPath,
     session.projectId,
@@ -1302,6 +1638,9 @@ export async function saveSession(
   } catch (error) {
     if (activity.ownership !== undefined) {
       await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(() => undefined);
+    }
+    if (activity.checkpointOwnership !== undefined) {
+      await unlinkCreatedFileIfOwned(activity.checkpointPath, activity.checkpointOwnership).catch(() => undefined);
     }
     throw error;
   }
@@ -1330,23 +1669,53 @@ export async function loadSession(
   return persisted;
 }
 
+async function withLearnTransitionClaim<T>(
+  rootPath: string,
+  projectId: string,
+  sessionId: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const workspace = await ensureDesignWorkspace(rootPath);
+  const claimPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `.${sessionId}.learn.claim`),
+  );
+  let claim: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    claim = await open(claimPath, "wx", 0o600);
+    await claim.writeFile(`${projectId}\n`, "utf8");
+    await claim.sync();
+    return await action();
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      throw new Error("Learn session transition is already in progress", { cause: error });
+    }
+    throw error;
+  } finally {
+    await claim?.close().catch(() => undefined);
+    await unlink(claimPath).catch(() => undefined);
+  }
+}
+
 export async function transitionLearnSession(
   rootPath: string,
   expectedStatus: LearnSessionStatus,
   session: DesignSession & { status: LearnSessionStatus },
 ): Promise<string> {
-  const existing = await loadSession(rootPath, session.projectId, session.id);
-  if (
-    existing.type !== session.type ||
-    existing.status !== expectedStatus ||
-    existing.createdAt !== session.createdAt ||
-    !canTransitionLearnSession(expectedStatus, session.status)
-  ) {
-    throw new Error(
-      `Learn session identity or transition from ${existing.status} to ${session.status} is invalid`,
-    );
-  }
-  return saveSession(rootPath, session);
+  return withLearnTransitionClaim(rootPath, session.projectId, session.id, async () => {
+    const existing = await loadSession(rootPath, session.projectId, session.id);
+    if (
+      existing.type !== session.type ||
+      existing.status !== expectedStatus ||
+      existing.createdAt !== session.createdAt ||
+      !canTransitionLearnSession(expectedStatus, session.status)
+    ) {
+      throw new Error(
+        `Learn session identity or transition from ${existing.status} to ${session.status} is invalid`,
+      );
+    }
+    return saveSession(rootPath, session);
+  });
 }
 
 interface FeatureEvolveSessionBase extends DesignSession {
@@ -1525,21 +1894,23 @@ export async function commitFeatureEvolveResult(
   ) {
     throw new Error("Feature EVOLVE result evidence is incomplete");
   }
-  const existing = await loadSession(rootPath, session.projectId, session.id);
-  if (
-    !isFeatureEvolvePendingSession(existing) ||
-    existing.status !== "ANALYZING" ||
-    existing.type !== session.type ||
-    existing.createdAt !== session.createdAt ||
-    stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
-    stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
-    !canTransitionLearnSession("ANALYZING", session.status)
-  ) {
-    throw new Error(
-      "Feature EVOLVE result requires a matching ANALYZING session",
-    );
-  }
-  await saveSession(rootPath, session);
+  await withLearnTransitionClaim(rootPath, session.projectId, session.id, async () => {
+    const existing = await loadSession(rootPath, session.projectId, session.id);
+    if (
+      !isFeatureEvolvePendingSession(existing) ||
+      existing.status !== "ANALYZING" ||
+      existing.type !== session.type ||
+      existing.createdAt !== session.createdAt ||
+      stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
+      stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
+      !canTransitionLearnSession("ANALYZING", session.status)
+    ) {
+      throw new Error(
+        "Feature EVOLVE result requires a matching ANALYZING session",
+      );
+    }
+    await saveSession(rootPath, session);
+  });
 }
 
 export async function approveFeatureEvolveApproach(
@@ -1556,7 +1927,7 @@ export async function approveFeatureEvolveApproach(
     !isApproval(approval) ||
     !isSafeExecutionDraftSession(executeSession)
   ) {
-    throw new Error("Feature EVOLVE approval checkpoint is incomplete");
+    throw new Error("Feature EVOLVE approval checkpoint is incomplete or has invalid timestamps");
   }
   if (
     session.updatedAt !== approval.createdAt ||
@@ -1643,6 +2014,12 @@ export async function approveFeatureEvolveApproach(
         await unlinkCreatedFileIfOwned(approvalActivity.path, approvalActivity.ownership)
           .catch(() => undefined);
       }
+      if (approvalActivity.checkpointOwnership !== undefined) {
+        await unlinkCreatedFileIfOwned(
+          approvalActivity.checkpointPath,
+          approvalActivity.checkpointOwnership,
+        ).catch(() => undefined);
+      }
       throw error;
     }
 
@@ -1664,9 +2041,21 @@ export async function approveFeatureEvolveApproach(
         await unlinkCreatedFileIfOwned(executionActivity.path, executionActivity.ownership)
           .catch(() => undefined);
       }
+      if (executionActivity.checkpointOwnership !== undefined) {
+        await unlinkCreatedFileIfOwned(
+          executionActivity.checkpointPath,
+          executionActivity.checkpointOwnership,
+        ).catch(() => undefined);
+      }
       if (approvalActivity.ownership !== undefined) {
         await unlinkCreatedFileIfOwned(approvalActivity.path, approvalActivity.ownership)
           .catch(() => undefined);
+      }
+      if (approvalActivity.checkpointOwnership !== undefined) {
+        await unlinkCreatedFileIfOwned(
+          approvalActivity.checkpointPath,
+          approvalActivity.checkpointOwnership,
+        ).catch(() => undefined);
       }
       try {
         await atomicWrite(
@@ -1917,6 +2306,12 @@ export async function commitReferenceScan(
         () => undefined,
       );
     }
+    if (activity.checkpointOwnership !== undefined) {
+      await unlinkCreatedFileIfOwned(
+        activity.checkpointPath,
+        activity.checkpointOwnership,
+      ).catch(() => undefined);
+    }
     const rollbackErrors: unknown[] = [];
     await (originalDesignDNAContents === undefined
       ? unlink(designDNAPath).catch((rollbackError: unknown) => {
@@ -1952,36 +2347,263 @@ export async function commitReferenceScan(
 export async function listSessions(
   rootPath: string,
   projectId: string,
+  verifyActivity = true,
 ): Promise<DesignSession[]> {
   const workspace = await loadValidatedProjectContext(rootPath, projectId);
-  const entries = await readdir(workspace.sessionsPath, { withFileTypes: true });
-  const sessions = await Promise.all(
-    entries
-      .filter(
-        (entry) =>
-          entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"),
-      )
-      .map(async (entry) => {
-        const sessionId = entry.name.slice(0, -".json".length);
-        assertSafePathSegment(sessionId, "Session id");
-        const sessionPath = assertPathInsideWorkspace(
-          workspace.sessionsPath,
-          join(workspace.sessionsPath, entry.name),
-        );
-        const persisted = await readBoundedJsonFile(sessionPath, "Session record");
-        if (
-          !isPersistedSession(persisted) ||
-          persisted.projectId !== projectId ||
-          persisted.id !== sessionId
-        ) {
-          throw new Error("Session record is invalid");
-        }
-        return persisted;
-      }),
+  const files = await boundedJsonDirectory(
+    workspace.sessionsPath,
+    "Session history",
+    MAX_SESSION_HISTORY_ENTRIES,
   );
+  const sessions: DesignSession[] = [];
+  for (const file of files) {
+    const sessionId = file.name.slice(0, -".json".length);
+    assertSafePathSegment(sessionId, "Session id");
+    const persisted = await readBoundedJsonFile(file.path, "Session record");
+    if (
+      !isPersistedSession(persisted) ||
+      persisted.projectId !== projectId ||
+      persisted.id !== sessionId
+    ) {
+      throw new Error("Session record is invalid");
+    }
+    sessions.push(persisted);
+  }
+  if (verifyActivity) {
+    const activityFiles = await boundedJsonDirectory(
+      workspace.activityPath,
+      "Activity history",
+      MAX_ACTIVITY_HISTORY_ENTRIES,
+    );
+    const checkpoints = await readSessionCheckpoints(workspace, projectId);
+    await assertActivityJournalPairing(projectId, activityFiles, checkpoints);
+    const latestBySession = new Map<string, SessionCheckpoint>();
+    for (const checkpoint of checkpoints) {
+      if (checkpoint.projectId !== projectId) continue;
+      const previous = latestBySession.get(checkpoint.sessionId);
+      if (previous !== undefined && previous.version === checkpoint.version && previous.eventId !== checkpoint.eventId) {
+        throw new Error("Session checkpoint versions are ambiguous");
+      }
+      if (previous === undefined || checkpoint.version > previous.version) {
+        latestBySession.set(checkpoint.sessionId, checkpoint);
+      }
+    }
+    for (const session of sessions) {
+      const latest = latestBySession.get(session.id);
+      if (latest === undefined || latest.sessionHash !== sessionCheckpointHash(session)) {
+        throw new Error("Session record does not match its latest immutable checkpoint");
+      }
+    }
+  }
   return sessions.sort((left, right) =>
     right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id),
   );
+}
+
+const RENDER_INTEGRITY_SUFFIX = ".integrity.json";
+
+interface RenderIntegrityRecord {
+  artifactId: string;
+  sessionId: string;
+  roundId: string;
+  route: string;
+  state: "default";
+  viewport: string;
+  viewportWidth: number;
+  viewportHeight: number;
+  imagePath: string;
+  capturedAt: string;
+  sourceRevisionFingerprint: string | null;
+  contentHash: string;
+  byteLength: number;
+}
+
+function renderMetadataPath(imagePath: string): string {
+  const extension = extname(imagePath);
+  return join(
+    dirname(imagePath),
+    `${basename(imagePath, extension)}${extension === ".json" ? ".metadata" : ""}.json`,
+  );
+}
+
+function renderIntegrityPath(imagePath: string): string {
+  const extension = extname(imagePath);
+  return join(
+    dirname(imagePath),
+    `${basename(imagePath, extension)}${extension === ".json" ? ".metadata" : ""}${RENDER_INTEGRITY_SUFFIX}`,
+  );
+}
+
+function renderIntegrityFor(
+  metadata: RenderArtifact,
+  bytes: Uint8Array,
+): RenderIntegrityRecord {
+  return {
+    artifactId: metadata.id,
+    sessionId: metadata.sessionId,
+    roundId: metadata.roundId,
+    route: metadata.route,
+    state: "default",
+    viewport: metadata.viewport,
+    viewportWidth: metadata.viewportWidth,
+    viewportHeight: metadata.viewportHeight,
+    imagePath: metadata.imagePath,
+    capturedAt: metadata.capturedAt,
+    sourceRevisionFingerprint: metadata.sourceRevision.available === true
+      ? metadata.sourceRevision.worktreeFingerprint
+      : null,
+    contentHash: createHash("sha256").update(bytes).digest("hex"),
+    byteLength: bytes.byteLength,
+  };
+}
+
+function isRenderIntegrity(value: unknown): value is RenderIntegrityRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<RenderIntegrityRecord>;
+  const keys = Object.keys(value).sort();
+  return keys.join("\u0000") === [
+    "artifactId",
+    "byteLength",
+    "capturedAt",
+    "contentHash",
+    "imagePath",
+    "roundId",
+    "route",
+    "sessionId",
+    "sourceRevisionFingerprint",
+    "state",
+    "viewport",
+    "viewportHeight",
+    "viewportWidth",
+  ].join("\u0000") &&
+    typeof record.artifactId === "string" && isCanonicalIdentifier(record.artifactId) &&
+    typeof record.sessionId === "string" && isCanonicalIdentifier(record.sessionId) &&
+    typeof record.roundId === "string" && isCanonicalIdentifier(record.roundId) &&
+    typeof record.route === "string" && record.route.startsWith("/") &&
+    record.state === "default" &&
+    typeof record.viewport === "string" && isCanonicalIdentifier(record.viewport) &&
+    Number.isSafeInteger(record.viewportWidth) && Number.isSafeInteger(record.viewportHeight) &&
+    typeof record.imagePath === "string" &&
+    typeof record.capturedAt === "string" &&
+    (record.sourceRevisionFingerprint === null || /^[a-f0-9]{64}$/.test(record.sourceRevisionFingerprint ?? "")) &&
+    typeof record.contentHash === "string" && /^[a-f0-9]{64}$/.test(record.contentHash) &&
+    typeof record.byteLength === "number" && Number.isSafeInteger(record.byteLength) &&
+    record.byteLength >= 24 && record.byteLength <= MAX_RENDER_BYTES;
+}
+
+async function readBoundedBinaryFile(
+  path: string,
+  label: string,
+  maximumBytes: number,
+): Promise<Uint8Array> {
+  const pathEntry = await lstat(path);
+  if (
+    pathEntry.isSymbolicLink() || !pathEntry.isFile() || pathEntry.nlink !== 1 ||
+    pathEntry.size > maximumBytes
+  ) throw new Error(`${label} is invalid`);
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (
+      opened.isSymbolicLink?.() || !opened.isFile() || opened.nlink !== 1 ||
+      opened.dev !== pathEntry.dev || opened.ino !== pathEntry.ino || opened.size !== pathEntry.size
+    ) throw new Error(`${label} changed while reading`);
+    const bytes = new Uint8Array(await handle.readFile());
+    const current = await lstat(path);
+    if (
+      current.isSymbolicLink() || !current.isFile() || current.nlink !== 1 ||
+      current.dev !== opened.dev || current.ino !== opened.ino || current.size !== opened.size
+    ) throw new Error(`${label} changed while reading`);
+    return bytes;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function assertPngBytesAndDimensions(
+  bytes: Uint8Array,
+  width: number,
+  height: number,
+): void {
+  if (
+    bytes.byteLength < 24 ||
+    ![137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte) ||
+    bytes[12] !== 73 || bytes[13] !== 72 || bytes[14] !== 68 || bytes[15] !== 82
+  ) throw new Error("Render artifact bytes must be a non-empty PNG");
+  const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (header.getUint32(16) !== width || header.getUint32(20) !== height) {
+    throw new Error("Render artifact PNG dimensions do not match metadata dimensions");
+  }
+}
+
+/** Revalidate the immutable image, metadata sidecar, and digest sidecar. */
+export async function assertRenderArtifactIntegrity(
+  rootPath: string,
+  metadata: RenderArtifact,
+): Promise<void> {
+  if (!isRenderArtifactMetadata(metadata)) {
+    throw new Error("Render metadata sidecar identity is invalid");
+  }
+  const workspace = await ensureDesignWorkspace(rootPath);
+  assertSafePathSegment(metadata.sessionId, "Render session id");
+  assertSafePathSegment(metadata.roundId, "Render round id");
+  assertSafePathSegment(metadata.viewport, "Render viewport");
+  const expectedPath = assertPathInsideWorkspace(
+    workspace.rendersPath,
+    join(workspace.rendersPath, metadata.sessionId, metadata.roundId, `${metadata.viewport}.png`),
+  );
+  const imagePath = assertPathInsideWorkspace(workspace.rendersPath, metadata.imagePath);
+  if (imagePath !== expectedPath) throw new Error("Render artifact path identity is invalid");
+  const canonical = await realpath(imagePath);
+  if (canonical !== imagePath) throw new Error("Render artifact path is not canonical");
+  const imageEntry = await lstat(imagePath);
+  if (
+    imageEntry.isSymbolicLink() || !imageEntry.isFile() || imageEntry.nlink !== 1 ||
+    imageEntry.size < 24 || imageEntry.size > MAX_RENDER_BYTES
+  ) throw new Error("Render artifact is not an authenticated project-scoped file");
+  const persistedMetadata = await readBoundedJsonFile(
+    renderMetadataPath(imagePath),
+    "Render metadata",
+  );
+  if (
+    !isRenderArtifactMetadata(persistedMetadata) ||
+    stableJson(persistedMetadata) !== stableJson({ ...metadata, imagePath })
+  ) throw new Error("Render metadata sidecar identity does not match the session artifact");
+  const integrityPath = renderIntegrityPath(imagePath);
+  const integrityValue = await readBoundedJsonFile(integrityPath, "Render integrity sidecar");
+  if (!isRenderIntegrity(integrityValue)) throw new Error("Render integrity sidecar is invalid");
+  const bytes = await readBoundedBinaryFile(imagePath, "Render artifact", MAX_RENDER_BYTES);
+  assertPngBytesAndDimensions(bytes, metadata.viewportWidth, metadata.viewportHeight);
+  const expectedIntegrity = renderIntegrityFor({ ...metadata, imagePath }, bytes);
+  if (stableJson(integrityValue) !== stableJson(expectedIntegrity)) {
+    throw new Error("Render artifact bytes or sidecar integrity does not match authenticated evidence");
+  }
+}
+
+function isRenderArtifactMetadata(value: unknown): value is RenderArtifact {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<RenderArtifact>;
+  const keys = Object.keys(value).sort();
+  return keys.join("\u0000") === [
+    "capturedAt",
+    "id",
+    "imagePath",
+    "roundId",
+    "route",
+    "sessionId",
+    "sourceRevision",
+    "viewport",
+    "viewportHeight",
+    "viewportWidth",
+  ].join("\u0000") &&
+    typeof record.id === "string" && isCanonicalIdentifier(record.id) &&
+    typeof record.sessionId === "string" && isCanonicalIdentifier(record.sessionId) &&
+    typeof record.roundId === "string" && isCanonicalIdentifier(record.roundId) &&
+    typeof record.route === "string" && record.route.startsWith("/") &&
+    typeof record.viewport === "string" && isCanonicalIdentifier(record.viewport) &&
+    Number.isSafeInteger(record.viewportWidth) && Number.isSafeInteger(record.viewportHeight) &&
+    typeof record.imagePath === "string" && typeof record.capturedAt === "string" &&
+    isCanonicalIsoDateTime(record.capturedAt) && record.sourceRevision !== undefined;
 }
 
 export async function saveRenderArtifact(
@@ -2171,7 +2793,20 @@ export async function saveRenderArtifact(
     throw new Error("Render artifact must use the exact render artifact path");
   }
   const artifactDirectory = dirname(artifactPath);
-  await mkdir(artifactDirectory, { recursive: true });
+  const sessionDirectory = assertPathInsideWorkspace(
+    workspace.rendersPath,
+    join(workspace.rendersPath, metadata.sessionId),
+  );
+  await validateFixedDirectory(
+    workspace.rendersPath,
+    sessionDirectory,
+    "Render session directory",
+  );
+  await validateFixedDirectory(
+    sessionDirectory,
+    artifactDirectory,
+    "Render round directory",
+  );
 
   const artifactExtension = extname(artifactPath);
   const metadataPath = assertPathInsideWorkspace(
@@ -2183,21 +2818,35 @@ export async function saveRenderArtifact(
       }.json`,
     ),
   );
+  const integrityPath = assertPathInsideWorkspace(
+    workspace.rendersPath,
+    renderIntegrityPath(artifactPath),
+  );
 
   const persistedMetadata = {
     ...metadata,
     imagePath: artifactPath,
   };
   const metadataContents = stableJson(persistedMetadata);
+  const integrityContents = stableJson(renderIntegrityFor(persistedMetadata, bytes));
   if (Buffer.byteLength(metadataContents, "utf8") > MAX_RECORD_BYTES) {
     throw new Error("Render artifact metadata is too large; maximum size is 1 MiB");
   }
 
   let artifactOwnership: { dev: number; ino: number } | undefined;
+  let metadataOwnership: { dev: number; ino: number } | undefined;
+  let integrityOwnership: { dev: number; ino: number } | undefined;
   try {
     artifactOwnership = await atomicCreate(workspace.rendersPath, artifactPath, bytes);
-    await atomicCreate(workspace.rendersPath, metadataPath, metadataContents);
+    metadataOwnership = await atomicCreate(workspace.rendersPath, metadataPath, metadataContents);
+    integrityOwnership = await atomicCreate(workspace.rendersPath, integrityPath, integrityContents);
   } catch (error) {
+    if (integrityOwnership !== undefined) {
+      await unlinkCreatedFileIfOwned(integrityPath, integrityOwnership).catch(() => undefined);
+    }
+    if (metadataOwnership !== undefined) {
+      await unlinkCreatedFileIfOwned(metadataPath, metadataOwnership).catch(() => undefined);
+    }
     if (artifactOwnership !== undefined) {
       try {
         await unlinkCreatedFileIfOwned(artifactPath, artifactOwnership);

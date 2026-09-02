@@ -13,6 +13,7 @@ import type {
 import {
   approveAndExecuteSafeProposal,
   decideSafeExecutionProposal,
+  loadSafeExecutionHistory,
   loadSafeExecutionState,
   prepareSafeExecutionProposal,
 } from "../safe-execution-store";
@@ -25,6 +26,7 @@ import {
   saveProjectMetadata,
   saveSession,
 } from "../workspace-store";
+import { loadProjectReport } from "../report-projection";
 import type {
   FeatureEvolveApprovedSession,
   SafeExecutionDraftSession,
@@ -725,6 +727,77 @@ describe("Safe execution human decisions", () => {
       ),
     ).rejects.toThrow(/not waiting/i);
     expect(replayExecutions).toBe(0);
+  });
+
+  it("projects a durably retained Safe execution failure as FAILED", async () => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    await expect(
+      approveAndExecuteSafeProposal(
+        rootPath,
+        project.id,
+        waiting.id,
+        mutationApproval(),
+        async () => {
+          throw new Error("unclassified executor transport failure");
+        },
+      ),
+    ).rejects.toThrow(/transport failure/i);
+
+    const report = await loadProjectReport(rootPath, project.id, {
+      offset: 0,
+      limit: 25,
+    });
+    expect(report.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: waiting.id,
+        result: "FAILED",
+        error: expect.stringMatching(/execution|reconciliation|transport/i),
+      }),
+    ]));
+    expect(report.activity).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sessionId: waiting.id,
+        category: "SYSTEM",
+        message: "SAFE EXECUTION failed",
+      }),
+    ]));
+  });
+
+  it("retains multiple authenticated Safe histories for Reports while the active loader stays singleton", async () => {
+    const { rootPath, project, execute } = await initializedExecution();
+    const secondApproval = {
+      ...((await loadSession(rootPath, project.id, "feature-session-1")) as FeatureEvolveApprovedSession).approval,
+      id: "approval-design-2",
+      createdAt: "2026-08-25T02:00:00.000Z",
+    };
+    const firstSource = (await loadSession(
+      rootPath,
+      project.id,
+      "feature-session-1",
+    )) as FeatureEvolveApprovedSession;
+    const secondSource: FeatureEvolveApprovedSession = {
+      ...firstSource,
+      id: "feature-session-2",
+      createdAt: "2026-08-25T01:30:00.000Z",
+      updatedAt: secondApproval.createdAt,
+      approval: secondApproval,
+      executeSessionId: "safe-session-2",
+    };
+    const secondExecute: SafeExecutionDraftSession = {
+      ...execute,
+      id: "safe-session-2",
+      createdAt: secondApproval.createdAt,
+      updatedAt: secondApproval.createdAt,
+      sourceSessionId: secondSource.id,
+      approvalId: secondApproval.id,
+    };
+    await saveSession(rootPath, secondSource);
+    await saveSession(rootPath, secondExecute);
+
+    await expect(loadSafeExecutionHistory(rootPath, project.id)).resolves.toHaveLength(2);
+    await expect(loadSafeExecutionState(rootPath, project.id)).rejects.toThrow(/ambiguous/i);
+    const report = await loadProjectReport(rootPath, project.id, { offset: 0, limit: 25 });
+    expect(report.sessions.filter(({ type }) => type === "SAFE_EXECUTION")).toHaveLength(2);
   });
 
   it("persists bounded classified reconciliation evidence without discarding approval", async () => {

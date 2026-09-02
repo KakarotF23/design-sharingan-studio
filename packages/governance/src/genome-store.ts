@@ -287,6 +287,11 @@ function rootFingerprint(canonicalRoot: string): string {
     .digest("hex");
 }
 
+/** Return the authenticated identity of a canonical project root. */
+export async function governanceRootFingerprint(rootPath: string): Promise<string> {
+  return rootFingerprint(await canonicalProjectRoot(rootPath));
+}
+
 export async function machineStateDirectory(rootPath: string, create: boolean): Promise<string> {
   const root = await canonicalProjectRoot(rootPath);
   const directory = assertPathInsideWorkspace(root, join(root, MACHINE_STATE_DIRECTORY));

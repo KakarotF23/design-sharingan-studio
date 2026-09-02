@@ -836,7 +836,7 @@ async function saveSafeExecutionSession(
   await saveSession(rootPath, session);
 }
 
-function assertSourceRelation(
+export function assertSafeExecutionSourceRelation(
   projectId: string,
   session: SafeExecutionSession,
   source: FeatureEvolveApprovedSession,
@@ -873,18 +873,61 @@ export async function loadSafeExecutionState(
   rootPath: string,
   projectId: string,
 ): Promise<SafeExecutionSession> {
+  try {
+    const history = await loadSafeExecutionHistory(rootPath, projectId);
+    if (history.length !== 1) {
+      throw new Error("Safe execution state is missing, ambiguous, or invalid");
+    }
+    return history[0]!;
+  } catch (error) {
+    // A process can be interrupted after replacing the session record but
+    // before its activity journal reaches disk. Recover only that explicit
+    // checkpoint gap; malformed or ambiguous Safe history still fails closed.
+    const message = error instanceof Error ? error.message : "";
+    if (!/checkpoint|latest immutable/i.test(message)) throw error;
+    const sessions = await listSessions(rootPath, projectId, false);
+    const safeRecords = sessions.filter((session) => session.type === "SAFE_EXECUTION");
+    if (safeRecords.length !== 1) {
+      throw new Error("Safe execution state is missing, ambiguous, or invalid");
+    }
+    const session = safeRecords[0]!;
+    if (!isSafeExecutionSession(session)) {
+      throw new Error("Safe execution state is invalid");
+    }
+    const source = await loadSession(rootPath, projectId, session.sourceSessionId);
+    if (!isFeatureEvolveApprovedSession(source)) {
+      throw new Error("Approved Feature EVOLVE source evidence is invalid");
+    }
+    assertSafeExecutionSourceRelation(projectId, session, source);
+    await saveSession(rootPath, session);
+    return session;
+  }
+}
+
+/**
+ * Authenticate every retained Safe execution. The active runtime still uses
+ * the singleton loader above; Reports deliberately consume this history so a
+ * project can retain more than one valid execution.
+ */
+export async function loadSafeExecutionHistory(
+  rootPath: string,
+  projectId: string,
+): Promise<SafeExecutionSession[]> {
   const sessions = await listSessions(rootPath, projectId);
   const safeRecords = sessions.filter((session) => session.type === "SAFE_EXECUTION");
-  if (safeRecords.length !== 1 || !isSafeExecutionSession(safeRecords[0])) {
-    throw new Error("Safe execution state is missing, ambiguous, or invalid");
+  const authenticated: SafeExecutionSession[] = [];
+  for (const record of safeRecords) {
+    if (!isSafeExecutionSession(record)) {
+      throw new Error("Safe execution history contains invalid evidence");
+    }
+    const source = await loadSession(rootPath, projectId, record.sourceSessionId);
+    if (!isFeatureEvolveApprovedSession(source)) {
+      throw new Error("Approved Feature EVOLVE source evidence is invalid");
+    }
+    assertSafeExecutionSourceRelation(projectId, record, source);
+    authenticated.push(record);
   }
-  const safeSession = safeRecords[0];
-  const source = await loadSession(rootPath, projectId, safeSession.sourceSessionId);
-  if (!isFeatureEvolveApprovedSession(source)) {
-    throw new Error("Approved Feature EVOLVE source evidence is invalid");
-  }
-  assertSourceRelation(projectId, safeSession, source);
-  return safeSession;
+  return authenticated;
 }
 
 async function acquireSessionClaim(

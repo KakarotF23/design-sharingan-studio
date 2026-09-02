@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { rm } from "node:fs/promises";
-import type { DriftReport, Project, ReleaseGate } from "@design-sharingan/core";
+import type { DesignSession, DriftReport, Project, ReleaseGate } from "@design-sharingan/core";
+import {
+  isCanonicalIdentifier,
+  isDesignSessionEnvelope,
+} from "@design-sharingan/core";
 import {
   evaluateReleaseGate,
   initializeGenomeWithCodex,
@@ -8,8 +12,10 @@ import {
 } from "@design-sharingan/eternal-engine";
 import {
   approveGenome,
+  governanceRootFingerprint,
   governanceIsInitialized,
   initializeGovernance,
+  isAuthenticatedGenomeDocument,
   readDesignDecisions,
   readDriftReport,
   readEvidenceCatalog,
@@ -72,36 +78,239 @@ export type GovernanceProjection =
       release?: GovernReleaseProjection;
     };
 
-type GovernanceSessionType = "GENOME_INIT" | "DRIFT_AUDIT" | "RELEASE_GATE";
+export type GovernanceSessionType = "GENOME_INIT" | "DRIFT_AUDIT" | "RELEASE_GATE";
+
+interface GovernanceSessionCheckpoint {
+  type: GovernanceSessionType;
+  status: string;
+  entityId: string;
+  revision: number;
+  artifactFingerprint: string;
+  rootFingerprint: string;
+}
+
+function canonicalJson(value: unknown): string {
+  function sort(entry: unknown): unknown {
+    if (Array.isArray(entry)) return entry.map(sort);
+    if (entry !== null && typeof entry === "object") {
+      return Object.fromEntries(
+        Object.entries(entry)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, nested]) => [key, sort(nested)]),
+      );
+    }
+    return entry;
+  }
+  const serialized = JSON.stringify(sort(value));
+  if (serialized === undefined) throw new Error("Governance artifact identity is not serializable");
+  return serialized;
+}
+
+function governanceArtifactFingerprint(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
+function genomeArtifactIdentity(genome: Awaited<ReturnType<typeof readGenome>>): unknown {
+  return {
+    metadata: genome.metadata,
+    value: genome.value,
+    payloadHash: genome.payloadHash,
+    authority: genome.authority,
+  };
+}
+
+function driftArtifactIdentity(drift: Awaited<ReturnType<typeof readDriftReport>>): unknown {
+  return { metadata: drift.metadata, value: drift.value };
+}
+
+function releaseArtifactIdentity(
+  release: GovernReleaseProjection,
+  drift: Awaited<ReturnType<typeof readDriftReport>>,
+): unknown {
+  return { release, drift: driftArtifactIdentity(drift) };
+}
+
+function governanceSessionId(
+  projectId: string,
+  checkpoint: GovernanceSessionCheckpoint,
+): string {
+  return `gov_${createHash("sha256").update(canonicalJson({
+    type: checkpoint.type,
+    projectId,
+    rootFingerprint: checkpoint.rootFingerprint,
+    entityId: checkpoint.entityId,
+    revision: checkpoint.revision,
+    artifactFingerprint: checkpoint.artifactFingerprint,
+  }), "utf8").digest("hex")}`;
+}
+
+async function genomeSessionCheckpoint(project: Project): Promise<GovernanceSessionCheckpoint> {
+  const [genome, rootFingerprint] = await Promise.all([
+    readGenome(project.rootPath, project.id),
+    governanceRootFingerprint(project.rootPath),
+  ]);
+  return {
+    type: "GENOME_INIT",
+    status: genome.value.status,
+    entityId: genome.metadata.entityId,
+    revision: genome.metadata.revision,
+    artifactFingerprint: governanceArtifactFingerprint(genomeArtifactIdentity(genome)),
+    rootFingerprint,
+  };
+}
+
+async function driftSessionCheckpoint(project: Project): Promise<GovernanceSessionCheckpoint> {
+  const [drift, rootFingerprint] = await Promise.all([
+    readDriftReport(project.rootPath, project.id),
+    governanceRootFingerprint(project.rootPath),
+  ]);
+  return {
+    type: "DRIFT_AUDIT",
+    status: drift.value.overallStatus,
+    entityId: drift.metadata.entityId,
+    revision: drift.metadata.revision,
+    artifactFingerprint: governanceArtifactFingerprint(driftArtifactIdentity(drift)),
+    rootFingerprint,
+  };
+}
+
+async function releaseSessionCheckpoint(
+  project: Project,
+  projection: Extract<GovernanceProjection, { initialized: true }>,
+): Promise<GovernanceSessionCheckpoint> {
+  if (projection.release === undefined) throw new Error("Release projection is unavailable");
+  const [drift, rootFingerprint] = await Promise.all([
+    readDriftReport(project.rootPath, project.id),
+    governanceRootFingerprint(project.rootPath),
+  ]);
+  return {
+    type: "RELEASE_GATE",
+    status: projection.release.status,
+    entityId: drift.metadata.entityId,
+    revision: drift.metadata.revision,
+    artifactFingerprint: governanceArtifactFingerprint(releaseArtifactIdentity(projection.release, drift)),
+    rootFingerprint,
+  };
+}
 
 async function persistGovernanceSession(
   project: Project,
-  type: GovernanceSessionType,
-  status: string,
-  fingerprint: unknown,
+  checkpoint: GovernanceSessionCheckpoint,
 ): Promise<void> {
-  const id = `gov_${createHash("sha256").update(`${type}\u0000${JSON.stringify(fingerprint)}`).digest("hex")}`;
+  const id = governanceSessionId(project.id, checkpoint);
+  const session = {
+    id,
+    projectId: project.id,
+    type: checkpoint.type,
+    status: checkpoint.status,
+    entityId: checkpoint.entityId,
+    revision: checkpoint.revision,
+    artifactFingerprint: checkpoint.artifactFingerprint,
+    rootFingerprint: checkpoint.rootFingerprint,
+  };
   try {
     const existing = await loadSession(project.rootPath, project.id, id);
-    if (existing.type === type && existing.status === status) return;
-    if (existing.type !== type) throw new Error("Governance session identity conflicts with retained evidence");
+    if (
+      existing.type !== session.type ||
+      existing.projectId !== session.projectId ||
+      (existing as Partial<typeof session>).entityId !== session.entityId ||
+      (existing as Partial<typeof session>).revision !== session.revision ||
+      (existing as Partial<typeof session>).artifactFingerprint !== session.artifactFingerprint ||
+      (existing as Partial<typeof session>).rootFingerprint !== session.rootFingerprint
+    ) throw new Error("Governance session identity conflicts with retained evidence");
+    if (existing.status === session.status) return;
     await saveSession(project.rootPath, {
       ...existing,
-      status,
+      status: session.status,
       updatedAt: new Date().toISOString(),
     });
   } catch (error) {
     if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
     const timestamp = new Date().toISOString();
     await saveSession(project.rootPath, {
-      id,
-      projectId: project.id,
-      type,
-      status,
+      ...session,
       createdAt: timestamp,
       updatedAt: timestamp,
     });
   }
+}
+
+function isGovernanceCheckpointSession(
+  session: DesignSession,
+): session is DesignSession & GovernanceSessionCheckpoint {
+  const value = session as unknown as Record<string, unknown>;
+  return isDesignSessionEnvelope(session) &&
+    Object.keys(value).length === 10 &&
+    value.type !== undefined &&
+    ["GENOME_INIT", "DRIFT_AUDIT", "RELEASE_GATE"].includes(String(value.type)) &&
+    isCanonicalIdentifier(value.entityId) &&
+    Number.isSafeInteger(value.revision) &&
+    Number(value.revision) > 0 &&
+    typeof value.artifactFingerprint === "string" && /^[a-f0-9]{64}$/.test(value.artifactFingerprint) &&
+    typeof value.rootFingerprint === "string" && /^[a-f0-9]{64}$/.test(value.rootFingerprint);
+}
+
+function assertGovernanceCheckpointMatches(
+  projectId: string,
+  session: DesignSession & GovernanceSessionCheckpoint,
+  expected: GovernanceSessionCheckpoint,
+): void {
+  if (
+    session.id !== governanceSessionId(projectId, expected) ||
+    session.type !== expected.type ||
+    session.status !== expected.status ||
+    session.entityId !== expected.entityId ||
+    session.revision !== expected.revision ||
+    session.artifactFingerprint !== expected.artifactFingerprint ||
+    session.rootFingerprint !== expected.rootFingerprint
+  ) throw new Error("Governance report session is stale or does not match authenticated truth");
+}
+
+/**
+ * Re-authenticate a retained governance session against the current signed
+ * Genome/audit generation. A status-shaped machine record cannot establish
+ * completion because the current durable documents are always authoritative.
+ */
+export async function authenticateGovernanceReportSession(
+  project: Project,
+  session: DesignSession,
+): Promise<void> {
+  if (session.projectId !== project.id || !isGovernanceCheckpointSession(session)) {
+    throw new Error("Governance report session is not an authenticated checkpoint");
+  }
+  const checkpoint = session as DesignSession & GovernanceSessionCheckpoint;
+  if (checkpoint.type === "GENOME_INIT") {
+    const genome = await readGenome(project.rootPath, project.id);
+    assertGovernanceCheckpointMatches(project.id, checkpoint, {
+      type: "GENOME_INIT",
+      status: genome.value.status,
+      entityId: genome.metadata.entityId,
+      revision: genome.metadata.revision,
+      artifactFingerprint: governanceArtifactFingerprint(genomeArtifactIdentity(genome)),
+      rootFingerprint: await governanceRootFingerprint(project.rootPath),
+    });
+    if (genome.value.status === "APPROVED" && !isAuthenticatedGenomeDocument(genome)) {
+      throw new Error("Approved Genome report session lacks current signed authority");
+    }
+    return;
+  }
+  const drift = await readDriftReport(project.rootPath, project.id);
+  if (checkpoint.type === "DRIFT_AUDIT") {
+    assertGovernanceCheckpointMatches(project.id, checkpoint, {
+      type: "DRIFT_AUDIT",
+      status: drift.value.overallStatus,
+      entityId: drift.metadata.entityId,
+      revision: drift.metadata.revision,
+      artifactFingerprint: governanceArtifactFingerprint(driftArtifactIdentity(drift)),
+      rootFingerprint: await governanceRootFingerprint(project.rootPath),
+    });
+    return;
+  }
+  const projection = await loadGovernanceProjection(project);
+  if (!projection.initialized || projection.release === undefined) {
+    throw new Error("Release report session lacks current authenticated release truth");
+  }
+  assertGovernanceCheckpointMatches(project.id, checkpoint, await releaseSessionCheckpoint(project, projection));
 }
 
 function missingDriftReport(error: unknown): boolean {
@@ -343,10 +552,7 @@ export async function initializeProjectGovernance(
   });
   const projection = await loadGovernanceProjection(project);
   if (!projection.initialized) throw new Error("Initialized Genome projection is unavailable");
-  await persistGovernanceSession(project, "GENOME_INIT", projection.genome.status, {
-    payloadHash: projection.genome.payloadHash,
-    status: projection.genome.status,
-  });
+  await persistGovernanceSession(project, await genomeSessionCheckpoint(project));
   return projection;
 }
 
@@ -362,10 +568,7 @@ export async function approveProjectGenome(
   });
   const projection = await loadGovernanceProjection(project);
   if (!projection.initialized) throw new Error("Approved Genome projection is unavailable");
-  await persistGovernanceSession(project, "GENOME_INIT", projection.genome.status, {
-    payloadHash: projection.genome.payloadHash,
-    status: projection.genome.status,
-  });
+  await persistGovernanceSession(project, await genomeSessionCheckpoint(project));
   return projection;
 }
 
@@ -458,10 +661,7 @@ export async function auditProjectDrift(
   if (!projection.initialized || projection.drift === undefined) {
     throw new Error("Drift audit projection is unavailable");
   }
-  await persistGovernanceSession(project, "DRIFT_AUDIT", projection.drift.overallStatus, {
-    evidenceIds: projection.drift.evidenceIds,
-    status: projection.drift.overallStatus,
-  });
+  await persistGovernanceSession(project, await driftSessionCheckpoint(project));
   return projection;
 }
 
@@ -470,9 +670,6 @@ export async function evaluateProjectRelease(
 ): Promise<GovernanceProjection> {
   const projection = await loadGovernanceProjection(project);
   if (!projection.initialized || projection.release === undefined) return projection;
-  await persistGovernanceSession(project, "RELEASE_GATE", projection.release.status, {
-    checks: projection.release.checks.map(({ name, status, evidence }) => ({ name, status, evidence })),
-    status: projection.release.status,
-  });
+  await persistGovernanceSession(project, await releaseSessionCheckpoint(project, projection));
   return projection;
 }

@@ -1,4 +1,5 @@
 import { loadProjectReport } from "@design-sharingan/project-adapters";
+import { authenticateGovernanceReportSession } from "../../../../../features/govern/govern-server";
 import { resolveProjectRequest } from "../../../../../features/projects/project-access";
 
 export const runtime = "nodejs";
@@ -19,6 +20,9 @@ export async function GET(
     return Response.json(await loadProjectReport(project.rootPath, project.id, {
       offset: Number(offset),
       limit: Number(limit),
+    }, {
+      authenticateGovernanceSession: (_rootPath, _projectId, session) =>
+        authenticateGovernanceReportSession(project, session),
     }));
   } catch {
     return Response.json({ error: "Project reports are unavailable." }, { status: 404 });

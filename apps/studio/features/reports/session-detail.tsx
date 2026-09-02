@@ -2,13 +2,41 @@
 
 import type { ReportSession } from "@design-sharingan/project-adapters";
 
+function evidenceHref(
+  projectId: string,
+  session: ReportSession,
+  evidence: ReportSession["evidence"][number],
+): string {
+  switch (evidence.kind) {
+    case "REFERENCE":
+      return `/projects/${encodeURIComponent(projectId)}/references#reference-${encodeURIComponent(evidence.id)}`;
+    case "RENDER":
+      return `#report-render-${encodeURIComponent(evidence.id)}`;
+    case "GIT":
+      return `#report-git-${encodeURIComponent(session.id)}`;
+    case "APPROVAL":
+      return `#report-approvals-${encodeURIComponent(session.id)}`;
+    case "GOVERNANCE":
+    case "SESSION":
+      return evidence.id === session.id
+        ? `#report-session-${encodeURIComponent(session.id)}`
+        : `/projects/${encodeURIComponent(projectId)}/reports?session=${encodeURIComponent(evidence.id)}#report-session-${encodeURIComponent(evidence.id)}`;
+  }
+}
+
 function duration(milliseconds: number): string {
   if (milliseconds < 1_000) return "Under one second";
   if (milliseconds < 60_000) return `${Math.round(milliseconds / 1_000)} sec`;
   return `${Math.floor(milliseconds / 60_000)} min ${Math.round((milliseconds % 60_000) / 1_000)} sec`;
 }
 
-export function SessionDetail({ session }: { session?: ReportSession }) {
+export function SessionDetail({
+  projectId,
+  session,
+}: {
+  projectId: string;
+  session?: ReportSession;
+}) {
   if (session === undefined) {
     return (
       <section className="session-detail session-detail--empty" aria-live="polite">
@@ -19,7 +47,11 @@ export function SessionDetail({ session }: { session?: ReportSession }) {
     );
   }
   return (
-    <section className="session-detail" aria-labelledby="session-detail-title">
+    <section
+      className="session-detail"
+      id={`report-session-${session.id}`}
+      aria-labelledby="session-detail-title"
+    >
       <div className="session-detail__header">
         <div>
           <p className="utility-label">SESSION INSPECTOR</p>
@@ -33,13 +65,19 @@ export function SessionDetail({ session }: { session?: ReportSession }) {
         <div><dt>Visual rounds</dt><dd>{session.visualRounds}</dd></div>
         <div><dt>Changed files</dt><dd>{session.filesChanged.length}</dd></div>
       </dl>
-      <div className="session-detail__group">
+      {session.error ? (
+        <div className="session-detail__group session-detail__error" role="alert">
+          <p className="utility-label">ERROR EVIDENCE</p>
+          <pre>{session.error}</pre>
+        </div>
+      ) : null}
+      <div className="session-detail__group session-detail__evidence">
         <p className="utility-label">LINKED EVIDENCE</p>
         {session.evidence.length > 0 ? (
           <ul>
             {session.evidence.map((evidence) => (
               <li key={`${evidence.kind}:${evidence.id}`}>
-                <a href={`#evidence-${evidence.kind}-${evidence.id}`}>
+                <a href={evidenceHref(projectId, session, evidence)}>
                   {evidence.label ?? evidence.kind}
                 </a>
                 <span>{evidence.kind}</span>
@@ -48,7 +86,10 @@ export function SessionDetail({ session }: { session?: ReportSession }) {
           </ul>
         ) : <p>Evidence is unavailable for this retained record.</p>}
       </div>
-      <div className="session-detail__group">
+      <div
+        className="session-detail__group"
+        id={`report-approvals-${session.id}`}
+      >
         <p className="utility-label">APPROVALS</p>
         {session.approvals.length > 0 ? (
           <ul>

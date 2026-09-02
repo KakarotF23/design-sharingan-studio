@@ -42,8 +42,11 @@ export function ReportsWorkspace() {
       .then((payload) => {
         if (controller.signal.aborted) return;
         setReport(payload);
+        const requestedSessionId = new URLSearchParams(window.location.search).get("session");
         setSelectedId((current) =>
-          payload.sessions.some((session) => session.id === current)
+          requestedSessionId !== null && payload.sessions.some((session) => session.id === requestedSessionId)
+            ? requestedSessionId
+            : payload.sessions.some((session) => session.id === current)
             ? current
             : payload.sessions[0]?.id,
         );
@@ -71,7 +74,7 @@ export function ReportsWorkspace() {
       {error ? <p className="form-error" role="alert">{error}</p> : null}
       <div className="reports-workspace__grid">
         <SessionList sessions={report.sessions} selectedId={selectedId} onSelect={setSelectedId} />
-        <SessionDetail session={selected} />
+        <SessionDetail projectId={project.id} session={selected} />
       </div>
       <div className="reports-workspace__panels">
         <ProjectActivityPanel events={report.activity} />

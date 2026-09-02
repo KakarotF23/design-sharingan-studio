@@ -1,5 +1,6 @@
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -10,6 +11,7 @@ import {
   rm,
   stat,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -32,6 +34,7 @@ import {
   commitReferenceScan,
   ensureDesignWorkspace,
   listReferences,
+  listActivityEvents,
   listSessions,
   loadReference,
   loadReferenceImage,
@@ -44,6 +47,7 @@ import {
   saveProjectMetadata,
   saveReferenceArtifact,
   saveRenderArtifact,
+  assertRenderArtifactIntegrity,
   saveSession,
   transitionLearnSession,
   updateReference,
@@ -1474,6 +1478,133 @@ it("cleans its temporary JSON file when atomic replacement fails", async () => {
   );
 });
 
+// Fix-round probe: an activity record is only valid for the immutable session
+// checkpoint that produced it; replacing the session must not leave a stale
+// event looking current.
+it("rejects activity whose session checkpoint was replaced", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const session = sessionFixture("stale-activity");
+  await saveSession(rootPath, session);
+  await writeFile(
+    join(rootPath, ".design-sharingan", "sessions", `${session.id}.json`),
+    `${JSON.stringify({ ...session, status: "ANALYZING", updatedAt: "2026-08-24T10:00:01.000Z" })}\n`,
+  );
+
+  await expect(listActivityEvents(rootPath, "project-1"))
+    .rejects.toThrow(/checkpoint|stale|identity|activity/i);
+});
+
+// Fix-round probe: a checkpoint without its event is not a recoverable
+// activity transition and must never be silently dropped from the report.
+it("rejects an orphaned activity checkpoint", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const session = sessionFixture("orphaned-checkpoint");
+  await saveSession(rootPath, session);
+  const activityPath = join(rootPath, ".design-sharingan", "activity");
+  const eventName = (await readdir(activityPath)).find((name) => !name.endsWith(".checkpoint.json"));
+  expect(eventName).toBeDefined();
+  await unlink(join(activityPath, eventName!));
+
+  await expect(listActivityEvents(rootPath, "project-1"))
+    .rejects.toThrow(/orphan|checkpoint|activity/i);
+});
+
+// Fix-round probe: durable failure state must produce a concrete failure
+// activity record instead of looking like an in-progress analysis.
+it("records a failure activity message for a failed scan", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const failed = {
+    ...referenceScanPendingSessionFixture("ANALYZING", "failed-scan"),
+    error: "Reference image analysis failed after the worker exited.",
+  };
+  await saveSession(rootPath, failed);
+
+  const [event] = await listActivityEvents(rootPath, "project-1");
+  expect(event?.message).toMatch(/failed/i);
+});
+
+// Fix-round probe: runtime records must not be readable through a hard link
+// that gives an unrelated directory another name for the same inode.
+it("rejects a hard-linked session record", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const session = sessionFixture("hard-linked-session");
+  await saveSession(rootPath, session);
+  const sessionPath = join(
+    rootPath,
+    ".design-sharingan",
+    "sessions",
+    `${session.id}.json`,
+  );
+  await link(sessionPath, join(rootPath, "hard-linked-session.json"));
+
+  await expect(loadSession(rootPath, "project-1", session.id))
+    .rejects.toThrow(/regular|hard|invalid/i);
+});
+
+// Fix-round probe: directory growth is bounded before any untrusted JSON is
+// read, preventing a large or malicious history from becoming an unbounded
+// Promise.all fan-out.
+it("rejects a session history beyond the bounded entry budget", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const sessionsPath = join(rootPath, ".design-sharingan", "sessions");
+  await Promise.all(Array.from({ length: 513 }, (_, index) => writeFile(
+    join(sessionsPath, `history-${index}.json`),
+    `${JSON.stringify({
+      id: `history-${index}`,
+      projectId: "project-1",
+      type: "REFERENCE_SCAN",
+      status: "DRAFT",
+      createdAt: "2026-08-24T09:00:00.000Z",
+      updatedAt: "2026-08-24T09:00:00.000Z",
+    })}\n`,
+  )));
+
+  await expect(listSessions(rootPath, "project-1"))
+    .rejects.toThrow(/bounded|history|entries|budget/i);
+});
+
+// Fix-round probe: pagination bounds must include directory entries that are
+// not JSON records; otherwise junk can evade the pre-read budget.
+it("rejects a session directory beyond the total entry budget", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const sessionsPath = join(rootPath, ".design-sharingan", "sessions");
+  await Promise.all(Array.from({ length: 513 }, (_, index) => writeFile(
+    join(sessionsPath, `junk-${index}.txt`),
+    "junk",
+  )));
+
+  await expect(listSessions(rootPath, "project-1"))
+    .rejects.toThrow(/bounded|history|entries|budget/i);
+});
+
+// Fix-round probe: two callers claiming the same learn transition must have
+// one winner and one observable rejection, with no event for the loser.
+it("uses a compare-and-swap claim for concurrent learn transitions", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const starting = sessionFixture("cas-session");
+  await saveSession(rootPath, starting);
+  const first = { ...starting, status: "ANALYZING" as const, updatedAt: "2026-08-24T10:00:01.000Z" };
+  const second = { ...starting, status: "ANALYZING" as const, updatedAt: "2026-08-24T10:00:02.000Z" };
+
+  const results = await Promise.allSettled([
+    transitionLearnSession(rootPath, "DRAFT", first),
+    transitionLearnSession(rootPath, "DRAFT", second),
+  ]);
+
+  expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+  expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+  const activity = await listActivityEvents(rootPath, "project-1");
+  expect(activity.filter((event) => event.sessionId === starting.id)).toHaveLength(2);
+  expect(activity.filter((event) => event.message === "Analyzing reference")).toHaveLength(1);
+});
+
 // Production break caught: trusting render imagePath allows the evidence store to overwrite project source or outside files.
 it("persists render bytes only inside the runtime renders directory", async () => {
   const rootPath = await temporaryProject();
@@ -1712,6 +1843,43 @@ it("validates complete render evidence at the persistence boundary", async () =>
       unexpected: true,
     },
   } as RenderArtifact, png)).rejects.toThrow(/source revision/i);
+});
+
+// Fix-round probe: every persisted render must retain the metadata and digest
+// sidecars that authenticate its bytes and source revision.
+it("rejects a render when either integrity sidecar is missing", async () => {
+  const rootPath = await temporaryProject();
+  await ensureDesignWorkspace(rootPath);
+  const imagePath = join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "desktop.png");
+  const metadata: RenderArtifact = {
+    id: "render-sidecar",
+    sessionId: "session-1",
+    roundId: "round-1",
+    route: "/",
+    viewport: "desktop",
+    viewportWidth: 1440,
+    viewportHeight: 800,
+    imagePath,
+    capturedAt: "2026-08-25T09:00:00.000Z",
+    sourceRevision: { kind: "UNVERSIONED", available: false, reason: "NOT_A_GIT_WORKSPACE" },
+  };
+  await saveRenderArtifact(rootPath, metadata, pngBytes());
+  await unlink(join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "desktop.integrity.json"));
+
+  await expect(assertRenderArtifactIntegrity(rootPath, metadata))
+    .rejects.toThrow(/integrity|sidecar|render/i);
+
+  const second = {
+    ...metadata,
+    id: "render-sidecar-metadata",
+    viewport: "tablet",
+    imagePath: join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "tablet.png"),
+  };
+  await saveRenderArtifact(rootPath, second, pngBytes());
+  await unlink(join(rootPath, ".design-sharingan", "renders", "session-1", "round-1", "tablet.json"));
+
+  await expect(assertRenderArtifactIntegrity(rootPath, second))
+    .rejects.toThrow(/metadata|sidecar|render/i);
 });
 
 it("rejects duplicate or undersized represented Git status evidence", async () => {

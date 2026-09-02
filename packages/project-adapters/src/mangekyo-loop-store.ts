@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
-import { isAbsolute, join, posix, relative, sep } from "node:path";
+import { isAbsolute, join, posix } from "node:path";
 import type {
   AutonomyChange,
   AutonomyPolicy,
@@ -20,13 +20,13 @@ import { DEFAULT_AUTONOMY_POLICY, evaluateAutonomyPolicy } from "@design-sharing
 import { assertPathInsideWorkspace } from "./path-policy";
 import {
   ensureDesignWorkspace,
+  assertRenderArtifactIntegrity,
   listSessions,
   loadProjectMetadata,
   loadSession,
   saveSession,
 } from "./workspace-store";
 
-const MAX_RENDER_BYTES = 25 * 1024 * 1024;
 const MAX_AUTHORIZATION_BYTES = 64 * 1024;
 const MAX_CLAIM_BYTES = 16 * 1024;
 
@@ -1065,24 +1065,7 @@ export function isMangekyoLoopSession(value: unknown): value is MangekyoLoopSess
 }
 
 async function assertRenderPath(rootPath: string, artifact: RenderArtifact): Promise<void> {
-  const renderRoot = join(rootPath, ".design-sharingan", "renders");
-  const authenticated = assertPathInsideWorkspace(renderRoot, artifact.imagePath);
-  const [canonical, entry] = await Promise.all([realpath(authenticated), lstat(authenticated)]);
-  const nested = relative(renderRoot, canonical);
-  if (
-    canonical !== authenticated ||
-    nested === "" ||
-    isAbsolute(nested) ||
-    nested === ".." ||
-    nested.startsWith(`..${sep}`) ||
-    entry.isSymbolicLink() ||
-    !entry.isFile() ||
-    entry.nlink !== 1 ||
-    entry.size < 8 ||
-    entry.size > MAX_RENDER_BYTES
-  ) {
-    throw new Error("Mangekyo render evidence is not an authenticated project-scoped file");
-  }
+  await assertRenderArtifactIntegrity(rootPath, artifact);
 }
 
 async function validateRenderFiles(rootPath: string, session: MangekyoLoopSession): Promise<void> {
@@ -1092,7 +1075,9 @@ async function validateRenderFiles(rootPath: string, session: MangekyoLoopSessio
     ...session.rounds.flatMap(({ round }) => [round.beforeRender, round.afterRender]),
   ].filter((artifact): artifact is RenderArtifact => artifact !== undefined);
   const uniquePaths = new Map(artifacts.map((artifact) => [artifact.imagePath, artifact]));
-  await Promise.all([...uniquePaths.values()].map((artifact) => assertRenderPath(rootPath, artifact)));
+  for (const artifact of uniquePaths.values()) {
+    await assertRenderPath(rootPath, artifact);
+  }
 }
 
 export async function saveMangekyoLoopSession(
@@ -2165,6 +2150,17 @@ export async function loadMangekyoRenderImage(
       throw new Error("Mangekyo render changed while it was authenticated");
     }
     const bytes = await handle.readFile();
+    const current = await lstat(artifact.imagePath);
+    if (
+      current.isSymbolicLink() ||
+      !current.isFile() ||
+      current.nlink !== 1 ||
+      current.dev !== opened.dev ||
+      current.ino !== opened.ino ||
+      current.size !== opened.size
+    ) {
+      throw new Error("Mangekyo render changed while it was authenticated");
+    }
     const isPng = bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
     const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
     const isWebp = bytes.subarray(0, 4).toString("ascii") === "RIFF" &&

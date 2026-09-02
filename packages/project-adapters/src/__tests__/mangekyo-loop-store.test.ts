@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { MangekyoLoopSession, Project, RenderArtifact } from "@design-sharingan/core";
 import { DEFAULT_AUTONOMY_POLICY } from "@design-sharingan/core";
 import { afterEach, describe, expect, it } from "vitest";
@@ -19,16 +20,30 @@ import {
   loadMangekyoLoopSession,
   loadMangekyoRenderImage,
   saveMangekyoAuthorization,
-  saveMangekyoLoopSession,
+  saveMangekyoLoopSession as persistMangekyoLoopSession,
   requestMangekyoStop,
   releaseMangekyoActiveLoop,
   releaseMangekyoGateDecisionClaim,
   releaseMangekyoWorkerLease,
 } from "../mangekyo-loop-store";
 import { createMangekyoWorkerLeaseOwner } from "../mangekyo-worker-owner";
-import { ensureDesignWorkspace, saveProjectMetadata } from "../workspace-store";
+import {
+  ensureDesignWorkspace,
+  saveProjectMetadata,
+  saveRenderArtifact,
+} from "../workspace-store";
 
 const roots: string[] = [];
+
+function pngBytes(width = 1280, height = 720): Uint8Array {
+  const bytes = new Uint8Array(24);
+  bytes.set([137, 80, 78, 71, 13, 10, 26, 10], 0);
+  bytes.set([0, 0, 0, 13, 73, 72, 68, 82], 8);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  return bytes;
+}
 
 async function projectFixture(): Promise<Project> {
   const rootPath = await realpath(await mkdtemp(join(tmpdir(), "mangekyo-store-test-")));
@@ -74,6 +89,89 @@ function renderArtifact(imagePath: string): RenderArtifact {
       requiredPathEvidence: [],
     },
   };
+}
+
+function renderMetadataPath(imagePath: string): string {
+  return join(dirname(imagePath), `${imagePath.split("/").at(-1)?.replace(/\.png$/, "")}.json`);
+}
+
+function renderIntegrityPath(imagePath: string): string {
+  return join(dirname(imagePath), `${imagePath.split("/").at(-1)?.replace(/\.png$/, "")}.integrity.json`);
+}
+
+function hasFixturePng(bytes: Uint8Array, artifact: RenderArtifact): boolean {
+  return bytes.byteLength >= 24 &&
+    [137, 80, 78, 71, 13, 10, 26, 10].every((value, index) => bytes[index] === value) &&
+    bytes[12] === 73 && bytes[13] === 72 && bytes[14] === 68 && bytes[15] === 82 &&
+    new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(16) === artifact.viewportWidth &&
+    new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(20) === artifact.viewportHeight;
+}
+
+/** Set up producer-owned render sidecars for a fixture before the strict
+ * adapter boundary authenticates the loop session. */
+async function prepareFixtureRenders(
+  rootPath: string,
+  session: MangekyoLoopSession,
+): Promise<void> {
+  const artifacts = [
+    session.initialRender,
+    session.finalRender,
+    ...session.rounds.flatMap(({ round }) => [round.beforeRender, round.afterRender]),
+  ].filter((artifact): artifact is RenderArtifact => artifact !== undefined);
+  const seen = new Set<string>();
+  for (const artifact of artifacts) {
+    const sourcePath = artifact.imagePath;
+    const imagePath = join(
+      rootPath,
+      ".design-sharingan",
+      "renders",
+      artifact.sessionId,
+      artifact.roundId,
+      `${artifact.viewport}.png`,
+    );
+    artifact.imagePath = imagePath;
+    if (seen.has(imagePath)) continue;
+    seen.add(imagePath);
+    await mkdir(dirname(imagePath), { recursive: true });
+    let bytes: Uint8Array;
+    try {
+      bytes = new Uint8Array(await readFile(sourcePath));
+    } catch {
+      bytes = pngBytes(artifact.viewportWidth, artifact.viewportHeight);
+    }
+    if (!hasFixturePng(bytes, artifact)) {
+      bytes = pngBytes(artifact.viewportWidth, artifact.viewportHeight);
+    }
+    await writeFile(imagePath, bytes);
+    const metadata = { ...artifact, imagePath };
+    const integrity = {
+      artifactId: artifact.id,
+      sessionId: artifact.sessionId,
+      roundId: artifact.roundId,
+      route: artifact.route,
+      state: "default",
+      viewport: artifact.viewport,
+      viewportWidth: artifact.viewportWidth,
+      viewportHeight: artifact.viewportHeight,
+      imagePath,
+      capturedAt: artifact.capturedAt,
+      sourceRevisionFingerprint: artifact.sourceRevision.available === true
+        ? artifact.sourceRevision.worktreeFingerprint
+        : null,
+      contentHash: createHash("sha256").update(bytes).digest("hex"),
+      byteLength: bytes.byteLength,
+    };
+    await writeFile(renderMetadataPath(imagePath), `${JSON.stringify(metadata, null, 2)}\n`);
+    await writeFile(renderIntegrityPath(imagePath), `${JSON.stringify(integrity, null, 2)}\n`);
+  }
+}
+
+async function saveMangekyoLoopSession(
+  rootPath: string,
+  session: MangekyoLoopSession,
+): Promise<void> {
+  await prepareFixtureRenders(rootPath, session);
+  await persistMangekyoLoopSession(rootPath, session);
 }
 
 function sessionFixture(rootPath: string): MangekyoLoopSession {
@@ -210,6 +308,34 @@ function interruptedSessionFixture(
   delete session.stopReason;
   return session;
 }
+
+// Fix-round probe: a retained render must be authenticated by its exact PNG
+// bytes, not merely by a project-scoped path.
+it("rejects a render whose PNG bytes were replaced after persistence", async () => {
+  const project = await projectFixture();
+  const session = sessionFixture(project.rootPath);
+  const artifact = {
+    ...(session.initialRender as RenderArtifact),
+    imagePath: join(
+      project.rootPath,
+      ".design-sharingan",
+      "renders",
+      "mangekyo-1",
+      "round-1",
+      "desktop.png",
+    ),
+  };
+  session.initialRender = artifact;
+  await saveRenderArtifact(project.rootPath, artifact, pngBytes());
+  await saveMangekyoLoopSession(project.rootPath, session);
+
+  const replacement = pngBytes();
+  replacement[23] = 99;
+  await writeFile(artifact.imagePath, replacement);
+
+  await expect(loadMangekyoLoopSession(project.rootPath, project.id, session.id))
+    .rejects.toThrow(/PNG|digest|integrity|render/i);
+});
 
 const invalidInterruptedSessionEvidence = [
   {
@@ -351,6 +477,7 @@ function completeSessionFixture(rootPath: string): MangekyoLoopSession {
   };
   const afterRender: RenderArtifact = {
     ...renderArtifact(join(rootPath, ".design-sharingan", "renders", "mangekyo-1", "round-1.png")),
+    roundId: "round-1-after",
     id: "render-after-1",
     capturedAt: "2026-08-27T01:00:04.000Z",
     sourceRevision: mutationSourceRevision,
@@ -926,6 +1053,7 @@ describe("Mangekyo loop persistence", () => {
     await writeFile(terminal.initialRender?.imagePath as string, png);
     await writeFile(terminal.finalRender?.imagePath as string, png);
     await saveMangekyoLoopSession(project.rootPath, deciding);
+    await prepareFixtureRenders(project.rootPath, terminal);
     await expect(commitMangekyoTerminalTransition(project.rootPath, project.id, {
       expectedVersion: deciding.updatedAt,
       session: terminal,
@@ -1836,7 +1964,7 @@ describe("Mangekyo loop persistence", () => {
 
     await expect(
       loadMangekyoRenderImage(project.rootPath, project.id, "render-1"),
-    ).resolves.toEqual({ bytes, type: "image/png" });
+    ).resolves.toEqual({ bytes: Buffer.from(pngBytes()), type: "image/png" });
   });
 
   it("rejects a tampered loop record with undeclared payload before it can authorize another round", async () => {

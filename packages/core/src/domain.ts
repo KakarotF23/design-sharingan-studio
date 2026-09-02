@@ -134,6 +134,84 @@ export interface DesignSession {
   updatedAt: ISODateTime;
 }
 
+/** Canonical identifiers are safe to use as durable record names and links. */
+const CANONICAL_SESSION_IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
+
+const DESIGN_SESSION_TYPES = [
+  "REFERENCE_SCAN",
+  "ASSIMILATION",
+  "FEATURE_EVOLVE",
+  "SAFE_EXECUTION",
+  "MANGEKYO_LOOP",
+  "GENOME_INIT",
+  "DRIFT_AUDIT",
+  "RELEASE_GATE",
+] as const satisfies readonly DesignSessionType[];
+
+const DESIGN_SESSION_STATUSES = new Set([
+  "DRAFT",
+  "ANALYZING",
+  "RESULT_READY",
+  "AWAITING_DECISION",
+  "APPROVED",
+  "REVISE",
+  "REJECT",
+  "IDLE",
+  "PREPARING",
+  "PROPOSING",
+  "WAITING_APPROVAL",
+  "REVISING",
+  "EDITING",
+  "RUNNING",
+  "CAPTURING",
+  "VERIFYING",
+  "COMPLETE",
+  "REJECTED",
+  "FAILED",
+  "POLICY_CHECK",
+  "COMPARING",
+  "DECIDING",
+  "FIXING",
+  "HUMAN_GATE",
+  "BLOCKED",
+  "PASS",
+  "PASS_WITH_DEBT",
+  "NOT_VERIFIED",
+  "FAIL",
+]);
+
+export function isCanonicalIdentifier(value: unknown): value is string {
+  return typeof value === "string" && CANONICAL_SESSION_IDENTIFIER.test(value);
+}
+
+export function isCanonicalIsoDateTime(value: unknown): value is ISODateTime {
+  if (typeof value !== "string" || value.length !== 24) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+export function isDesignSessionType(value: unknown): value is DesignSessionType {
+  return typeof value === "string" && (DESIGN_SESSION_TYPES as readonly string[]).includes(value);
+}
+
+export function isKnownDesignSessionStatus(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 64 &&
+    !/[\u0000-\u001f\u007f]/.test(value) && DESIGN_SESSION_STATUSES.has(value);
+}
+
+/** Validate the common immutable session envelope before type-specific parsing. */
+export function isDesignSessionEnvelope(value: unknown): value is DesignSession {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const session = value as Partial<DesignSession>;
+  return isCanonicalIdentifier(session.id) &&
+    isCanonicalIdentifier(session.projectId) &&
+    isDesignSessionType(session.type) &&
+    isKnownDesignSessionStatus(session.status) &&
+    isCanonicalIsoDateTime(session.createdAt) &&
+    isCanonicalIsoDateTime(session.updatedAt) &&
+    Date.parse(session.updatedAt) >= Date.parse(session.createdAt);
+}
+
 export interface DesignDNA {
   id: string;
   referenceIds: string[];
