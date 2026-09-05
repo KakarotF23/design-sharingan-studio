@@ -21,6 +21,7 @@ import {
 import { isMangekyoLoopSession, loadMangekyoLoopSession } from "./mangekyo-loop-store";
 import {
   isSafeExecutionSession,
+  loadSafeExecutionForSource,
   loadSafeExecutionHistoryForSessions,
 } from "./safe-execution-store";
 
@@ -421,7 +422,11 @@ async function assertAuthenticatedSessions(
         session.approval.scope !== "DESIGN_APPROACH" ||
         session.approval.proposalId !== selectedApproach.id
       ) throw new Error("Approved Feature EVOLVE report is missing its approved Design Approach relation");
-      const linked = safeById.get(session.executeSessionId);
+      let linked = safeById.get(session.executeSessionId);
+      if (linked === undefined) {
+        linked = await loadSafeExecutionForSource(rootPath, projectId, session);
+        safeById.set(linked.id, linked);
+      }
       if (linked === undefined || linked.sourceSessionId !== session.id ||
         linked.approvedApproachId !== session.approvedApproachId ||
         linked.approvalId !== session.approval.id) {

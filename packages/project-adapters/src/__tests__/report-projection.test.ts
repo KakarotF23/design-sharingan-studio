@@ -1,8 +1,13 @@
-import { lstat, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import type { DesignSession } from "@design-sharingan/core";
+import { basename, join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type {
+  Approval,
+  DesignApproach,
+  DesignSession,
+  FeatureBrief,
+} from "@design-sharingan/core";
 import {
   loadProjectReport,
   redactReportEvidence,
@@ -10,6 +15,15 @@ import {
   saveReferenceArtifact,
   saveSession,
 } from "../index";
+import type {
+  FeatureEvolveApprovedSession,
+  SafeExecutionDraftSession,
+} from "../index";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, open: vi.fn(actual.open) };
+});
 
 const temporaryRoots: string[] = [];
 
@@ -33,6 +47,93 @@ async function projectRoot(): Promise<string> {
     updatedAt: "2026-08-29T12:00:00.000Z",
   });
   return root;
+}
+
+const featureBrief: FeatureBrief = {
+  name: "Evidence inbox",
+  goal: "Triage unresolved design evidence.",
+  description: "Add a bounded evidence inbox.",
+  constraints: ["Keep navigation"],
+  mustKeep: ["Reports history"],
+  mustNotChange: ["No new route"],
+  successCriteria: ["Triage one item quickly"],
+};
+
+const designApproach: DesignApproach = {
+  id: "approach-guided-queue",
+  title: "Guided evidence queue",
+  summary: "Add a bounded queue in the current screen.",
+  recommended: true,
+  pros: ["Preserves navigation"],
+  cons: ["Adds one state"],
+  uxImpact: [{
+    area: "Reference review",
+    severity: "IMPORTANT",
+    reason: "Review state becomes explicit.",
+    affectedRoutes: ["/references"],
+    affectedComponents: ["ReferenceCard"],
+    decisionRequired: true,
+  }],
+  estimatedComplexity: "MEDIUM",
+  genomeFit: "Fits the evidence-first direction.",
+  likelyFiles: ["src/reference-card.tsx"],
+  status: "PROPOSED",
+};
+
+function approvedFeatureAndSafe(
+  suffix: string,
+  sourceCreatedAt: string,
+  approvedAt: string,
+): {
+  feature: FeatureEvolveApprovedSession;
+  safe: SafeExecutionDraftSession;
+} {
+  const approval: Approval = {
+    id: `approval-${suffix}`,
+    proposalId: designApproach.id,
+    decision: "APPROVED",
+    scope: "DESIGN_APPROACH",
+    approvedBy: "local-user",
+    createdAt: approvedAt,
+  };
+  const feature = {
+    id: `feature-${suffix}`,
+    projectId: "project-1",
+    type: "FEATURE_EVOLVE" as const,
+    status: "APPROVED" as const,
+    createdAt: sourceCreatedAt,
+    updatedAt: approvedAt,
+    featureBrief,
+    referenceIds: [],
+    uxImpact: designApproach.uxImpact,
+    approaches: [
+      designApproach,
+      {
+        ...designApproach,
+        id: `approach-${suffix}-alternate`,
+        title: "Inline evidence markers",
+        recommended: false,
+      },
+    ],
+    agentThreadId: `thread-${suffix}`,
+    approvedApproachId: designApproach.id,
+    approval,
+    executeSessionId: `safe-${suffix}`,
+  };
+  const safe = {
+    id: feature.executeSessionId,
+    projectId: "project-1",
+    type: "SAFE_EXECUTION" as const,
+    status: "IDLE" as const,
+    createdAt: approvedAt,
+    updatedAt: approvedAt,
+    sourceSessionId: feature.id,
+    approvedApproachId: designApproach.id,
+    approvalId: approval.id,
+    featureBrief,
+    designApproach,
+  };
+  return { feature, safe };
 }
 
 describe("read-only project report", () => {
@@ -233,6 +334,114 @@ describe("read-only project report", () => {
     expect(report.sessions).toEqual([
       expect.objectContaining({ id: "assimilation-unbound", result: "NOT_VERIFIED" }),
     ]);
+  });
+
+  it("authenticates only an approved Feature row's exact off-page Safe relation", async () => {
+    const root = await projectRoot();
+    const selected = approvedFeatureAndSafe(
+      "selected",
+      "2026-08-29T13:00:00.000Z",
+      "2026-08-29T14:00:00.000Z",
+    );
+    const unrelated = approvedFeatureAndSafe(
+      "unrelated",
+      "2026-08-29T10:00:00.000Z",
+      "2026-08-29T11:00:00.000Z",
+    );
+    await saveSession(root, selected.feature);
+    await saveSession(root, selected.safe);
+    await saveSession(root, unrelated.feature);
+    await saveSession(root, unrelated.safe);
+
+    // Retain the authenticated head index but make an unrelated off-page Safe
+    // body unreadable. A bounded relation lookup must open only safe-selected.
+    await writeFile(
+      join(root, ".design-sharingan", "sessions", "safe-unrelated.json"),
+      "{ deliberately malformed unrelated Safe body\n",
+      "utf8",
+    );
+
+    vi.mocked(open).mockClear();
+    const report = await loadProjectReport(
+      root,
+      "project-1",
+      { offset: 1, limit: 1 },
+    );
+    expect(report).toMatchObject({
+      total: 4,
+      sessions: [{
+        id: "feature-selected",
+        result: "APPROVED",
+        evidence: expect.arrayContaining([
+          expect.objectContaining({ kind: "SESSION", id: "safe-selected" }),
+        ]),
+      }],
+    });
+    const openedSessionBodies = vi.mocked(open).mock.calls
+      .map(([path]) => String(path))
+      .filter((path) => path.includes("/.design-sharingan/sessions/") && path.endsWith(".json"));
+    expect(openedSessionBodies.map((path) => basename(path))).toEqual([
+      "feature-selected.json",
+      "safe-selected.json",
+    ]);
+  });
+
+  it("fails closed when an approved Feature row's exact Safe relation is missing", async () => {
+    const root = await projectRoot();
+    const { feature } = approvedFeatureAndSafe(
+      "missing",
+      "2026-08-29T13:00:00.000Z",
+      "2026-08-29T14:00:00.000Z",
+    );
+    await saveSession(root, feature);
+
+    await expect(
+      loadProjectReport(root, "project-1", { offset: 0, limit: 1 }),
+    ).rejects.toThrow(/safe|session|missing|ENOENT/i);
+  });
+
+  it("fails closed when an approved Feature row's exact Safe relation is forged", async () => {
+    const root = await projectRoot();
+    const { feature, safe } = approvedFeatureAndSafe(
+      "forged",
+      "2026-08-29T13:00:00.000Z",
+      "2026-08-29T14:00:00.000Z",
+    );
+    await saveSession(root, feature);
+    const forgedSafe: SafeExecutionDraftSession = {
+      ...safe,
+      approvalId: "approval-substituted",
+    };
+    await saveSession(root, forgedSafe);
+
+    await expect(
+      loadProjectReport(root, "project-1", { offset: 1, limit: 1 }),
+    ).rejects.toThrow(/safe|approval|source|evidence|match/i);
+  });
+
+  it("fails closed when selected Feature rows claim the same Safe relation", async () => {
+    const root = await projectRoot();
+    const first = approvedFeatureAndSafe(
+      "first",
+      "2026-08-29T13:00:00.000Z",
+      "2026-08-29T14:00:00.000Z",
+    );
+    const second = approvedFeatureAndSafe(
+      "second",
+      "2026-08-29T12:00:00.000Z",
+      "2026-08-29T14:00:00.000Z",
+    );
+    await saveSession(root, first.feature);
+    await saveSession(root, first.safe);
+    const conflictingFeature: FeatureEvolveApprovedSession = {
+      ...second.feature,
+      executeSessionId: first.safe.id,
+    };
+    await saveSession(root, conflictingFeature);
+
+    await expect(
+      loadProjectReport(root, "project-1", { offset: 1, limit: 2 }),
+    ).rejects.toThrow(/authenticated Safe execution|source|evidence/i);
   });
 
   it("pages before opening off-page reference artifacts across hundreds of indexed sessions", async () => {

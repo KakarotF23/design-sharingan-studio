@@ -956,6 +956,23 @@ export async function loadSafeExecutionHistoryForSessions(
   return authenticated;
 }
 
+/** Authenticate the one Safe execution named by an approved Feature source. */
+export async function loadSafeExecutionForSource(
+  rootPath: string,
+  projectId: string,
+  source: FeatureEvolveApprovedSession,
+): Promise<SafeExecutionSession> {
+  if (source.projectId !== projectId || !isFeatureEvolveApprovedSession(source)) {
+    throw new Error("Approved Feature EVOLVE source evidence is invalid");
+  }
+  const record = await loadSession(rootPath, projectId, source.executeSessionId);
+  if (!isSafeExecutionSession(record)) {
+    throw new Error("Linked Safe execution evidence is invalid");
+  }
+  assertSafeExecutionSourceRelation(projectId, record, source);
+  return record;
+}
+
 async function acquireSessionClaim(
   rootPath: string,
   projectId: string,

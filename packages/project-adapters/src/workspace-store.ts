@@ -48,10 +48,44 @@ const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
 const CHECKPOINT_SUFFIX = ".checkpoint.json";
 const SESSION_HEAD_SUFFIX = ".session-head.json";
 const ACTIVITY_ID_PATTERN = /^act_[a-f0-9]{64}$/;
+const AUTHENTICATED_SESSION_READ_ATTEMPTS = 5;
 // Learn transitions are short, local durable writes. A bounded lease protects
 // a live owner across processes while still making a crashed owner (including
 // PID reuse) recoverable instead of permanently wedging the state machine.
 const LEARN_CLAIM_LEASE_MS = 30_000;
+
+function isConcurrentSessionRead(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return [
+    /^(?:Activity record|Session (?:checkpoint|head) record|Session record) changed while reading$/,
+    /^Session head is not authenticated by its immutable checkpoint$/,
+    /^Session commit (?:is still in progress|recovery raced)/,
+    /^Session journal has no committed head$/,
+    /^Session history filename\/identity count is invalid against its authenticated head index$/,
+    /^Session page (?:index points to a missing record|record does not match its authenticated head index)$/,
+    /^Session record (?:does not match its authenticated activity checkpoint head index|does not match its latest immutable checkpoint|is not part of a committed journal pair)$/,
+  ].some((pattern) => pattern.test(error.message));
+}
+
+/**
+ * A writer publishes checkpoint, body, and head as separate durable renames.
+ * Re-run the complete authenticated read when those renames cross a reader's
+ * bounded directory snapshot. Every attempt revalidates the immutable
+ * checkpoint relation, and a persistent mismatch is still rejected.
+ */
+async function retryAuthenticatedSessionRead<T>(read: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await read();
+    } catch (error) {
+      if (
+        attempt >= AUTHENTICATED_SESSION_READ_ATTEMPTS ||
+        !isConcurrentSessionRead(error)
+      ) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, attempt));
+    }
+  }
+}
 
 export type SessionCommitFault =
   | "after-journal-before-session"
@@ -2312,7 +2346,7 @@ export async function saveSession(
   }
 }
 
-export async function loadSession(
+async function loadSessionOnce(
   rootPath: string,
   projectId: string,
   sessionId: string,
@@ -2343,6 +2377,16 @@ export async function loadSession(
     head.createdAt !== persisted.createdAt || head.updatedAt !== persisted.updatedAt
   ) throw new Error("Session record is not part of a committed journal pair");
   return persisted;
+}
+
+export async function loadSession(
+  rootPath: string,
+  projectId: string,
+  sessionId: string,
+): Promise<DesignSession> {
+  return retryAuthenticatedSessionRead(() =>
+    loadSessionOnce(rootPath, projectId, sessionId),
+  );
 }
 
 async function withLearnTransitionClaim<T>(
@@ -3194,7 +3238,7 @@ export interface DesignSessionPage {
  * any referenced artifacts. The index count and exact filename set are still
  * authenticated for the whole retained history.
  */
-export async function listSessionPage(
+async function listSessionPageOnce(
   rootPath: string,
   projectId: string,
   offset: number,
@@ -3252,7 +3296,18 @@ export async function listSessionPage(
   return { total: heads.size, sessions };
 }
 
-export async function listSessions(
+export async function listSessionPage(
+  rootPath: string,
+  projectId: string,
+  offset: number,
+  limit: number,
+): Promise<DesignSessionPage> {
+  return retryAuthenticatedSessionRead(() =>
+    listSessionPageOnce(rootPath, projectId, offset, limit),
+  );
+}
+
+async function listSessionsOnce(
   rootPath: string,
   projectId: string,
   verifyActivity = true,
@@ -3319,6 +3374,16 @@ export async function listSessions(
   }
   return sessions.sort((left, right) =>
     right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id),
+  );
+}
+
+export async function listSessions(
+  rootPath: string,
+  projectId: string,
+  verifyActivity = true,
+): Promise<DesignSession[]> {
+  return retryAuthenticatedSessionRead(() =>
+    listSessionsOnce(rootPath, projectId, verifyActivity),
   );
 }
 
