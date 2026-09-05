@@ -13,7 +13,16 @@ export async function GET(
     const project = await resolveProjectRequest(projectId);
     const { references, session, stopRequest } = await loadMangekyoContext(project);
     return Response.json(mangekyoDataView(references, session, stopRequest));
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      /session commit is still in progress; committed head remains authoritative/i.test(error.message)
+    ) {
+      return Response.json(
+        { error: "Mangekyō evidence is being committed; retry shortly." },
+        { status: 409 },
+      );
+    }
     return Response.json(
       { error: "Mangekyō evidence is unavailable or ambiguous." },
       { status: 404 },

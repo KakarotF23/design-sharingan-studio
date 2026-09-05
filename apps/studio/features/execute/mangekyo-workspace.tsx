@@ -1,7 +1,7 @@
 "use client";
 
 import { ModeSwitcher, WorkspaceHeader, type StudioMode } from "@design-sharingan/ui";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useStudioProject } from "../projects/project-shell";
 import { AutonomyBoundaryCard } from "./autonomy-boundary-card";
 import type { MangekyoDataView, MangekyoSessionView } from "./mangekyo-types";
@@ -11,6 +11,8 @@ import { VisualRoundTimeline } from "./visual-round-timeline";
 function findings(session?: MangekyoSessionView) {
   return session?.rounds.at(-1)?.findings ?? [];
 }
+
+class RetryableMangekyoLoadError extends Error {}
 
 export function MangekyoWorkspace({
   safeSessionId,
@@ -24,35 +26,45 @@ export function MangekyoWorkspace({
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const loadGeneration = useRef(0);
   const endpoint = `/projects/${encodeURIComponent(project.id)}/execute/mangekyo`;
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (): Promise<MangekyoDataView> => {
     const response = await fetch(`${endpoint}/data`, { cache: "no-store" });
     const payload = (await response.json()) as MangekyoDataView & { error?: string };
-    if (!response.ok) throw new Error(payload.error ?? "Mangekyō evidence is unavailable.");
-    setData(payload);
+    if (!response.ok) {
+      const message = payload.error ?? "Mangekyō evidence is unavailable.";
+      if (response.status === 409) throw new RetryableMangekyoLoadError(message);
+      throw new Error(message);
+    }
+    return payload;
   }, [endpoint]);
 
   useEffect(() => {
     let cancelled = false;
+    const generation = loadGeneration.current + 1;
+    loadGeneration.current = generation;
+    const current = () => !cancelled && loadGeneration.current === generation;
     const loadInitialContext = async () => {
       let lastError: unknown;
-      for (let attempt = 0; attempt < 100 && !cancelled; attempt += 1) {
+      for (let attempt = 0; attempt < 100 && current(); attempt += 1) {
         try {
-          await load();
-          if (!cancelled) {
+          const next = await load();
+          if (current()) {
+            setData(next);
             setError(undefined);
             setLoaded(true);
           }
           return;
         } catch (caught) {
           lastError = caught;
-          if (attempt < 99) {
+          if (!(caught instanceof RetryableMangekyoLoadError)) break;
+          if (attempt < 99 && current()) {
             await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
           }
         }
       }
-      if (!cancelled) {
+      if (current()) {
         setError(lastError instanceof Error ? lastError.message : "Mangekyō evidence is unavailable.");
         setLoaded(true);
       }
@@ -76,10 +88,16 @@ export function MangekyoWorkspace({
 
   useEffect(() => {
     if (!durableWorking && !session?.stopRequested) return;
+    let cancelled = false;
     const timer = window.setInterval(() => {
-      void load().catch(() => undefined);
+      void load().then((next) => {
+        if (!cancelled) setData(next);
+      }).catch(() => undefined);
     }, 300);
-    return () => window.clearInterval(timer);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [durableWorking, load, session?.stopRequested]);
 
   async function action(path: string, body: Record<string, unknown>) {

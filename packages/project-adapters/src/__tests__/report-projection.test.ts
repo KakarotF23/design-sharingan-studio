@@ -279,9 +279,23 @@ describe("read-only project report", () => {
       total: 201,
       sessions: [{ id: "scan-visible" }],
     });
+    // The page index must not open an unrelated retained body. A malformed
+    // old record remains a problem when selected, but cannot turn a visible
+    // page into an unbounded full-history read.
+    await writeFile(
+      join(root, ".design-sharingan", "sessions", "scan-history-000.json"),
+      "{ deliberately malformed off-page session body\n",
+      "utf8",
+    );
+    await expect(
+      loadProjectReport(root, "project-1", { offset: 0, limit: 1 }),
+    ).resolves.toMatchObject({
+      total: 201,
+      sessions: [{ id: "scan-visible" }],
+    });
     await expect(
       loadProjectReport(root, "project-1", { offset: 200, limit: 1 }),
-    ).rejects.toThrow(/reference|artifact|invalid/i);
+    ).rejects.toThrow(/reference|artifact|invalid|json/i);
   }, 60_000);
 
   it("rejects oversized reference-id arrays before persistence", async () => {

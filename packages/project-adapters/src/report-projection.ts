@@ -6,7 +6,7 @@ import type {
   DesignSessionType,
 } from "@design-sharingan/core";
 import { isDesignSessionEnvelope } from "@design-sharingan/core";
-import { listActivityEvents } from "./workspace-store";
+import { listActivityEventsForSessions } from "./workspace-store";
 import {
   isFeatureEvolveApprovedSession,
   isFeatureEvolvePendingSession,
@@ -21,7 +21,7 @@ import {
 import { isMangekyoLoopSession, loadMangekyoLoopSession } from "./mangekyo-loop-store";
 import {
   isSafeExecutionSession,
-  loadSafeExecutionHistory,
+  loadSafeExecutionHistoryForSessions,
 } from "./safe-execution-store";
 
 const MAX_PAGE_SIZE = 50;
@@ -403,7 +403,7 @@ async function assertAuthenticatedSessions(
     type === "SAFE_EXECUTION" && status !== "FAILED" && status !== "NOT_VERIFIED",
   );
   const safeHistory = safeSessions.length > 0
-    ? await loadSafeExecutionHistory(rootPath, projectId)
+    ? await loadSafeExecutionHistoryForSessions(rootPath, projectId, safeSessions)
     : [];
   const safeById = new Map(safeHistory.map((session) => [session.id, session]));
   for (const safeSession of safeSessions) {
@@ -477,9 +477,8 @@ export async function loadProjectReport(
     selected,
     options,
   );
-  const visibleSessionIds = new Set(selected.map(({ id }) => id));
   const [activity, reportSessions] = await Promise.all([
-    listActivityEvents(rootPath, projectId),
+    listActivityEventsForSessions(rootPath, projectId, selected),
     Promise.resolve(selected.map((session) => reportForSession(
       session,
       unavailableGovernance.has(session.id) ? "UNAVAILABLE" : "AUTHENTICATED",
@@ -490,6 +489,6 @@ export async function loadProjectReport(
     offset: page.offset,
     limit: page.limit,
     sessions: reportSessions,
-    activity: activity.filter((event) => visibleSessionIds.has(event.sessionId)).slice(0, MAX_ACTIVITY),
+    activity: activity.slice(0, MAX_ACTIVITY),
   };
 }

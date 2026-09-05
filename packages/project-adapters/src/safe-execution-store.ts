@@ -930,6 +930,32 @@ export async function loadSafeExecutionHistory(
   return authenticated;
 }
 
+/** Authenticate only Safe records already selected by the committed page index. */
+export async function loadSafeExecutionHistoryForSessions(
+  rootPath: string,
+  projectId: string,
+  sessions: readonly DesignSession[],
+): Promise<SafeExecutionSession[]> {
+  const authenticated: SafeExecutionSession[] = [];
+  const ids = new Set<string>();
+  for (const record of sessions) {
+    if (
+      record.projectId !== projectId || record.type !== "SAFE_EXECUTION" ||
+      ids.has(record.id) || !isSafeExecutionSession(record)
+    ) throw new Error("Visible Safe execution evidence is invalid or ambiguous");
+    ids.add(record.id);
+    // The directly linked approval is required authentication evidence. No
+    // unrelated retained Safe/session body is opened for a page projection.
+    const source = await loadSession(rootPath, projectId, record.sourceSessionId);
+    if (!isFeatureEvolveApprovedSession(source)) {
+      throw new Error("Approved Feature EVOLVE source evidence is invalid");
+    }
+    assertSafeExecutionSourceRelation(projectId, record, source);
+    authenticated.push(record);
+  }
+  return authenticated;
+}
+
 async function acquireSessionClaim(
   rootPath: string,
   projectId: string,

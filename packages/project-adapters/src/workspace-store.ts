@@ -48,10 +48,16 @@ const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
 const CHECKPOINT_SUFFIX = ".checkpoint.json";
 const SESSION_HEAD_SUFFIX = ".session-head.json";
 const ACTIVITY_ID_PATTERN = /^act_[a-f0-9]{64}$/;
+// Learn transitions are short, local durable writes. A bounded lease protects
+// a live owner across processes while still making a crashed owner (including
+// PID reuse) recoverable instead of permanently wedging the state machine.
+const LEARN_CLAIM_LEASE_MS = 30_000;
 
 export type SessionCommitFault =
   | "after-journal-before-session"
-  | "after-session-before-commit";
+  | "after-session-before-commit"
+  | "after-execution-head-before-approval-head"
+  | "after-reference-session-before-head";
 let sessionCommitFault: SessionCommitFault | undefined;
 
 /** Test-only fault injection for process-death boundaries in the session journal. */
@@ -118,6 +124,19 @@ interface OwnedSessionCommitClaim {
   handle: Awaited<ReturnType<typeof open>>;
   ownership: { dev: number; ino: number };
 }
+
+interface LearnTransitionClaim {
+  kind: "DESIGN_SHARINGAN_LEARN_CLAIM";
+  ownerId: string;
+  pid: number;
+  projectId: string;
+  sessionId: string;
+  expectedStatus: LearnSessionStatus;
+  expectedSessionHash: string;
+  leaseExpiresAt: string;
+}
+
+const activeLearnClaimOwners = new Set<string>();
 
 export interface DesignWorkspace {
   rootPath: string;
@@ -1732,6 +1751,50 @@ async function releaseSessionCommitClaim(claim: OwnedSessionCommitClaim): Promis
   ).catch(() => undefined);
 }
 
+/**
+ * A recovery publish is itself a write transaction. Re-check the exact head
+ * only after taking the same per-session claim as writers, so a writer that
+ * starts between stale-claim inspection and recovery cannot be regressed.
+ */
+async function publishRecoveredSessionHead(
+  workspace: DesignWorkspace,
+  projectId: string,
+  candidate: SessionCheckpoint,
+  expectedHead: SessionCommitHead | undefined,
+): Promise<void> {
+  const claim = await acquireSessionCommitClaim(workspace, projectId, candidate.sessionId)
+    .catch((error: unknown) => {
+      if (error instanceof Error && /already in progress/i.test(error.message)) {
+        throw new Error("Session commit recovery raced a live writer; retry from the committed head", { cause: error });
+      }
+      throw error;
+    });
+  try {
+    const headPath = assertPathInsideWorkspace(
+      workspace.activityPath,
+      join(workspace.activityPath, sessionHeadFileName(candidate.sessionId)),
+    );
+    const currentHead = await readBoundedJsonFile(headPath, "Session head record").catch(
+      (error: unknown) => {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+        throw error;
+      },
+    );
+    const headMatches = expectedHead === undefined
+      ? currentHead === undefined
+      : isSessionCommitHead(currentHead) && stableJson(currentHead) === stableJson(expectedHead);
+    if (!headMatches) throw new Error("Session commit recovery raced a changed committed head");
+    const current = await readSessionRecordForRecovery(workspace, projectId, candidate.sessionId);
+    if (
+      current === undefined || sessionCheckpointHash(current) !== candidate.sessionHash ||
+      stableJson(current) !== stableJson(candidate.session)
+    ) throw new Error("Session commit recovery raced a changed session record");
+    await writeSessionCommitHead(workspace, candidate);
+  } finally {
+    await releaseSessionCommitClaim(claim);
+  }
+}
+
 async function readSessionRecordForRecovery(
   workspace: DesignWorkspace,
   projectId: string,
@@ -1824,7 +1887,7 @@ async function recoverSessionCommits(
       session !== undefined && sessionCheckpointHash(session) === candidate.sessionHash &&
       stableJson(session) === stableJson(candidate.session)
     ) {
-      await writeSessionCommitHead(workspace, candidate);
+      await publishRecoveredSessionHead(workspace, projectId, candidate, head);
       continue;
     }
     const currentMatchesHead = session !== undefined && head !== undefined &&
@@ -2110,6 +2173,84 @@ export async function listActivityEvents(
   return orderActivityEvents(events);
 }
 
+/**
+ * Return activity only for already-authenticated visible session bodies. The
+ * complete checkpoint/head index is still validated, but unrelated session
+ * bodies and activity payloads are never opened while projecting a page.
+ */
+export async function listActivityEventsForSessions(
+  rootPath: string,
+  projectId: string,
+  sessions: readonly DesignSession[],
+): Promise<readonly ActivityEvent[]> {
+  const requested = new Map<string, DesignSession>();
+  for (const session of sessions) {
+    if (
+      !isPersistedSession(session) || session.projectId !== projectId ||
+      requested.has(session.id)
+    ) throw new Error("Visible activity session scope is invalid or ambiguous");
+    requested.set(session.id, session);
+  }
+  if (requested.size === 0) return [];
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
+  const files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const checkpoints = await readSessionCheckpoints(workspace, projectId, files);
+  const heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
+  const eventFiles = new Map<string, BoundedFileEntry>();
+  for (const file of files.filter(
+    ({ name }) => !name.endsWith(CHECKPOINT_SUFFIX) && !name.endsWith(SESSION_HEAD_SUFFIX),
+  )) {
+    const eventId = file.name.slice(0, -".json".length);
+    if (!ACTIVITY_ID_PATTERN.test(eventId) || eventFiles.has(eventId)) {
+      throw new Error("Activity event identity is invalid");
+    }
+    eventFiles.set(eventId, file);
+  }
+  const selectedCheckpoints = checkpoints.filter((checkpoint) => requested.has(checkpoint.sessionId));
+  const selectedBySession = new Map<string, SessionCheckpoint[]>();
+  for (const checkpoint of selectedCheckpoints) {
+    if (!eventFiles.has(checkpoint.eventId)) throw new Error("Visible activity checkpoint is orphaned");
+    selectedBySession.set(checkpoint.sessionId, [
+      ...(selectedBySession.get(checkpoint.sessionId) ?? []),
+      checkpoint,
+    ]);
+  }
+  for (const [sessionId, session] of requested) {
+    const values = selectedBySession.get(sessionId) ?? [];
+    const latest = values.reduce<SessionCheckpoint | undefined>(
+      (current, value) => current === undefined || value.version > current.version ? value : current,
+      undefined,
+    );
+    const head = heads.get(sessionId);
+    if (
+      latest === undefined || head === undefined ||
+      head.eventId !== latest.eventId || head.version !== latest.version ||
+      head.sessionHash !== sessionCheckpointHash(session)
+    ) throw new Error("Visible session does not match its authenticated activity head");
+  }
+  const events: ActivityEvent[] = [];
+  for (const checkpoint of selectedCheckpoints) {
+    const file = eventFiles.get(checkpoint.eventId);
+    if (file === undefined) throw new Error("Visible activity checkpoint is orphaned");
+    const event = await readBoundedJsonFile(file.path, "Activity record");
+    const expected = activityEventForSession(
+      checkpoint.session,
+      checkpoint.sessionHash,
+      checkpoint.version,
+    );
+    if (!validateActivityEvent(event) || stableJson(event) !== stableJson(expected)) {
+      throw new Error("Visible activity event is stale or invalid");
+    }
+    events.push(createActivityEvent(event));
+  }
+  return orderActivityEvents(events);
+}
+
 export async function saveSession(
   rootPath: string,
   session: DesignSession,
@@ -2217,20 +2358,22 @@ async function withLearnTransitionClaim<T>(
     join(workspace.sessionsPath, `.${sessionId}.learn.claim`),
   );
   const source = await loadSession(rootPath, projectId, sessionId);
-  const claimValue = {
+  const claimValue: LearnTransitionClaim = {
     kind: "DESIGN_SHARINGAN_LEARN_CLAIM" as const,
     ownerId: randomUUID(),
+    pid: process.pid,
     projectId,
     sessionId,
     expectedStatus,
     expectedSessionHash: sessionCheckpointHash(source),
+    leaseExpiresAt: new Date(Date.now() + LEARN_CLAIM_LEASE_MS).toISOString(),
   };
   const claimContents = stableJson(claimValue);
   let claim: Awaited<ReturnType<typeof open>> | undefined;
   let ownership: { dev: number; ino: number } | undefined;
 
   const removeExactClaim = async (
-    expected: typeof claimValue,
+    expected: LearnTransitionClaim,
     expectedOwnership: { dev: number; ino: number },
   ): Promise<boolean> => {
     const before = await lstat(claimPath).catch((error: unknown) => {
@@ -2256,21 +2399,33 @@ async function withLearnTransitionClaim<T>(
     if (identity.isSymbolicLink() || !identity.isFile() || identity.nlink !== 1) {
       throw new Error("Learn session transition claim is invalid or ambiguous");
     }
-    const persisted = await readBoundedJsonFile(claimPath, "Learn transition claim") as Partial<typeof claimValue>;
+    const persisted = await readBoundedJsonFile(claimPath, "Learn transition claim") as Partial<LearnTransitionClaim>;
     if (
       persisted.kind !== "DESIGN_SHARINGAN_LEARN_CLAIM" ||
       typeof persisted.ownerId !== "string" || !/^[a-f0-9-]{36}$/.test(persisted.ownerId) ||
+      !Number.isSafeInteger(persisted.pid) || Number(persisted.pid) <= 0 ||
+      Number(persisted.pid) > 2_147_483_647 ||
       persisted.projectId !== projectId || persisted.sessionId !== sessionId ||
+      !isCanonicalIsoDateTime(persisted.leaseExpiresAt) ||
       typeof persisted.expectedStatus !== "string" ||
       typeof persisted.expectedSessionHash !== "string" ||
       !/^[a-f0-9]{64}$/.test(persisted.expectedSessionHash) ||
       Object.keys(persisted).sort().join("\0") !== [
-        "expectedSessionHash", "expectedStatus", "kind", "ownerId", "projectId", "sessionId",
+        "expectedSessionHash", "expectedStatus", "kind", "leaseExpiresAt", "ownerId", "pid", "projectId", "sessionId",
       ].join("\0")
     ) throw new Error("Learn session transition claim is invalid or ambiguous");
+    const claim = persisted as LearnTransitionClaim;
     const current = await loadSession(rootPath, projectId, sessionId);
-    if (sessionCheckpointHash(current) === persisted.expectedSessionHash) return false;
-    return removeExactClaim(persisted as typeof claimValue, {
+    if (sessionCheckpointHash(current) === claim.expectedSessionHash) {
+      // A same-process claimant can be proven live only by its unforgeable
+      // in-memory owner token. For another process, PID plus a current lease
+      // is a bounded liveness proof; either may be stale after a crash.
+      if (
+        activeLearnClaimOwners.has(claim.ownerId) ||
+        (processIsAlive(claim.pid) && Date.parse(claim.leaseExpiresAt) > Date.now())
+      ) return false;
+    }
+    return removeExactClaim(claim, {
       dev: identity.dev,
       ino: identity.ino,
     });
@@ -2288,6 +2443,7 @@ async function withLearnTransitionClaim<T>(
         await claim.sync();
         const entry = await claim.stat();
         ownership = { dev: entry.dev, ino: entry.ino };
+        activeLearnClaimOwners.add(claimValue.ownerId);
         break;
       } catch (error) {
         if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
@@ -2316,6 +2472,7 @@ async function withLearnTransitionClaim<T>(
       });
       await claim.close().catch(() => undefined);
       await removeExactClaim(claimValue, ownership).catch(() => undefined);
+      activeLearnClaimOwners.delete(claimValue.ownerId);
     }
   }
 }
@@ -2641,6 +2798,7 @@ export async function approveFeatureEvolveApproach(
     const originalSessionContents = stableJson(existing);
     const approvalActivity = await persistSessionActivity(workspace, session, false);
     let executionActivity: Awaited<ReturnType<typeof persistSessionActivity>>;
+    let pairBodiesWritten = false;
     try {
       executionActivity = await persistSessionActivity(workspace, executeSession, false);
     } catch (error) {
@@ -2670,9 +2828,23 @@ export async function approveFeatureEvolveApproach(
         executeSessionPath,
         executeSessionContents,
       );
+      pairBodiesWritten = true;
       await writeSessionCommitHead(workspace, executionActivity.checkpoint);
+      throwSessionCommitFault("after-execution-head-before-approval-head");
       await writeSessionCommitHead(workspace, approvalActivity.checkpoint);
     } catch (error) {
+      if (pairBodiesWritten) {
+        // Once both mutable records exist, the journals are the only durable
+        // evidence capable of authenticating them. Do not delete that proof
+        // after a partial head publish: release the exact pair claims, then
+        // let normal recovery roll the committed heads forward together.
+        for (const claim of sessionCommitClaims.reverse()) {
+          await releaseSessionCommitClaim(claim);
+        }
+        sessionCommitClaims.length = 0;
+        await recoverSessionCommits(workspace, session.projectId);
+        throw error;
+      }
       if (executionActivity.ownership !== undefined) {
         await unlinkCreatedFileIfOwned(executionActivity.path, executionActivity.ownership)
           .catch(() => undefined);
@@ -2927,6 +3099,7 @@ export async function commitReferenceScan(
   );
   const originalReferenceContents = stableJson(existingReference);
   const originalDesignDNAContents = await readOptionalJsonContents(designDNAPath);
+  const originalSessionContents = stableJson(existingSession);
   const finalReferenceContents = stableJson(reference);
   const finalSessionContents = stableJson(session);
   await recoverSessionCommits(workspace, session.projectId);
@@ -2935,6 +3108,7 @@ export async function commitReferenceScan(
     session.projectId,
     session.id,
   );
+  let scanSessionWritten = false;
   try {
     const activity = await persistSessionActivity(workspace, session, false);
 
@@ -2946,8 +3120,19 @@ export async function commitReferenceScan(
         finalReferenceContents,
       );
       await atomicWrite(workspace.sessionsPath, sessionPath, finalSessionContents);
+      scanSessionWritten = true;
+      throwSessionCommitFault("after-reference-session-before-head");
       await writeSessionCommitHead(workspace, activity.checkpoint);
     } catch (error) {
+      if (scanSessionWritten) {
+        // Reference, DNA, session body, and immutable activity all reached
+        // disk. Preserve the complete new checkpoint and publish its head
+        // through normal recovery rather than reverting only part of it.
+        await releaseSessionCommitClaim(commitClaim);
+        scanSessionWritten = false;
+        await recoverSessionCommits(workspace, session.projectId);
+        throw error;
+      }
       if (activity.ownership !== undefined) {
         await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(
           () => undefined,
@@ -2981,6 +3166,11 @@ export async function commitReferenceScan(
         referencePath,
         referenceMetadataPath,
         originalReferenceContents,
+      ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError));
+      await atomicWrite(
+        workspace.sessionsPath,
+        sessionPath,
+        originalSessionContents,
       ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError));
       if (rollbackErrors.length > 0) {
         throw new Error("Reference scan checkpoint and rollback both failed", {

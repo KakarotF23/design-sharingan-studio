@@ -624,6 +624,31 @@ it("persists approval before the linked SAFE_EXECUTION draft and rolls both back
   ).resolves.toEqual(safeExecutionDraftFixture());
 });
 
+// The two body records and both immutable journals are already durable at
+// this boundary. A failed final head write must recover to one coherent new
+// pair, never a Safe body without its authenticating approval journal/head.
+it("rolls a partial Feature EVOLVE approval head publish forward coherently", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(rootPath, awaiting);
+  setSessionCommitFaultForTest("after-execution-head-before-approval-head");
+  await expect(approveFeatureEvolveApproach(rootPath, {
+    session: approvedFeatureEvolveSessionFixture(),
+    approval: approvalFixture(),
+    executeSession: safeExecutionDraftFixture(),
+  })).rejects.toThrow(/injected session commit crash/i);
+  setSessionCommitFaultForTest(undefined);
+
+  await expect(loadSession(rootPath, "project-1", awaiting.id)).resolves.toEqual(
+    approvedFeatureEvolveSessionFixture(),
+  );
+  await expect(loadSession(rootPath, "project-1", "safe-execution-1")).resolves.toEqual(
+    safeExecutionDraftFixture(),
+  );
+  await expect(listActivityEvents(rootPath, "project-1")).resolves.toHaveLength(3);
+});
+
 // Production break caught: two requests that both read AWAITING_DECISION can
 // otherwise approve different approaches, create two execution drafts, and let
 // one rollback overwrite the other's successful approved source record.
@@ -1117,6 +1142,32 @@ it("enforces the Learn lifecycle and commits a completed reference scan as one r
   ).resolves.toEqual(analyzedReference);
 });
 
+it("rolls a partial reference SCAN head publish forward with matching artifacts", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  await saveReferenceArtifact(rootPath, referenceFixture(), validPng);
+  const draft = referenceScanPendingSessionFixture();
+  const analyzing = { ...draft, status: "ANALYZING" as const };
+  const completed = referenceScanResultSessionFixture();
+  await saveSession(rootPath, draft);
+  await transitionLearnSession(rootPath, "DRAFT", analyzing);
+  const original = await loadReference(rootPath, "project-1", "reference-1");
+  const analyzed = { ...original, analysisStatus: "ANALYZED" as const };
+  setSessionCommitFaultForTest("after-reference-session-before-head");
+  await expect(commitReferenceScan(rootPath, {
+    reference: analyzed,
+    designDNA: designDNAFixture(),
+    session: completed,
+  })).rejects.toThrow(/injected session commit crash/i);
+  setSessionCommitFaultForTest(undefined);
+
+  await expect(loadSession(rootPath, "project-1", draft.id)).resolves.toEqual(completed);
+  await expect(loadReference(rootPath, "project-1", "reference-1")).resolves.toEqual(analyzed);
+  await expect(loadReferenceDesignDNA(rootPath, "project-1", "reference-1"))
+    .resolves.toEqual(designDNAFixture());
+  await expect(listActivityEvents(rootPath, "project-1")).resolves.toHaveLength(3);
+});
+
 // Production break caught: a generic RESULT_READY session can otherwise
 // advertise a report whose required evidence is absent or belongs to another
 // reference/DesignDNA result.
@@ -1607,6 +1658,43 @@ it("uses a compare-and-swap claim for concurrent learn transitions", async () =>
   const activity = await listActivityEvents(rootPath, "project-1");
   expect(activity.filter((event) => event.sessionId === starting.id)).toHaveLength(2);
   expect(activity.filter((event) => event.message === "Analyzing reference")).toHaveLength(1);
+});
+
+// A process can die immediately after claiming, before it mutates the session.
+// PID liveness alone is not ownership (PIDs can be reused, including by this
+// test process), so an expired authenticated claim must not wedge Learn.
+it.each([
+  ["dead owner", 2_147_483_646],
+  ["PID reuse", process.pid],
+  ["same-process stale owner", process.pid],
+] as const)("recovers an expired %s Learn claim before mutation", async (_label, pid) => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const starting = sessionFixture(`expired-learn-${pid}`);
+  await saveSession(rootPath, starting);
+  const head = JSON.parse(await readFile(
+    join(rootPath, ".design-sharingan", "activity", `${starting.id}.session-head.json`),
+    "utf8",
+  )) as { sessionHash: string };
+  await writeFile(
+    join(rootPath, ".design-sharingan", "sessions", `.${starting.id}.learn.claim`),
+    `${JSON.stringify({
+      kind: "DESIGN_SHARINGAN_LEARN_CLAIM",
+      ownerId: "11111111-1111-4111-8111-111111111111",
+      pid,
+      projectId: "project-1",
+      sessionId: starting.id,
+      expectedStatus: "DRAFT",
+      expectedSessionHash: head.sessionHash,
+      leaseExpiresAt: "2026-08-24T09:00:01.000Z",
+    })}\n`,
+  );
+
+  await expect(transitionLearnSession(rootPath, "DRAFT", {
+    ...starting,
+    status: "ANALYZING",
+    updatedAt: "2026-08-24T10:00:01.000Z",
+  })).resolves.toBeDefined();
 });
 
 // Fix-round-2 probe: a losing caller must never unlink the winner's claim.
