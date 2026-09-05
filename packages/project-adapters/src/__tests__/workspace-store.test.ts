@@ -49,6 +49,8 @@ import {
   saveRenderArtifact,
   assertRenderArtifactIntegrity,
   saveSession,
+  setLearnTransitionHookForTest,
+  setSessionCommitFaultForTest,
   transitionLearnSession,
   updateReference,
   validateReferenceImage,
@@ -73,6 +75,8 @@ async function temporaryProject(): Promise<string> {
 }
 
 afterEach(async () => {
+  setLearnTransitionHookForTest(undefined);
+  setSessionCommitFaultForTest(undefined);
   const { rm } = await import("node:fs/promises");
   await Promise.all(
     temporaryRoots.splice(0).map((directory) =>
@@ -1604,6 +1608,111 @@ it("uses a compare-and-swap claim for concurrent learn transitions", async () =>
   expect(activity.filter((event) => event.sessionId === starting.id)).toHaveLength(2);
   expect(activity.filter((event) => event.message === "Analyzing reference")).toHaveLength(1);
 });
+
+// Fix-round-2 probe: a losing caller must never unlink the winner's claim.
+// The third caller begins after the first has committed but before its cleanup,
+// forcing stale recovery and then letting the first cleanup interleave with the
+// third owner's live claim.
+it("preserves the exact Learn claim owner across a deterministic three-caller interleave", async () => {
+  const rootPath = await temporaryProject();
+  await saveProjectMetadata(projectFixture(rootPath));
+  const starting = sessionFixture("three-caller-cas");
+  await saveSession(rootPath, starting);
+  const analyzing = {
+    ...starting,
+    status: "ANALYZING" as const,
+    updatedAt: "2026-08-24T10:00:01.000Z",
+  };
+  const ready = {
+    ...starting,
+    status: "RESULT_READY" as const,
+    updatedAt: "2026-08-24T10:00:02.000Z",
+  };
+
+  let firstOwner: string | undefined;
+  let releaseFirstAction!: () => void;
+  let releaseFirstCleanup!: () => void;
+  let releaseThirdAction!: () => void;
+  const firstMayAct = new Promise<void>((resolve) => { releaseFirstAction = resolve; });
+  const firstMayClean = new Promise<void>((resolve) => { releaseFirstCleanup = resolve; });
+  const thirdMayAct = new Promise<void>((resolve) => { releaseThirdAction = resolve; });
+  let firstClaimed!: () => void;
+  let firstCommitted!: () => void;
+  let thirdClaimed!: () => void;
+  const firstClaim = new Promise<void>((resolve) => { firstClaimed = resolve; });
+  const firstCommit = new Promise<void>((resolve) => { firstCommitted = resolve; });
+  const thirdClaim = new Promise<void>((resolve) => { thirdClaimed = resolve; });
+
+  setLearnTransitionHookForTest(async ({ point, ownerId }) => {
+    if (point === "after-claim" && firstOwner === undefined) {
+      firstOwner = ownerId;
+      firstClaimed();
+      await firstMayAct;
+      return;
+    }
+    if (point === "before-release" && ownerId === firstOwner) {
+      firstCommitted();
+      await firstMayClean;
+      return;
+    }
+    if (point === "after-claim") {
+      thirdClaimed();
+      await thirdMayAct;
+    }
+  });
+
+  const first = transitionLearnSession(rootPath, "DRAFT", analyzing);
+  await firstClaim;
+  await expect(
+    transitionLearnSession(rootPath, "DRAFT", {
+      ...analyzing,
+      updatedAt: "2026-08-24T10:00:01.500Z",
+    }),
+  ).rejects.toThrow(/already in progress|claim/i);
+  releaseFirstAction();
+  await firstCommit;
+
+  const third = transitionLearnSession(rootPath, "ANALYZING", ready);
+  await thirdClaim;
+  releaseFirstCleanup();
+  await first;
+  releaseThirdAction();
+  await third;
+
+  await expect(loadSession(rootPath, "project-1", starting.id)).resolves.toEqual(ready);
+  const activity = await listActivityEvents(rootPath, "project-1");
+  expect(activity.filter(({ sessionId }) => sessionId === starting.id)).toHaveLength(3);
+  await expect(
+    lstat(join(rootPath, ".design-sharingan", "sessions", `.${starting.id}.learn.claim`)),
+  ).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it.each([
+  ["after-journal-before-session", "DRAFT", 1],
+  ["after-session-before-commit", "ANALYZING", 2],
+] as const)(
+  "recovers Learn session/activity truth after a forced crash %s",
+  async (fault, expectedStatus, expectedEvents) => {
+    const rootPath = await temporaryProject();
+    await saveProjectMetadata(projectFixture(rootPath));
+    const starting = sessionFixture(`learn-crash-${expectedStatus.toLowerCase()}`);
+    await saveSession(rootPath, starting);
+    setSessionCommitFaultForTest(fault);
+
+    await expect(transitionLearnSession(rootPath, "DRAFT", {
+      ...starting,
+      status: "ANALYZING",
+      updatedAt: "2026-08-24T10:00:01.000Z",
+    })).rejects.toThrow(/injected session commit crash/i);
+    setSessionCommitFaultForTest(undefined);
+
+    await expect(loadSession(rootPath, "project-1", starting.id)).resolves.toMatchObject({
+      status: expectedStatus,
+    });
+    const activity = await listActivityEvents(rootPath, "project-1");
+    expect(activity.filter(({ sessionId }) => sessionId === starting.id)).toHaveLength(expectedEvents);
+  },
+);
 
 // Production break caught: trusting render imagePath allows the evidence store to overwrite project source or outside files.
 it("persists render bytes only inside the runtime renders directory", async () => {

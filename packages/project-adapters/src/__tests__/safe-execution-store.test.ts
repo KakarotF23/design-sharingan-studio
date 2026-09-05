@@ -22,9 +22,11 @@ import type {
   SafeExecutionWaitingSession,
 } from "../safe-execution-store";
 import {
+  listActivityEvents,
   loadSession,
   saveProjectMetadata,
   saveSession,
+  setSessionCommitFaultForTest,
 } from "../workspace-store";
 import { loadProjectReport } from "../report-projection";
 import type {
@@ -35,6 +37,7 @@ import type {
 const cleanupRoots: string[] = [];
 
 afterEach(async () => {
+  setSessionCommitFaultForTest(undefined);
   await Promise.all(
     cleanupRoots.splice(0).map((path) =>
       rm(path, { force: true, recursive: true }),
@@ -242,6 +245,30 @@ async function awaitingProposal(): Promise<{
 }
 
 describe("Safe execution proposal lifecycle", () => {
+  it.each([
+    ["after-journal-before-session", "IDLE", 1],
+    ["after-session-before-commit", "PREPARING", 2],
+  ] as const)(
+    "recovers Safe session/activity truth after a forced crash %s",
+    async (fault, expectedStatus, expectedEvents) => {
+      const { rootPath, project, execute } = await initializedExecution();
+      setSessionCommitFaultForTest(fault);
+      await expect(saveSession(rootPath, {
+        ...execute,
+        status: "PREPARING",
+        updatedAt: "2026-08-25T01:00:01.000Z",
+      })).rejects.toThrow(/injected session commit crash/i);
+      setSessionCommitFaultForTest(undefined);
+
+      await expect(loadSafeExecutionState(rootPath, project.id)).resolves.toMatchObject({
+        id: execute.id,
+        status: expectedStatus,
+      });
+      const activity = await listActivityEvents(rootPath, project.id);
+      expect(activity.filter(({ sessionId }) => sessionId === execute.id)).toHaveLength(expectedEvents);
+    },
+  );
+
   it("persists IDLE → PREPARING → PROPOSING → WAITING_APPROVAL with one exact proposal thread", async () => {
     const { rootPath, project, execute } = await initializedExecution();
     const waiting = await prepareSafeExecutionProposal(

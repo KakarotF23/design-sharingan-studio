@@ -34,9 +34,31 @@ export function MangekyoWorkspace({
   }, [endpoint]);
 
   useEffect(() => {
-    load()
-      .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : "Mangekyō evidence is unavailable."))
-      .finally(() => setLoaded(true));
+    let cancelled = false;
+    const loadInitialContext = async () => {
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 100 && !cancelled; attempt += 1) {
+        try {
+          await load();
+          if (!cancelled) {
+            setError(undefined);
+            setLoaded(true);
+          }
+          return;
+        } catch (caught) {
+          lastError = caught;
+          if (attempt < 99) {
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+          }
+        }
+      }
+      if (!cancelled) {
+        setError(lastError instanceof Error ? lastError.message : "Mangekyō evidence is unavailable.");
+        setLoaded(true);
+      }
+    };
+    void loadInitialContext();
+    return () => { cancelled = true; };
   }, [load]);
 
   const session = data.session;

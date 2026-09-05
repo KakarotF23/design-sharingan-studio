@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -233,5 +233,70 @@ describe("read-only project report", () => {
     expect(report.sessions).toEqual([
       expect.objectContaining({ id: "assimilation-unbound", result: "NOT_VERIFIED" }),
     ]);
+  });
+
+  it("pages before opening off-page reference artifacts across hundreds of indexed sessions", async () => {
+    const root = await projectRoot();
+    for (let index = 0; index < 200; index += 1) {
+      const timestamp = new Date(Date.UTC(2026, 7, 29, 12, 0, index)).toISOString();
+      await saveSession(root, {
+        id: `scan-history-${index.toString().padStart(3, "0")}`,
+        projectId: "project-1",
+        type: "REFERENCE_SCAN",
+        status: "ANALYZING",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        referenceId: `missing-reference-${index}`,
+        referenceTitle: `Off-page reference ${index}`,
+      } as DesignSession & { referenceId: string; referenceTitle: string });
+    }
+    await saveReferenceArtifact(root, {
+      id: "reference-visible",
+      projectId: "project-1",
+      title: "Visible page evidence",
+      type: "image/png",
+      source: "upload",
+      likes: [],
+      dislikes: [],
+      tags: [],
+      analysisStatus: "UPLOADED",
+      createdAt: "2026-08-29T13:00:00.000Z",
+    }, new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
+    await saveSession(root, {
+      id: "scan-visible",
+      projectId: "project-1",
+      type: "REFERENCE_SCAN",
+      status: "ANALYZING",
+      createdAt: "2026-08-29T13:00:00.000Z",
+      updatedAt: "2026-08-29T13:00:00.000Z",
+      referenceId: "reference-visible",
+      referenceTitle: "Visible page evidence",
+    } as DesignSession & { referenceId: string; referenceTitle: string });
+
+    await expect(
+      loadProjectReport(root, "project-1", { offset: 0, limit: 1 }),
+    ).resolves.toMatchObject({
+      total: 201,
+      sessions: [{ id: "scan-visible" }],
+    });
+    await expect(
+      loadProjectReport(root, "project-1", { offset: 200, limit: 1 }),
+    ).rejects.toThrow(/reference|artifact|invalid/i);
+  }, 60_000);
+
+  it("rejects oversized reference-id arrays before persistence", async () => {
+    const root = await projectRoot();
+    const id = "oversized-reference-array";
+    await expect(saveSession(root, {
+      id,
+      projectId: "project-1",
+      type: "ASSIMILATION",
+      status: "DRAFT",
+      createdAt: "2026-08-29T12:00:00.000Z",
+      updatedAt: "2026-08-29T12:00:00.000Z",
+      referenceIds: Array.from({ length: 33 }, (_, index) => `reference-${index}`),
+    } as DesignSession & { referenceIds: string[] })).rejects.toThrow(/reference.*bound|reference.*32/i);
+    await expect(lstat(join(root, ".design-sharingan", "sessions", `${id}.json`)))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 });

@@ -1986,6 +1986,6 @@ describe("Mangekyo loop persistence", () => {
 
     await expect(
       loadMangekyoLoopSession(project.rootPath, project.id, session.id),
-    ).rejects.toThrow(/invalid mangekyo loop/i);
+    ).rejects.toThrow(/invalid mangekyo loop|committed journal pair/i);
   });
 });

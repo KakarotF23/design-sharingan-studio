@@ -14,15 +14,17 @@ import {
   governanceRootFingerprint,
   initializeGovernance,
   parseGovernanceMetadata,
+  readDriftReport,
   readGenome,
   renderGenome,
+  saveDriftReport,
 } from "../index";
 import { authenticateGovernanceReportSession } from "../../../../apps/studio/features/govern/govern-server";
 
 const roots: string[] = [];
 
 interface GovernanceSessionCheckpoint {
-  type: "GENOME_INIT";
+  type: "GENOME_INIT" | "DRIFT_AUDIT" | "RELEASE_GATE";
   status: string;
   entityId: string;
   revision: number;
@@ -210,5 +212,113 @@ describe("governance report session authentication", () => {
     await expect(readGenome(project.rootPath, project.id)).rejects.toThrow(
       /authenticated|authority/i,
     );
+  });
+
+  it("keeps initialize, approve, and signed audit history readable without treating superseded evidence as current", async () => {
+    const project = await projectFixture();
+    const created = await initializeGovernance({
+      rootPath: project.rootPath,
+      projectId: project.id,
+      genome: draftGenome(),
+      screens: [screenRecord()],
+      evidenceCatalog: evidenceCatalog(),
+      decisions: [],
+    });
+    const draftCheckpoint: GovernanceSessionCheckpoint = {
+      type: "GENOME_INIT",
+      status: created.genome.value.status,
+      entityId: created.genome.metadata.entityId,
+      revision: created.genome.metadata.revision,
+      artifactFingerprint: governanceArtifactFingerprint({
+        metadata: created.genome.metadata,
+        value: created.genome.value,
+        payloadHash: created.genome.payloadHash,
+        authority: created.genome.authority,
+      }),
+      rootFingerprint: await governanceRootFingerprint(project.rootPath),
+    };
+    await saveSession(project.rootPath, {
+      id: governanceSessionId(project.id, draftCheckpoint),
+      projectId: project.id,
+      ...draftCheckpoint,
+      createdAt: "2026-08-31T09:01:00.000Z",
+      updatedAt: "2026-08-31T09:01:00.000Z",
+    });
+
+    const approved = await approveGenome(project.rootPath, project.id, {
+      approvedBy: "local-user",
+      expectedRevision: created.genome.metadata.revision,
+      expectedPayloadHash: created.genome.payloadHash,
+    });
+    const approvedCheckpoint: GovernanceSessionCheckpoint = {
+      type: "GENOME_INIT",
+      status: approved.value.status,
+      entityId: approved.metadata.entityId,
+      revision: approved.metadata.revision,
+      artifactFingerprint: governanceArtifactFingerprint({
+        metadata: approved.metadata,
+        value: approved.value,
+        payloadHash: approved.payloadHash,
+        authority: approved.authority,
+      }),
+      rootFingerprint: await governanceRootFingerprint(project.rootPath),
+    };
+    await saveSession(project.rootPath, {
+      id: governanceSessionId(project.id, approvedCheckpoint),
+      projectId: project.id,
+      ...approvedCheckpoint,
+      createdAt: "2026-08-31T09:02:00.000Z",
+      updatedAt: "2026-08-31T09:02:00.000Z",
+    });
+
+    await saveDriftReport({
+      rootPath: project.rootPath,
+      projectId: project.id,
+      expectedRevision: 1,
+      evidenceCatalog: [],
+      report: {
+        requestedScope: "SELECTED_SCREENS",
+        expectedScope: [{ screen: "/overview", states: ["default"] }],
+        inspectedScope: [],
+        unavailableScope: ["/overview#default: No authenticated render."],
+        unverifiedScope: ["/overview#default: No authenticated render."],
+        evidenceIds: [],
+        findings: [],
+        overallStatus: "NOT_VERIFIED",
+      },
+      auditedAt: "2026-08-31T09:03:00.000Z",
+    });
+    const drift = await readDriftReport(project.rootPath, project.id);
+    const auditCheckpoint = {
+      type: "DRIFT_AUDIT" as const,
+      status: drift.value.overallStatus,
+      entityId: drift.metadata.entityId,
+      revision: drift.metadata.revision,
+      artifactFingerprint: governanceArtifactFingerprint({ metadata: drift.metadata, value: drift.value }),
+      rootFingerprint: await governanceRootFingerprint(project.rootPath),
+    };
+    await saveSession(project.rootPath, {
+      id: governanceSessionId(project.id, auditCheckpoint),
+      projectId: project.id,
+      ...auditCheckpoint,
+      createdAt: "2026-08-31T09:03:00.000Z",
+      updatedAt: "2026-08-31T09:03:00.000Z",
+    });
+
+    const report = await loadProjectReport(project.rootPath, project.id, {
+      offset: 0,
+      limit: 25,
+    }, {
+      authenticateGovernanceSession: async (_rootPath, _projectId, session) =>
+        authenticateGovernanceReportSession(project, session),
+    });
+
+    expect(report.sessions).toHaveLength(3);
+    expect(report.sessions.find(({ id }) => id === governanceSessionId(project.id, draftCheckpoint)))
+      .toMatchObject({ result: "NOT_VERIFIED", evidence: [], error: expect.stringMatching(/unavailable|superseded/i) });
+    expect(report.sessions.find(({ id }) => id === governanceSessionId(project.id, approvedCheckpoint)))
+      .toMatchObject({ result: "APPROVED" });
+    expect(report.sessions.find(({ type }) => type === "DRIFT_AUDIT"))
+      .toMatchObject({ result: "NOT_VERIFIED" });
   });
 });

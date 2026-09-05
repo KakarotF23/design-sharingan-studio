@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { expect, test } from "@playwright/test";
+import type { DesignSession } from "@design-sharingan/core";
+import { saveSession } from "@design-sharingan/project-adapters";
 
 const execFile = promisify(execFileCallback);
 let sandboxPath: string;
@@ -124,10 +126,12 @@ test("keeps the target unchanged until proposal approval, then applies one bound
       );
       return records.find((record) => record.type === "SAFE_EXECUTION")?.status;
     }, { intervals: [10], timeout: 5_000 })
-    .toBe("PROPOSING");
+    .toBe("WAITING_APPROVAL");
 
   await page.reload();
-  await expect(page.locator(".safe-activity")).toContainText(/read-only/i);
+  await expect(page.locator(".safe-activity")).toContainText(
+    "Waiting for explicit Change Proposal approval",
+  );
   await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
 
   await expect(page.getByRole("heading", { name: "Safe Mode change proposal" })).toBeVisible();
@@ -210,20 +214,15 @@ test("keeps the target unchanged until proposal approval, then applies one bound
           file,
           record: JSON.parse(
             await readFile(join(sessionDirectory, file), "utf8"),
-          ) as Record<string, any>,
+          ) as DesignSession,
         })),
     )
   ).find(({ record }) => record.type === "SAFE_EXECUTION");
   expect(waitingRecordFile?.record.status).toBe("WAITING_APPROVAL");
-  const waitingRecordPath = join(
-    sessionDirectory,
-    waitingRecordFile?.file as string,
-  );
-  const waitingRecordContents = await readFile(waitingRecordPath, "utf8");
   await page.route("**/execute/proposal/approve", async (route) => {
     const reconciliation = structuredClone(
       waitingRecordFile?.record,
-    ) as Record<string, any>;
+    ) as DesignSession & Record<string, any>;
     const occurredAt = new Date().toISOString();
     const approval = {
       id: "approval-fast-reconciliation",
@@ -248,11 +247,10 @@ test("keeps the target unchanged until proposal approval, then applies one bound
       ],
       occurredAt,
     };
-    await writeFile(
-      waitingRecordPath,
-      `${JSON.stringify(reconciliation)}\n`,
-      "utf8",
-    );
+    // The test fixture is an authenticated durable state transition, not a
+    // raw session-file mutation. This exercises reconciliation without
+    // bypassing the session/activity commit boundary.
+    await saveSession(projectPath, reconciliation);
     await route.fulfill({
       status: 422,
       contentType: "application/json",
@@ -271,14 +269,20 @@ test("keeps the target unchanged until proposal approval, then applies one bound
   );
   await expect(page.locator(".safe-activity")).not.toContainText(/applying|running/i);
   await page.unroute("**/execute/proposal/approve");
-  await writeFile(waitingRecordPath, waitingRecordContents, "utf8");
+  await saveSession(projectPath, waitingRecordFile?.record as DesignSession);
   await page.reload();
 
   let finishDelayedDataRequest!: () => void;
   const delayedDataRequest = new Promise<void>((resolve) => {
     finishDelayedDataRequest = resolve;
   });
+  let delayedDataRouteHandled = false;
   await page.route("**/execute/data", async (route) => {
+    if (delayedDataRouteHandled) {
+      await route.continue();
+      return;
+    }
+    delayedDataRouteHandled = true;
     try {
       await new Promise((resolve) => setTimeout(resolve, 400));
       const response = await route.fetch();
@@ -395,13 +399,7 @@ test("keeps the target unchanged until proposal approval, then applies one bound
     ],
   });
 
-  const safeRecordPath = join(
-    projectPath,
-    ".design-sharingan",
-    "sessions",
-    `${safeRecord?.id as string}.json`,
-  );
-  const editingRecord = structuredClone(safeRecord) as Record<string, any>;
+  const editingRecord = structuredClone(safeRecord) as DesignSession & Record<string, any>;
   const retainedDiff = editingRecord.mutationEvidence.git.diffAfter as string;
   editingRecord.mutationEvidence.git.truncation.diffAfter = {
     truncated: true,
@@ -409,7 +407,7 @@ test("keeps the target unchanged until proposal approval, then applies one bound
     originalBytes: 128 * 1024 + 100,
     retainedBytes: Buffer.byteLength(retainedDiff, "utf8"),
   };
-  await writeFile(safeRecordPath, `${JSON.stringify(editingRecord)}\n`, "utf8");
+  await saveSession(projectPath, editingRecord);
   await page.reload();
   await expect(page.getByText(/Git diff evidence truncated: retained/i)).toBeVisible();
 
@@ -425,11 +423,7 @@ test("keeps the target unchanged until proposal approval, then applies one bound
     occurredAt,
   };
   delete reconciliationRecord.mutationEvidence;
-  await writeFile(
-    safeRecordPath,
-    `${JSON.stringify(reconciliationRecord)}\n`,
-    "utf8",
-  );
+  await saveSession(projectPath, reconciliationRecord);
   let dataRequests = 0;
   page.on("request", (request) => {
     if (request.url().includes("/execute/data")) dataRequests += 1;

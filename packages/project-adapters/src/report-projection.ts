@@ -16,7 +16,7 @@ import {
   loadReferenceImage,
   isReferenceScanPendingSession,
   isReferenceScanResultSession,
-  listSessions,
+  listSessionPage,
 } from "./workspace-store";
 import { isMangekyoLoopSession, loadMangekyoLoopSession } from "./mangekyo-loop-store";
 import {
@@ -99,7 +99,7 @@ export type GovernanceSessionAuthenticator = (
   rootPath: string,
   projectId: string,
   session: DesignSession,
-) => Promise<void>;
+) => Promise<"AUTHENTICATED" | "UNAVAILABLE" | void>;
 
 export interface ReportProjectionOptions {
   authenticateGovernanceSession?: GovernanceSessionAuthenticator;
@@ -227,7 +227,10 @@ function baseReport(session: DesignSession): ReportSession {
   };
 }
 
-function reportForSession(session: DesignSession): ReportSession {
+function reportForSession(
+  session: DesignSession,
+  governanceEvidence: "AUTHENTICATED" | "UNAVAILABLE" = "AUTHENTICATED",
+): ReportSession {
   const report = baseReport(session);
   if (isReferenceScanPendingSession(session) || isReferenceScanResultSession(session)) {
     report.evidence = boundedEvidence([
@@ -317,7 +320,14 @@ function reportForSession(session: DesignSession): ReportSession {
     ]);
     return report;
   }
-  if (isGovernanceReportSession(session)) return report;
+  if (isGovernanceReportSession(session)) {
+    if (governanceEvidence === "UNAVAILABLE") {
+      report.result = "NOT_VERIFIED";
+      report.evidence = [];
+      report.error = "Historical governance evidence is unavailable or superseded; this row is retained without a current authority claim.";
+    }
+    return report;
+  }
   if (
     (session.status === "FAILED" || session.status === "NOT_VERIFIED") &&
     typeof (session as unknown as { error?: unknown }).error === "string"
@@ -387,7 +397,8 @@ async function assertAuthenticatedSessions(
   projectId: string,
   sessions: readonly DesignSession[],
   options: ReportProjectionOptions,
-): Promise<void> {
+): Promise<Set<string>> {
+  const unavailableGovernance = new Set<string>();
   const safeSessions = sessions.filter(({ type, status }) =>
     type === "SAFE_EXECUTION" && status !== "FAILED" && status !== "NOT_VERIFIED",
   );
@@ -427,11 +438,18 @@ async function assertAuthenticatedSessions(
       if (options.authenticateGovernanceSession === undefined) {
         throw new Error("Governance report evidence requires an authenticated loader");
       }
-      await options.authenticateGovernanceSession(rootPath, projectId, session);
+      const authentication = await options.authenticateGovernanceSession(rootPath, projectId, session);
+      if (authentication === "UNAVAILABLE") unavailableGovernance.add(session.id);
     }
     await assertReferenceEvidence(rootPath, projectId, session);
   }
-  for (const session of sessions) reportForSession(session);
+  for (const session of sessions) {
+    reportForSession(
+      session,
+      unavailableGovernance.has(session.id) ? "UNAVAILABLE" : "AUTHENTICATED",
+    );
+  }
+  return unavailableGovernance;
 }
 
 /**
@@ -446,16 +464,29 @@ export async function loadProjectReport(
   options: ReportProjectionOptions = {},
 ): Promise<ProjectReport> {
   assertPage(page);
-  const sessions = await listSessions(rootPath, projectId);
-  await assertAuthenticatedSessions(rootPath, projectId, sessions, options);
-  const selected = sessions.slice(page.offset, page.offset + page.limit);
+  const indexedPage = await listSessionPage(
+    rootPath,
+    projectId,
+    page.offset,
+    page.limit,
+  );
+  const selected = indexedPage.sessions;
+  const unavailableGovernance = await assertAuthenticatedSessions(
+    rootPath,
+    projectId,
+    selected,
+    options,
+  );
   const visibleSessionIds = new Set(selected.map(({ id }) => id));
   const [activity, reportSessions] = await Promise.all([
     listActivityEvents(rootPath, projectId),
-    Promise.resolve(selected.map(reportForSession)),
+    Promise.resolve(selected.map((session) => reportForSession(
+      session,
+      unavailableGovernance.has(session.id) ? "UNAVAILABLE" : "AUTHENTICATED",
+    ))),
   ]);
   return {
-    total: sessions.length,
+    total: indexedPage.total,
     offset: page.offset,
     limit: page.limit,
     sessions: reportSessions,

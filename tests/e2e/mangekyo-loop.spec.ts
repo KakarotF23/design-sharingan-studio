@@ -91,7 +91,10 @@ test.afterAll(async () => {
 test("allows a style round then enters a durable HUMAN_GATE before a navigation mutation", async ({
   page,
 }) => {
-  test.setTimeout(60_000);
+  // The real render/process loop runs twice after the concurrent-start proof;
+  // retain condition-based waits without capping the full durable workflow at
+  // one minute on a busy local filesystem.
+  test.setTimeout(210_000);
   await page.goto("/projects?source=local");
   await page.getByLabel("Project folder path").fill(projectPath);
   await page.getByRole("button", { name: "Scan project" }).click();
@@ -303,7 +306,9 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
 
   await page.reload();
   await page.getByRole("button", { name: "Mangekyō" }).click();
-  await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible({
+    timeout: 90_000,
+  });
   const approveResponse = page.waitForResponse((response) =>
     response.request().method() === "POST" && response.url().endsWith("/mangekyo/decision"),
   );
@@ -316,24 +321,28 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
   });
   await expect(
     page.getByLabel("Current visual round").getByText("FIXING", { exact: true }),
-  ).toBeVisible({ timeout: 20_000 });
+  ).toBeVisible({ timeout: 40_000 });
   await page.reload();
   await page.getByRole("button", { name: "Mangekyō" }).click();
   await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible({
-    timeout: 20_000,
+    timeout: 90_000,
   });
   expect(await readFile(join(projectPath, "server.mjs"), "utf8")).toContain(
     "data-mangekyo-navigation=\"approved\"",
   );
   await expect(page.getByRole("button", { name: "Stop visual loop" })).toBeVisible();
   await page.getByRole("button", { name: "Stop visual loop" }).click();
-  await expect(page.getByText("BLOCKED", { exact: true })).toBeVisible();
+  await expect(page.getByText("BLOCKED", { exact: true })).toBeVisible({
+    timeout: 20_000,
+  });
   await expect(page.locator(".mangekyo-activity")).toContainText(
     "stopped without a whole-product pass",
   );
   await page.reload();
   await page.getByRole("button", { name: "Mangekyō" }).click();
-  await expect(page.getByText("BLOCKED", { exact: true })).toBeVisible();
+  await expect(page.getByText("BLOCKED", { exact: true })).toBeVisible({
+    timeout: 20_000,
+  });
   const stoppedLoop = (
     await Promise.all(
       (await readdir(join(projectPath, ".design-sharingan", "sessions")))

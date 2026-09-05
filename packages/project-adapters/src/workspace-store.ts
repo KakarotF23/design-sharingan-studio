@@ -42,9 +42,47 @@ const MAX_RECORD_BYTES = 1024 * 1024;
 const MAX_RENDER_BYTES = 25 * 1024 * 1024;
 const MAX_SESSION_HISTORY_ENTRIES = 512;
 const MAX_ACTIVITY_HISTORY_ENTRIES = 1_024;
+const MAX_ACTIVITY_DIRECTORY_ENTRIES =
+  MAX_ACTIVITY_HISTORY_ENTRIES + MAX_SESSION_HISTORY_ENTRIES;
 const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
 const CHECKPOINT_SUFFIX = ".checkpoint.json";
+const SESSION_HEAD_SUFFIX = ".session-head.json";
 const ACTIVITY_ID_PATTERN = /^act_[a-f0-9]{64}$/;
+
+export type SessionCommitFault =
+  | "after-journal-before-session"
+  | "after-session-before-commit";
+let sessionCommitFault: SessionCommitFault | undefined;
+
+/** Test-only fault injection for process-death boundaries in the session journal. */
+export function setSessionCommitFaultForTest(value: SessionCommitFault | undefined): void {
+  sessionCommitFault = value;
+}
+
+class InjectedSessionCommitCrash extends Error {
+  constructor(point: SessionCommitFault) {
+    super(`Injected session commit crash: ${point}`);
+    this.name = "InjectedSessionCommitCrash";
+  }
+}
+
+function throwSessionCommitFault(point: SessionCommitFault): void {
+  if (sessionCommitFault === point) throw new InjectedSessionCommitCrash(point);
+}
+
+export type LearnTransitionHookPoint = "after-claim" | "before-release";
+export type LearnTransitionHook = (input: {
+  point: LearnTransitionHookPoint;
+  ownerId: string;
+  projectId: string;
+  sessionId: string;
+}) => Promise<void> | void;
+let learnTransitionHook: LearnTransitionHook | undefined;
+
+/** Test-only scheduling hook for deterministic claim interleavings. */
+export function setLearnTransitionHookForTest(value: LearnTransitionHook | undefined): void {
+  learnTransitionHook = value;
+}
 
 interface SessionCheckpoint {
   eventId: string;
@@ -53,6 +91,32 @@ interface SessionCheckpoint {
   version: number;
   sessionHash: string;
   session: DesignSession;
+}
+
+interface SessionCommitHead {
+  kind: "DESIGN_SHARINGAN_SESSION_HEAD";
+  projectId: string;
+  sessionId: string;
+  eventId: string;
+  version: number;
+  sessionHash: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface SessionCommitClaim {
+  kind: "DESIGN_SHARINGAN_SESSION_COMMIT_CLAIM";
+  ownerId: string;
+  pid: number;
+  projectId: string;
+  sessionId: string;
+}
+
+interface OwnedSessionCommitClaim {
+  path: string;
+  value: SessionCommitClaim;
+  handle: Awaited<ReturnType<typeof open>>;
+  ownership: { dev: number; ino: number };
 }
 
 export interface DesignWorkspace {
@@ -278,11 +342,28 @@ async function unlinkCreatedFileIfOwned(
 }
 
 function boundedSessionContents(session: DesignSession): string {
+  assertBoundedSessionReferenceIds(session);
   const contents = stableJson(session);
   if (new TextEncoder().encode(contents).byteLength > MAX_RECORD_BYTES) {
     throw new Error("Session record is too large; maximum size is 1 MiB");
   }
   return contents;
+}
+
+function assertBoundedSessionReferenceIds(session: DesignSession): void {
+  const record = session as unknown as Record<string, unknown>;
+  const candidates: unknown[] = [record.referenceIds];
+  if (record.designDNA !== null && typeof record.designDNA === "object") {
+    candidates.push((record.designDNA as Record<string, unknown>).referenceIds);
+  }
+  for (const value of candidates) {
+    if (value === undefined) continue;
+    if (
+      !Array.isArray(value) || value.length > 32 ||
+      value.some((entry) => !isCanonicalIdentifier(entry)) ||
+      new Set(value).size !== value.length
+    ) throw new Error("Session reference-id arrays must be unique and bounded to 32 canonical ids");
+  }
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -1373,6 +1454,8 @@ interface BoundedFileEntry {
   name: string;
   path: string;
   size: number;
+  dev: number;
+  ino: number;
 }
 
 async function boundedJsonDirectory(
@@ -1403,7 +1486,13 @@ async function boundedJsonDirectory(
     if (aggregateBytes > MAX_HISTORY_BYTES) {
       throw new Error(`${label} exceeds the bounded history byte budget`);
     }
-    files.push({ name: entry.name, path, size: identity.size });
+    files.push({
+      name: entry.name,
+      path,
+      size: identity.size,
+      dev: identity.dev,
+      ino: identity.ino,
+    });
   }
   return files;
 }
@@ -1411,11 +1500,12 @@ async function boundedJsonDirectory(
 async function readSessionCheckpoints(
   workspace: DesignWorkspace,
   projectId?: string,
+  existingFiles?: readonly BoundedFileEntry[],
 ): Promise<SessionCheckpoint[]> {
-  const files = await boundedJsonDirectory(
+  const files = existingFiles ?? await boundedJsonDirectory(
     workspace.activityPath,
     "Activity history",
-    MAX_ACTIVITY_HISTORY_ENTRIES,
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
   );
   const checkpoints: SessionCheckpoint[] = [];
   for (const file of files.filter(({ name }) => name.endsWith(CHECKPOINT_SUFFIX))) {
@@ -1429,6 +1519,346 @@ async function readSessionCheckpoints(
     checkpoints.push(value);
   }
   return checkpoints;
+}
+
+function sessionHeadFileName(sessionId: string): string {
+  assertSafePathSegment(sessionId, "Session id");
+  return `${sessionId}${SESSION_HEAD_SUFFIX}`;
+}
+
+function sessionCommitHeadFor(checkpoint: SessionCheckpoint): SessionCommitHead {
+  return {
+    kind: "DESIGN_SHARINGAN_SESSION_HEAD",
+    projectId: checkpoint.projectId,
+    sessionId: checkpoint.sessionId,
+    eventId: checkpoint.eventId,
+    version: checkpoint.version,
+    sessionHash: checkpoint.sessionHash,
+    createdAt: checkpoint.session.createdAt,
+    updatedAt: checkpoint.session.updatedAt,
+  };
+}
+
+function isSessionCommitHead(value: unknown): value is SessionCommitHead {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const head = value as Partial<SessionCommitHead>;
+  return (
+    Object.keys(value).sort().join("\0") === [
+      "createdAt", "eventId", "kind", "projectId", "sessionHash", "sessionId",
+      "updatedAt", "version",
+    ].join("\0") &&
+    head.kind === "DESIGN_SHARINGAN_SESSION_HEAD" &&
+    isCanonicalIdentifier(head.projectId) && isCanonicalIdentifier(head.sessionId) &&
+    typeof head.eventId === "string" && ACTIVITY_ID_PATTERN.test(head.eventId) &&
+    Number.isSafeInteger(head.version) && Number(head.version) > 0 &&
+    Number(head.version) <= MAX_SESSION_HISTORY_ENTRIES &&
+    typeof head.sessionHash === "string" && /^[a-f0-9]{64}$/.test(head.sessionHash) &&
+    isCanonicalIsoDateTime(head.createdAt) && isCanonicalIsoDateTime(head.updatedAt) &&
+    Date.parse(head.updatedAt) >= Date.parse(head.createdAt)
+  );
+}
+
+async function readSessionCommitHeads(
+  workspace: DesignWorkspace,
+  projectId: string,
+  files: readonly BoundedFileEntry[],
+  checkpoints: readonly SessionCheckpoint[],
+): Promise<Map<string, SessionCommitHead>> {
+  const checkpointsByEvent = new Map(checkpoints.map((checkpoint) => [checkpoint.eventId, checkpoint]));
+  const heads = new Map<string, SessionCommitHead>();
+  const headFiles = files.filter(({ name }) => name.endsWith(SESSION_HEAD_SUFFIX));
+  if (headFiles.length > MAX_SESSION_HISTORY_ENTRIES) {
+    throw new Error("Session head index exceeds its bounded entry budget");
+  }
+  for (const file of headFiles) {
+    const sessionId = file.name.slice(0, -SESSION_HEAD_SUFFIX.length);
+    assertSafePathSegment(sessionId, "Session id");
+    const value = await readBoundedJsonFile(file.path, "Session head record");
+    if (
+      !isSessionCommitHead(value) || value.projectId !== projectId ||
+      value.sessionId !== sessionId || file.name !== sessionHeadFileName(value.sessionId) ||
+      heads.has(value.sessionId)
+    ) throw new Error("Session head index is invalid or ambiguous");
+    const checkpoint = checkpointsByEvent.get(value.eventId);
+    if (
+      checkpoint === undefined || checkpoint.sessionId !== value.sessionId ||
+      stableJson(value) !== stableJson(sessionCommitHeadFor(checkpoint))
+    ) throw new Error("Session head is not authenticated by its immutable checkpoint");
+    heads.set(value.sessionId, value);
+  }
+  return heads;
+}
+
+async function writeSessionCommitHead(
+  workspace: DesignWorkspace,
+  checkpoint: SessionCheckpoint,
+): Promise<void> {
+  await atomicWriteJson(
+    workspace.activityPath,
+    assertPathInsideWorkspace(
+      workspace.activityPath,
+      join(workspace.activityPath, sessionHeadFileName(checkpoint.sessionId)),
+    ),
+    sessionCommitHeadFor(checkpoint),
+  );
+}
+
+async function removeBoundedFileIfOwned(file: BoundedFileEntry): Promise<void> {
+  await unlinkCreatedFileIfOwned(file.path, { dev: file.dev, ino: file.ino });
+}
+
+function sessionCommitClaimPath(workspace: DesignWorkspace, sessionId: string): string {
+  assertSafePathSegment(sessionId, "Session id");
+  return assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `.${sessionId}.session-commit.claim`),
+  );
+}
+
+function isSessionCommitClaim(value: unknown): value is SessionCommitClaim {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const claim = value as Partial<SessionCommitClaim>;
+  return (
+    Object.keys(value).sort().join("\0") === [
+      "kind", "ownerId", "pid", "projectId", "sessionId",
+    ].join("\0") &&
+    claim.kind === "DESIGN_SHARINGAN_SESSION_COMMIT_CLAIM" &&
+    typeof claim.ownerId === "string" && /^[a-f0-9-]{36}$/.test(claim.ownerId) &&
+    Number.isSafeInteger(claim.pid) && Number(claim.pid) > 0 && Number(claim.pid) <= 2_147_483_647 &&
+    isCanonicalIdentifier(claim.projectId) && isCanonicalIdentifier(claim.sessionId)
+  );
+}
+
+async function removeExactSessionCommitClaim(
+  path: string,
+  value: SessionCommitClaim,
+  ownership: { dev: number; ino: number },
+): Promise<boolean> {
+  const before = await lstat(path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (
+    before === undefined || before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 ||
+    before.dev !== ownership.dev || before.ino !== ownership.ino
+  ) return false;
+  const persisted = await readBoundedJsonFile(path, "Session commit claim");
+  const after = await lstat(path).catch(() => undefined);
+  if (
+    !isSessionCommitClaim(persisted) || stableJson(persisted) !== stableJson(value) ||
+    after === undefined || after.dev !== before.dev || after.ino !== before.ino || after.nlink !== 1
+  ) return false;
+  await unlink(path);
+  return true;
+}
+
+function processIsAlive(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(error instanceof Error && "code" in error && error.code === "ESRCH");
+  }
+}
+
+async function hasLiveSessionCommitClaim(
+  workspace: DesignWorkspace,
+  projectId: string,
+  sessionId: string,
+): Promise<boolean> {
+  const path = sessionCommitClaimPath(workspace, sessionId);
+  const identity = await lstat(path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (identity === undefined) return false;
+  if (identity.isSymbolicLink() || !identity.isFile() || identity.nlink !== 1) {
+    throw new Error("Session commit claim is invalid or ambiguous");
+  }
+  const value = await readBoundedJsonFile(path, "Session commit claim");
+  if (!isSessionCommitClaim(value) || value.projectId !== projectId || value.sessionId !== sessionId) {
+    throw new Error("Session commit claim is invalid or ambiguous");
+  }
+  if (processIsAlive(value.pid)) return true;
+  await removeExactSessionCommitClaim(path, value, { dev: identity.dev, ino: identity.ino });
+  return false;
+}
+
+async function acquireSessionCommitClaim(
+  workspace: DesignWorkspace,
+  projectId: string,
+  sessionId: string,
+): Promise<OwnedSessionCommitClaim> {
+  const path = sessionCommitClaimPath(workspace, sessionId);
+  const value: SessionCommitClaim = {
+    kind: "DESIGN_SHARINGAN_SESSION_COMMIT_CLAIM",
+    ownerId: randomUUID(),
+    pid: process.pid,
+    projectId,
+    sessionId,
+  };
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(stableJson(value), "utf8");
+    await handle.sync();
+    const identity = await handle.stat();
+    return {
+      path,
+      value,
+      handle,
+      ownership: { dev: identity.dev, ino: identity.ino },
+    };
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      throw new Error("Session commit is already in progress", { cause: error });
+    }
+    throw error;
+  }
+}
+
+async function releaseSessionCommitClaim(claim: OwnedSessionCommitClaim): Promise<void> {
+  await claim.handle.close().catch(() => undefined);
+  await removeExactSessionCommitClaim(
+    claim.path,
+    claim.value,
+    claim.ownership,
+  ).catch(() => undefined);
+}
+
+async function readSessionRecordForRecovery(
+  workspace: DesignWorkspace,
+  projectId: string,
+  sessionId: string,
+): Promise<DesignSession | undefined> {
+  const path = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${sessionId}.json`),
+  );
+  try {
+    const value = await readBoundedJsonFile(path, "Session record");
+    if (!isPersistedSession(value) || value.projectId !== projectId || value.id !== sessionId) {
+      throw new Error("Session record is invalid during commit recovery");
+    }
+    return value;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Recover only a single uncommitted next checkpoint per session. The session
+ * head is the final authority marker: if the mutable session reached the next
+ * immutable checkpoint, publish its head; otherwise remove that exact future
+ * journal pair. Committed history is never repaired or silently discarded.
+ */
+async function recoverSessionCommits(
+  workspace: DesignWorkspace,
+  projectId: string,
+): Promise<void> {
+  let files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  let checkpoints = await readSessionCheckpoints(workspace, projectId, files);
+  let heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
+  const fileByName = new Map(files.map((file) => [file.name, file]));
+  const bySession = new Map<string, SessionCheckpoint[]>();
+  for (const checkpoint of checkpoints) {
+    bySession.set(checkpoint.sessionId, [
+      ...(bySession.get(checkpoint.sessionId) ?? []),
+      checkpoint,
+    ]);
+  }
+  for (const [sessionId, values] of bySession) {
+    values.sort((left, right) => left.version - right.version);
+    const versions = new Set(values.map(({ version }) => version));
+    if (
+      versions.size !== values.length ||
+      values.some((checkpoint, index) => checkpoint.version !== index + 1)
+    ) throw new Error("Session checkpoint versions are ambiguous or non-contiguous");
+    const head = heads.get(sessionId);
+    const committedVersion = head?.version ?? 0;
+    const future = values.filter(({ version }) => version > committedVersion);
+    if (future.length === 0) continue;
+    if (await hasLiveSessionCommitClaim(workspace, projectId, sessionId)) {
+      throw new Error("Session commit is still in progress; committed head remains authoritative");
+    }
+    if (future.length !== 1 || future[0]!.version !== committedVersion + 1) {
+      throw new Error("Session has ambiguous future checkpoints");
+    }
+    const candidate = future[0]!;
+    const eventFile = fileByName.get(`${candidate.eventId}.json`);
+    const checkpointFile = fileByName.get(`${candidate.eventId}${CHECKPOINT_SUFFIX}`);
+    if (checkpointFile === undefined) {
+      throw new Error("Future session activity is missing its immutable checkpoint");
+    }
+    const session = await readSessionRecordForRecovery(workspace, projectId, sessionId);
+    if (eventFile === undefined) {
+      const currentMatchesHead = session !== undefined && head !== undefined &&
+        sessionCheckpointHash(session) === head.sessionHash;
+      if ((session === undefined && head === undefined) || currentMatchesHead) {
+        await removeBoundedFileIfOwned(checkpointFile);
+        continue;
+      }
+      throw new Error("Future session checkpoint cannot be recovered without its activity event");
+    }
+    const event = await readBoundedJsonFile(eventFile.path, "Activity record");
+    const expectedEvent = activityEventForSession(
+      candidate.session,
+      candidate.sessionHash,
+      candidate.version,
+    );
+    if (!validateActivityEvent(event) || stableJson(event) !== stableJson(expectedEvent)) {
+      throw new Error("Future activity event does not match its immutable checkpoint");
+    }
+    if (
+      session !== undefined && sessionCheckpointHash(session) === candidate.sessionHash &&
+      stableJson(session) === stableJson(candidate.session)
+    ) {
+      await writeSessionCommitHead(workspace, candidate);
+      continue;
+    }
+    const currentMatchesHead = session !== undefined && head !== undefined &&
+      sessionCheckpointHash(session) === head.sessionHash;
+    if ((session === undefined && head === undefined) || currentMatchesHead) {
+      await removeBoundedFileIfOwned(eventFile);
+      await removeBoundedFileIfOwned(checkpointFile);
+      continue;
+    }
+    throw new Error("Session and future journal checkpoint have ambiguous commit truth");
+  }
+
+  // Re-read after recovery and require every retained immutable checkpoint to
+  // be at or below one exact authenticated session head.
+  files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  checkpoints = await readSessionCheckpoints(workspace, projectId, files);
+  heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
+  const latestBySession = new Map<string, SessionCheckpoint>();
+  for (const checkpoint of checkpoints) {
+    const previous = latestBySession.get(checkpoint.sessionId);
+    if (previous === undefined || checkpoint.version > previous.version) {
+      latestBySession.set(checkpoint.sessionId, checkpoint);
+    }
+  }
+  for (const [sessionId, latest] of latestBySession) {
+    const head = heads.get(sessionId);
+    if (head === undefined || head.eventId !== latest.eventId || head.version !== latest.version) {
+      throw new Error("Session journal has no committed head");
+    }
+  }
 }
 
 /**
@@ -1445,7 +1875,9 @@ async function assertActivityJournalPairing(
   const checkpointsByEvent = new Map(
     checkpoints.map((checkpoint) => [checkpoint.eventId, checkpoint]),
   );
-  for (const file of files.filter(({ name }) => !name.endsWith(CHECKPOINT_SUFFIX))) {
+  for (const file of files.filter(
+    ({ name }) => !name.endsWith(CHECKPOINT_SUFFIX) && !name.endsWith(SESSION_HEAD_SUFFIX),
+  )) {
     const id = file.name.slice(0, -".json".length);
     if (!ACTIVITY_ID_PATTERN.test(id)) throw new Error("Activity event identity is invalid");
     const value = await readBoundedJsonFile(file.path, "Activity record");
@@ -1467,35 +1899,82 @@ async function assertActivityJournalPairing(
 async function persistSessionActivity(
   workspace: DesignWorkspace,
   session: DesignSession,
+  recover = true,
 ): Promise<{
   path: string;
   ownership?: { dev: number; ino: number };
   checkpointPath: string;
   checkpointOwnership?: { dev: number; ino: number };
+  checkpoint: SessionCheckpoint;
 }> {
-  const checkpointHash = sessionCheckpointHash(session);
-  const files = await boundedJsonDirectory(
+  assertBoundedSessionReferenceIds(session);
+  const committedHeadPath = assertPathInsideWorkspace(
+    workspace.activityPath,
+    join(workspace.activityPath, sessionHeadFileName(session.id)),
+  );
+  const sessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${session.id}.json`),
+  );
+  if (recover && ((await pathExists(committedHeadPath)) || (await pathExists(sessionPath)))) {
+    await recoverSessionCommits(workspace, session.projectId);
+  }
+  const boundedFiles = await boundedJsonDirectory(
     workspace.activityPath,
     "Activity history",
-    MAX_ACTIVITY_HISTORY_ENTRIES,
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
   );
-  const checkpoints = await readSessionCheckpoints(workspace, session.projectId);
-  await assertActivityJournalPairing(session.projectId, files, checkpoints);
-  const sessionCheckpoints = checkpoints.filter(
-    (checkpoint) => checkpoint.sessionId === session.id && checkpoint.projectId === session.projectId,
+  const boundedCheckpoints = await readSessionCheckpoints(
+    workspace,
+    session.projectId,
+    boundedFiles,
   );
-  const latestVersion = Math.max(0, ...sessionCheckpoints.map((checkpoint) => checkpoint.version));
-  const matchingCheckpoint = sessionCheckpoints.find(
-    (checkpoint) => checkpoint.sessionId === session.id &&
-      checkpoint.projectId === session.projectId &&
-      checkpoint.sessionHash === checkpointHash &&
-      stableJson(checkpoint.session) === stableJson(session),
+  await readSessionCommitHeads(
+    workspace,
+    session.projectId,
+    boundedFiles,
+    boundedCheckpoints,
   );
+  await assertActivityJournalPairing(
+    session.projectId,
+    boundedFiles,
+    boundedCheckpoints,
+  );
+  const checkpointHash = sessionCheckpointHash(session);
+  const committedHeadValue = await readBoundedJsonFile(
+    committedHeadPath,
+    "Session head record",
+  ).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  let committedCheckpoint: SessionCheckpoint | undefined;
+  if (committedHeadValue !== undefined) {
+    if (
+      !isSessionCommitHead(committedHeadValue) ||
+      committedHeadValue.projectId !== session.projectId ||
+      committedHeadValue.sessionId !== session.id
+    ) throw new Error("Session head record is invalid");
+    const path = assertPathInsideWorkspace(
+      workspace.activityPath,
+      join(workspace.activityPath, `${committedHeadValue.eventId}${CHECKPOINT_SUFFIX}`),
+    );
+    const value = await readBoundedJsonFile(path, "Session checkpoint");
+    if (
+      !isSessionCheckpoint(value) ||
+      stableJson(committedHeadValue) !== stableJson(sessionCommitHeadFor(value))
+    ) throw new Error("Session head is not authenticated by its immutable checkpoint");
+    committedCheckpoint = value;
+  }
+  const latestVersion = committedCheckpoint?.version ?? 0;
   // A retry of the current head is idempotent. A deliberate rollback to an
   // earlier immutable checkpoint receives a new version so the head remains
   // monotonic and its event remains auditable.
-  const existingCheckpoint = matchingCheckpoint !== undefined &&
-    matchingCheckpoint.version === latestVersion ? matchingCheckpoint : undefined;
+  const existingCheckpoint = committedCheckpoint !== undefined &&
+    committedCheckpoint.sessionHash === checkpointHash &&
+    stableJson(committedCheckpoint.session) === stableJson(session)
+    ? committedCheckpoint
+    : undefined;
   const checkpointVersion = existingCheckpoint?.version ?? latestVersion + 1;
   if (checkpointVersion > MAX_SESSION_HISTORY_ENTRIES) {
     throw new Error("Session checkpoint history exceeds its bounded entry budget");
@@ -1518,6 +1997,14 @@ async function persistSessionActivity(
     sessionHash: checkpointHash,
     session,
   } satisfies SessionCheckpoint);
+  const checkpoint: SessionCheckpoint = {
+    eventId: event.id,
+    sessionId: session.id,
+    projectId: session.projectId,
+    version: checkpointVersion,
+    sessionHash: checkpointHash,
+    session,
+  };
   if (existingCheckpoint !== undefined && existingCheckpoint.eventId !== event.id) {
     throw new Error("Session checkpoint identity could not be reproduced");
   }
@@ -1532,7 +2019,7 @@ async function persistSessionActivity(
     }
     try {
       const ownership = await atomicCreate(workspace.activityPath, path, contents);
-      return { path, ownership, checkpointPath, checkpointOwnership };
+      return { path, ownership, checkpointPath, checkpointOwnership, checkpoint };
     } catch (error) {
       if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
       const existing = await readBoundedJsonFile(path, "Activity record");
@@ -1544,7 +2031,7 @@ async function persistSessionActivity(
       ) {
         throw new Error("Activity event identity conflicts with durable evidence");
       }
-      return { path, checkpointPath, checkpointOwnership };
+      return { path, checkpointPath, checkpointOwnership, checkpoint };
     }
   } catch (error) {
     if (checkpointOwnership !== undefined) {
@@ -1563,12 +2050,14 @@ export async function listActivityEvents(
   projectId: string,
 ): Promise<readonly ActivityEvent[]> {
   const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
   const files = await boundedJsonDirectory(
     workspace.activityPath,
     "Activity history",
-    MAX_ACTIVITY_HISTORY_ENTRIES,
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
   );
-  const checkpoints = await readSessionCheckpoints(workspace, projectId);
+  const checkpoints = await readSessionCheckpoints(workspace, projectId, files);
+  const heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
   await assertActivityJournalPairing(projectId, files, checkpoints);
   const checkpointsByEvent = new Map(checkpoints.map((checkpoint) => [checkpoint.eventId, checkpoint]));
   const latestBySession = new Map<string, SessionCheckpoint>();
@@ -1580,7 +2069,9 @@ export async function listActivityEvents(
     if (previous === undefined || checkpoint.version > previous.version) latestBySession.set(checkpoint.sessionId, checkpoint);
   }
   const events: ActivityEvent[] = [];
-  for (const file of files.filter(({ name }) => !name.endsWith(CHECKPOINT_SUFFIX))) {
+  for (const file of files.filter(
+    ({ name }) => !name.endsWith(CHECKPOINT_SUFFIX) && !name.endsWith(SESSION_HEAD_SUFFIX),
+  )) {
     const id = file.name.slice(0, -".json".length);
     if (!ACTIVITY_ID_PATTERN.test(id)) throw new Error("Activity event identity is invalid");
     const event = await readBoundedJsonFile(file.path, "Activity record");
@@ -1603,7 +2094,11 @@ export async function listActivityEvents(
   const sessionsById = new Map(sessions.map((session) => [session.id, session]));
   for (const [sessionId, latest] of latestBySession) {
     const session = sessionsById.get(sessionId);
-    if (session === undefined || latest.sessionHash !== sessionCheckpointHash(session)) {
+    const head = heads.get(sessionId);
+    if (
+      session === undefined || latest.sessionHash !== sessionCheckpointHash(session) ||
+      head === undefined || head.eventId !== latest.eventId || head.version !== latest.version
+    ) {
       throw new Error("Session record does not match its latest immutable checkpoint");
     }
   }
@@ -1632,19 +2127,48 @@ export async function saveSession(
     join(workspace.sessionsPath, `${session.id}.json`),
   );
   const contents = boundedSessionContents(session);
-  const activity = await persistSessionActivity(workspace, session);
+  await recoverSessionCommits(workspace, session.projectId);
+  let commitClaim: OwnedSessionCommitClaim | undefined =
+    await acquireSessionCommitClaim(workspace, session.projectId, session.id);
   try {
-    await atomicWrite(workspace.sessionsPath, sessionPath, contents);
-  } catch (error) {
-    if (activity.ownership !== undefined) {
-      await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(() => undefined);
+    const activity = await persistSessionActivity(workspace, session, false);
+    let sessionWritten = false;
+    try {
+      throwSessionCommitFault("after-journal-before-session");
+      await atomicWrite(workspace.sessionsPath, sessionPath, contents);
+      sessionWritten = true;
+      throwSessionCommitFault("after-session-before-commit");
+      await writeSessionCommitHead(workspace, activity.checkpoint);
+    } catch (error) {
+      if (error instanceof InjectedSessionCommitCrash) throw error;
+      if (sessionWritten) {
+        await releaseSessionCommitClaim(commitClaim);
+        commitClaim = undefined;
+        await recoverSessionCommits(workspace, session.projectId);
+        const headPath = assertPathInsideWorkspace(
+          workspace.activityPath,
+          join(workspace.activityPath, sessionHeadFileName(session.id)),
+        );
+        const recovered = await readBoundedJsonFile(headPath, "Session head record");
+        if (
+          isSessionCommitHead(recovered) &&
+          recovered.eventId === activity.checkpoint.eventId &&
+          recovered.sessionHash === activity.checkpoint.sessionHash
+        ) return sessionPath;
+      } else {
+        if (activity.ownership !== undefined) {
+          await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(() => undefined);
+        }
+        if (activity.checkpointOwnership !== undefined) {
+          await unlinkCreatedFileIfOwned(activity.checkpointPath, activity.checkpointOwnership).catch(() => undefined);
+        }
+      }
+      throw error;
     }
-    if (activity.checkpointOwnership !== undefined) {
-      await unlinkCreatedFileIfOwned(activity.checkpointPath, activity.checkpointOwnership).catch(() => undefined);
-    }
-    throw error;
+    return sessionPath;
+  } finally {
+    if (commitClaim !== undefined) await releaseSessionCommitClaim(commitClaim);
   }
-  return sessionPath;
 }
 
 export async function loadSession(
@@ -1654,6 +2178,7 @@ export async function loadSession(
 ): Promise<DesignSession> {
   assertSafePathSegment(sessionId, "Session id");
   const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
   const sessionPath = assertPathInsideWorkspace(
     workspace.sessionsPath,
     join(workspace.sessionsPath, `${sessionId}.json`),
@@ -1666,6 +2191,16 @@ export async function loadSession(
   ) {
     throw new Error("Session record is invalid");
   }
+  const headPath = assertPathInsideWorkspace(
+    workspace.activityPath,
+    join(workspace.activityPath, sessionHeadFileName(sessionId)),
+  );
+  const head = await readBoundedJsonFile(headPath, "Session head record");
+  if (
+    !isSessionCommitHead(head) || head.projectId !== projectId || head.sessionId !== sessionId ||
+    head.sessionHash !== sessionCheckpointHash(persisted) ||
+    head.createdAt !== persisted.createdAt || head.updatedAt !== persisted.updatedAt
+  ) throw new Error("Session record is not part of a committed journal pair");
   return persisted;
 }
 
@@ -1673,27 +2208,115 @@ async function withLearnTransitionClaim<T>(
   rootPath: string,
   projectId: string,
   sessionId: string,
+  expectedStatus: LearnSessionStatus,
   action: () => Promise<T>,
 ): Promise<T> {
-  const workspace = await ensureDesignWorkspace(rootPath);
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
   const claimPath = assertPathInsideWorkspace(
     workspace.sessionsPath,
     join(workspace.sessionsPath, `.${sessionId}.learn.claim`),
   );
+  const source = await loadSession(rootPath, projectId, sessionId);
+  const claimValue = {
+    kind: "DESIGN_SHARINGAN_LEARN_CLAIM" as const,
+    ownerId: randomUUID(),
+    projectId,
+    sessionId,
+    expectedStatus,
+    expectedSessionHash: sessionCheckpointHash(source),
+  };
+  const claimContents = stableJson(claimValue);
   let claim: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    claim = await open(claimPath, "wx", 0o600);
-    await claim.writeFile(`${projectId}\n`, "utf8");
-    await claim.sync();
-    return await action();
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-      throw new Error("Learn session transition is already in progress", { cause: error });
+  let ownership: { dev: number; ino: number } | undefined;
+
+  const removeExactClaim = async (
+    expected: typeof claimValue,
+    expectedOwnership: { dev: number; ino: number },
+  ): Promise<boolean> => {
+    const before = await lstat(claimPath).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (
+      before === undefined || before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 ||
+      before.dev !== expectedOwnership.dev || before.ino !== expectedOwnership.ino
+    ) return false;
+    const persisted = await readBoundedJsonFile(claimPath, "Learn transition claim");
+    const after = await lstat(claimPath).catch(() => undefined);
+    if (
+      stableJson(persisted) !== stableJson(expected) || after === undefined ||
+      after.dev !== before.dev || after.ino !== before.ino || after.nlink !== 1
+    ) return false;
+    await unlink(claimPath);
+    return true;
+  };
+
+  const recoverStaleClaim = async (): Promise<boolean> => {
+    const identity = await lstat(claimPath);
+    if (identity.isSymbolicLink() || !identity.isFile() || identity.nlink !== 1) {
+      throw new Error("Learn session transition claim is invalid or ambiguous");
     }
-    throw error;
+    const persisted = await readBoundedJsonFile(claimPath, "Learn transition claim") as Partial<typeof claimValue>;
+    if (
+      persisted.kind !== "DESIGN_SHARINGAN_LEARN_CLAIM" ||
+      typeof persisted.ownerId !== "string" || !/^[a-f0-9-]{36}$/.test(persisted.ownerId) ||
+      persisted.projectId !== projectId || persisted.sessionId !== sessionId ||
+      typeof persisted.expectedStatus !== "string" ||
+      typeof persisted.expectedSessionHash !== "string" ||
+      !/^[a-f0-9]{64}$/.test(persisted.expectedSessionHash) ||
+      Object.keys(persisted).sort().join("\0") !== [
+        "expectedSessionHash", "expectedStatus", "kind", "ownerId", "projectId", "sessionId",
+      ].join("\0")
+    ) throw new Error("Learn session transition claim is invalid or ambiguous");
+    const current = await loadSession(rootPath, projectId, sessionId);
+    if (sessionCheckpointHash(current) === persisted.expectedSessionHash) return false;
+    return removeExactClaim(persisted as typeof claimValue, {
+      dev: identity.dev,
+      ino: identity.ino,
+    });
+  };
+
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        claim = await open(
+          claimPath,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          0o600,
+        );
+        await claim.writeFile(claimContents, "utf8");
+        await claim.sync();
+        const entry = await claim.stat();
+        ownership = { dev: entry.dev, ino: entry.ino };
+        break;
+      } catch (error) {
+        if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+        if (attempt > 0 || !(await recoverStaleClaim())) {
+          throw new Error("Learn session transition is already in progress", { cause: error });
+        }
+      }
+    }
+    if (claim === undefined || ownership === undefined) {
+      throw new Error("Learn session transition claim could not be acquired");
+    }
+    await learnTransitionHook?.({
+      point: "after-claim",
+      ownerId: claimValue.ownerId,
+      projectId,
+      sessionId,
+    });
+    return await action();
   } finally {
-    await claim?.close().catch(() => undefined);
-    await unlink(claimPath).catch(() => undefined);
+    if (claim !== undefined && ownership !== undefined) {
+      await learnTransitionHook?.({
+        point: "before-release",
+        ownerId: claimValue.ownerId,
+        projectId,
+        sessionId,
+      });
+      await claim.close().catch(() => undefined);
+      await removeExactClaim(claimValue, ownership).catch(() => undefined);
+    }
   }
 }
 
@@ -1702,7 +2325,7 @@ export async function transitionLearnSession(
   expectedStatus: LearnSessionStatus,
   session: DesignSession & { status: LearnSessionStatus },
 ): Promise<string> {
-  return withLearnTransitionClaim(rootPath, session.projectId, session.id, async () => {
+  return withLearnTransitionClaim(rootPath, session.projectId, session.id, expectedStatus, async () => {
     const existing = await loadSession(rootPath, session.projectId, session.id);
     if (
       existing.type !== session.type ||
@@ -1894,7 +2517,7 @@ export async function commitFeatureEvolveResult(
   ) {
     throw new Error("Feature EVOLVE result evidence is incomplete");
   }
-  await withLearnTransitionClaim(rootPath, session.projectId, session.id, async () => {
+  await withLearnTransitionClaim(rootPath, session.projectId, session.id, "ANALYZING", async () => {
     const existing = await loadSession(rootPath, session.projectId, session.id);
     if (
       !isFeatureEvolvePendingSession(existing) ||
@@ -1951,6 +2574,7 @@ export async function approveFeatureEvolveApproach(
     join(workspace.sessionsPath, `.${session.id}.approval.claim`),
   );
   let approvalClaim: Awaited<ReturnType<typeof open>> | undefined;
+  const sessionCommitClaims: OwnedSessionCommitClaim[] = [];
 
   try {
     approvalClaim = await open(approvalClaimPath, "wx", 0o600);
@@ -1996,6 +2620,16 @@ export async function approveFeatureEvolveApproach(
       );
     }
 
+    // Hold both session identities while their journals and records cross the
+    // shared commit boundary. Sorted acquisition keeps competing pair writes
+    // deterministic and lets readers distinguish a live transaction from
+    // recoverable crash residue.
+    for (const sessionId of [session.id, executeSession.id].sort()) {
+      sessionCommitClaims.push(
+        await acquireSessionCommitClaim(workspace, session.projectId, sessionId),
+      );
+    }
+
     const approvalSessionPath = assertPathInsideWorkspace(
       workspace.sessionsPath,
       join(workspace.sessionsPath, `${session.id}.json`),
@@ -2005,10 +2639,10 @@ export async function approveFeatureEvolveApproach(
       join(workspace.sessionsPath, `${executeSession.id}.json`),
     );
     const originalSessionContents = stableJson(existing);
-    const approvalActivity = await persistSessionActivity(workspace, session);
+    const approvalActivity = await persistSessionActivity(workspace, session, false);
     let executionActivity: Awaited<ReturnType<typeof persistSessionActivity>>;
     try {
-      executionActivity = await persistSessionActivity(workspace, executeSession);
+      executionActivity = await persistSessionActivity(workspace, executeSession, false);
     } catch (error) {
       if (approvalActivity.ownership !== undefined) {
         await unlinkCreatedFileIfOwned(approvalActivity.path, approvalActivity.ownership)
@@ -2036,6 +2670,8 @@ export async function approveFeatureEvolveApproach(
         executeSessionPath,
         executeSessionContents,
       );
+      await writeSessionCommitHead(workspace, executionActivity.checkpoint);
+      await writeSessionCommitHead(workspace, approvalActivity.checkpoint);
     } catch (error) {
       if (executionActivity.ownership !== undefined) {
         await unlinkCreatedFileIfOwned(executionActivity.path, executionActivity.ownership)
@@ -2071,6 +2707,9 @@ export async function approveFeatureEvolveApproach(
       throw error;
     }
   } finally {
+    for (const claim of sessionCommitClaims.reverse()) {
+      await releaseSessionCommitClaim(claim);
+    }
     if (approvalClaim !== undefined) {
       await approvalClaim.close().catch(() => undefined);
       await unlink(approvalClaimPath).catch(() => undefined);
@@ -2290,58 +2929,137 @@ export async function commitReferenceScan(
   const originalDesignDNAContents = await readOptionalJsonContents(designDNAPath);
   const finalReferenceContents = stableJson(reference);
   const finalSessionContents = stableJson(session);
-  const activity = await persistSessionActivity(workspace, session);
-
+  await recoverSessionCommits(workspace, session.projectId);
+  const commitClaim = await acquireSessionCommitClaim(
+    workspace,
+    session.projectId,
+    session.id,
+  );
   try {
-    await atomicWrite(referencePath, designDNAPath, finalDesignDNAContents);
-    await atomicWrite(
-      referencePath,
-      referenceMetadataPath,
-      finalReferenceContents,
-    );
-    await atomicWrite(workspace.sessionsPath, sessionPath, finalSessionContents);
-  } catch (error) {
-    if (activity.ownership !== undefined) {
-      await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(
-        () => undefined,
+    const activity = await persistSessionActivity(workspace, session, false);
+
+    try {
+      await atomicWrite(referencePath, designDNAPath, finalDesignDNAContents);
+      await atomicWrite(
+        referencePath,
+        referenceMetadataPath,
+        finalReferenceContents,
       );
+      await atomicWrite(workspace.sessionsPath, sessionPath, finalSessionContents);
+      await writeSessionCommitHead(workspace, activity.checkpoint);
+    } catch (error) {
+      if (activity.ownership !== undefined) {
+        await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(
+          () => undefined,
+        );
+      }
+      if (activity.checkpointOwnership !== undefined) {
+        await unlinkCreatedFileIfOwned(
+          activity.checkpointPath,
+          activity.checkpointOwnership,
+        ).catch(() => undefined);
+      }
+      const rollbackErrors: unknown[] = [];
+      await (originalDesignDNAContents === undefined
+        ? unlink(designDNAPath).catch((rollbackError: unknown) => {
+            if (
+              !(
+                rollbackError instanceof Error &&
+                "code" in rollbackError &&
+                rollbackError.code === "ENOENT"
+              )
+            ) {
+              rollbackErrors.push(rollbackError);
+            }
+          })
+        : atomicWrite(
+            referencePath,
+            designDNAPath,
+            originalDesignDNAContents,
+          ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError)));
+      await atomicWrite(
+        referencePath,
+        referenceMetadataPath,
+        originalReferenceContents,
+      ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError));
+      if (rollbackErrors.length > 0) {
+        throw new Error("Reference scan checkpoint and rollback both failed", {
+          cause: { commitError: error, rollbackErrors },
+        });
+      }
+      throw error;
     }
-    if (activity.checkpointOwnership !== undefined) {
-      await unlinkCreatedFileIfOwned(
-        activity.checkpointPath,
-        activity.checkpointOwnership,
-      ).catch(() => undefined);
-    }
-    const rollbackErrors: unknown[] = [];
-    await (originalDesignDNAContents === undefined
-      ? unlink(designDNAPath).catch((rollbackError: unknown) => {
-          if (
-            !(
-              rollbackError instanceof Error &&
-              "code" in rollbackError &&
-              rollbackError.code === "ENOENT"
-            )
-          ) {
-            rollbackErrors.push(rollbackError);
-          }
-        })
-      : atomicWrite(
-          referencePath,
-          designDNAPath,
-          originalDesignDNAContents,
-        ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError)));
-    await atomicWrite(
-      referencePath,
-      referenceMetadataPath,
-      originalReferenceContents,
-    ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError));
-    if (rollbackErrors.length > 0) {
-      throw new Error("Reference scan checkpoint and rollback both failed", {
-        cause: { commitError: error, rollbackErrors },
-      });
-    }
-    throw error;
+  } finally {
+    await releaseSessionCommitClaim(commitClaim);
   }
+}
+
+export interface DesignSessionPage {
+  total: number;
+  sessions: DesignSession[];
+}
+
+/**
+ * Page from the bounded committed-head index before opening session bodies or
+ * any referenced artifacts. The index count and exact filename set are still
+ * authenticated for the whole retained history.
+ */
+export async function listSessionPage(
+  rootPath: string,
+  projectId: string,
+  offset: number,
+  limit: number,
+): Promise<DesignSessionPage> {
+  if (
+    !Number.isSafeInteger(offset) || offset < 0 || offset > 100_000 ||
+    !Number.isSafeInteger(limit) || limit < 1 || limit > 50
+  ) throw new Error("Session pagination is invalid");
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
+  const files = await boundedJsonDirectory(
+    workspace.sessionsPath,
+    "Session history",
+    MAX_SESSION_HISTORY_ENTRIES,
+  );
+  const activityFiles = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const checkpoints = await readSessionCheckpoints(workspace, projectId, activityFiles);
+  const heads = await readSessionCommitHeads(workspace, projectId, activityFiles, checkpoints);
+  await assertActivityJournalPairing(projectId, activityFiles, checkpoints);
+  const filesById = new Map<string, BoundedFileEntry>();
+  for (const file of files) {
+    const sessionId = file.name.slice(0, -".json".length);
+    assertSafePathSegment(sessionId, "Session id");
+    if (file.name !== `${sessionId}.json` || filesById.has(sessionId)) {
+      throw new Error("Session history filename index is invalid or ambiguous");
+    }
+    filesById.set(sessionId, file);
+  }
+  if (
+    heads.size !== filesById.size ||
+    [...heads.keys()].some((sessionId) => !filesById.has(sessionId))
+  ) throw new Error("Session history filename/identity count is invalid against its authenticated head index");
+  const selectedHeads = [...heads.values()]
+    .sort((left, right) =>
+      right.createdAt.localeCompare(left.createdAt) || left.sessionId.localeCompare(right.sessionId),
+    )
+    .slice(offset, offset + limit);
+  const sessions: DesignSession[] = [];
+  for (const head of selectedHeads) {
+    const file = filesById.get(head.sessionId);
+    if (file === undefined) throw new Error("Session page index points to a missing record");
+    const persisted = await readBoundedJsonFile(file.path, "Session record");
+    if (
+      !isPersistedSession(persisted) || persisted.projectId !== projectId ||
+      persisted.id !== head.sessionId || sessionCheckpointHash(persisted) !== head.sessionHash ||
+      persisted.createdAt !== head.createdAt || persisted.updatedAt !== head.updatedAt
+    ) throw new Error("Session page record does not match its authenticated head index");
+    sessions.push(persisted);
+  }
+  return { total: heads.size, sessions };
 }
 
 export async function listSessions(
@@ -2350,11 +3068,23 @@ export async function listSessions(
   verifyActivity = true,
 ): Promise<DesignSession[]> {
   const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
   const files = await boundedJsonDirectory(
     workspace.sessionsPath,
     "Session history",
     MAX_SESSION_HISTORY_ENTRIES,
   );
+  const activityFiles = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const checkpoints = await readSessionCheckpoints(workspace, projectId, activityFiles);
+  const heads = await readSessionCommitHeads(workspace, projectId, activityFiles, checkpoints);
+  await assertActivityJournalPairing(projectId, activityFiles, checkpoints);
+  if (heads.size !== files.length) {
+    throw new Error("Session history filename/identity count is invalid against its authenticated head index");
+  }
   const sessions: DesignSession[] = [];
   for (const file of files) {
     const sessionId = file.name.slice(0, -".json".length);
@@ -2367,16 +3097,14 @@ export async function listSessions(
     ) {
       throw new Error("Session record is invalid");
     }
+    const head = heads.get(sessionId);
+    if (
+      head === undefined || head.sessionHash !== sessionCheckpointHash(persisted) ||
+      head.createdAt !== persisted.createdAt || head.updatedAt !== persisted.updatedAt
+    ) throw new Error("Session record does not match its authenticated activity checkpoint head index");
     sessions.push(persisted);
   }
   if (verifyActivity) {
-    const activityFiles = await boundedJsonDirectory(
-      workspace.activityPath,
-      "Activity history",
-      MAX_ACTIVITY_HISTORY_ENTRIES,
-    );
-    const checkpoints = await readSessionCheckpoints(workspace, projectId);
-    await assertActivityJournalPairing(projectId, activityFiles, checkpoints);
     const latestBySession = new Map<string, SessionCheckpoint>();
     for (const checkpoint of checkpoints) {
       if (checkpoint.projectId !== projectId) continue;
@@ -2390,7 +3118,11 @@ export async function listSessions(
     }
     for (const session of sessions) {
       const latest = latestBySession.get(session.id);
-      if (latest === undefined || latest.sessionHash !== sessionCheckpointHash(session)) {
+      const head = heads.get(session.id);
+      if (
+        latest === undefined || latest.sessionHash !== sessionCheckpointHash(session) ||
+        head === undefined || head.eventId !== latest.eventId || head.version !== latest.version
+      ) {
         throw new Error("Session record does not match its latest immutable checkpoint");
       }
     }

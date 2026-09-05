@@ -42,7 +42,12 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async () => {
-  await rm(sandboxPath, { force: true, recursive: true });
+  await rm(sandboxPath, {
+    force: true,
+    recursive: true,
+    maxRetries: 5,
+    retryDelay: 50,
+  });
   await rm(stateRoot, { force: true, recursive: true });
 });
 

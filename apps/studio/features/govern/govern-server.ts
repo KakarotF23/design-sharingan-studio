@@ -255,7 +255,17 @@ function assertGovernanceCheckpointMatches(
   session: DesignSession & GovernanceSessionCheckpoint,
   expected: GovernanceSessionCheckpoint,
 ): void {
-  if (
+  if (!governanceCheckpointMatches(projectId, session, expected)) {
+    throw new Error("Governance report session is stale or does not match authenticated truth");
+  }
+}
+
+function governanceCheckpointMatches(
+  projectId: string,
+  session: DesignSession & GovernanceSessionCheckpoint,
+  expected: GovernanceSessionCheckpoint,
+): boolean {
+  return !(
     session.id !== governanceSessionId(projectId, expected) ||
     session.type !== expected.type ||
     session.status !== expected.status ||
@@ -263,7 +273,7 @@ function assertGovernanceCheckpointMatches(
     session.revision !== expected.revision ||
     session.artifactFingerprint !== expected.artifactFingerprint ||
     session.rootFingerprint !== expected.rootFingerprint
-  ) throw new Error("Governance report session is stale or does not match authenticated truth");
+  );
 }
 
 /**
@@ -274,43 +284,74 @@ function assertGovernanceCheckpointMatches(
 export async function authenticateGovernanceReportSession(
   project: Project,
   session: DesignSession,
-): Promise<void> {
+): Promise<"AUTHENTICATED" | "UNAVAILABLE"> {
   if (session.projectId !== project.id || !isGovernanceCheckpointSession(session)) {
     throw new Error("Governance report session is not an authenticated checkpoint");
   }
   const checkpoint = session as DesignSession & GovernanceSessionCheckpoint;
+  if (checkpoint.id !== governanceSessionId(project.id, checkpoint)) {
+    throw new Error("Governance report session identity is not canonical");
+  }
   if (checkpoint.type === "GENOME_INIT") {
-    const genome = await readGenome(project.rootPath, project.id);
-    assertGovernanceCheckpointMatches(project.id, checkpoint, {
+    const [genome, rootFingerprint] = await Promise.all([
+      readGenome(project.rootPath, project.id),
+      governanceRootFingerprint(project.rootPath),
+    ]);
+    const expected: GovernanceSessionCheckpoint = {
       type: "GENOME_INIT",
       status: genome.value.status,
       entityId: genome.metadata.entityId,
       revision: genome.metadata.revision,
       artifactFingerprint: governanceArtifactFingerprint(genomeArtifactIdentity(genome)),
-      rootFingerprint: await governanceRootFingerprint(project.rootPath),
-    });
-    if (genome.value.status === "APPROVED" && !isAuthenticatedGenomeDocument(genome)) {
-      throw new Error("Approved Genome report session lacks current signed authority");
+      rootFingerprint,
+    };
+    if (governanceCheckpointMatches(project.id, checkpoint, expected)) {
+      if (genome.value.status === "APPROVED" && !isAuthenticatedGenomeDocument(genome)) {
+        throw new Error("Approved Genome report session lacks current signed authority");
+      }
+      return "AUTHENTICATED";
     }
-    return;
+    // Initialization snapshots before the approved revision were not retained
+    // in v0.1. Keep only a self-canonical predecessor of the same Genome/root,
+    // explicitly unavailable, rather than denying the authenticated rows.
+    if (
+      checkpoint.entityId === genome.metadata.entityId &&
+      checkpoint.rootFingerprint === rootFingerprint &&
+      checkpoint.revision < genome.metadata.revision &&
+      checkpoint.status === "DRAFT"
+    ) return "UNAVAILABLE";
+    throw new Error("Governance report session is stale or does not match authenticated truth");
   }
   const drift = await readDriftReport(project.rootPath, project.id);
   if (checkpoint.type === "DRIFT_AUDIT") {
-    assertGovernanceCheckpointMatches(project.id, checkpoint, {
+    const rootFingerprint = await governanceRootFingerprint(project.rootPath);
+    const expected: GovernanceSessionCheckpoint = {
       type: "DRIFT_AUDIT",
       status: drift.value.overallStatus,
       entityId: drift.metadata.entityId,
       revision: drift.metadata.revision,
       artifactFingerprint: governanceArtifactFingerprint(driftArtifactIdentity(drift)),
-      rootFingerprint: await governanceRootFingerprint(project.rootPath),
-    });
-    return;
+      rootFingerprint,
+    };
+    if (governanceCheckpointMatches(project.id, checkpoint, expected)) {
+      return "AUTHENTICATED";
+    }
+    // Signed audit generations are bounded and may later be retired at their
+    // retention limit. A canonical predecessor is retained as unavailable;
+    // it cannot inherit the current generation's status or authority.
+    if (
+      checkpoint.entityId === drift.metadata.entityId &&
+      checkpoint.rootFingerprint === rootFingerprint &&
+      checkpoint.revision < drift.metadata.revision
+    ) return "UNAVAILABLE";
+    throw new Error("Governance report session is stale or does not match authenticated truth");
   }
   const projection = await loadGovernanceProjection(project);
   if (!projection.initialized || projection.release === undefined) {
     throw new Error("Release report session lacks current authenticated release truth");
   }
   assertGovernanceCheckpointMatches(project.id, checkpoint, await releaseSessionCheckpoint(project, projection));
+  return "AUTHENTICATED";
 }
 
 function missingDriftReport(error: unknown): boolean {
