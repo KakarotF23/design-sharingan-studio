@@ -54,7 +54,16 @@ const AUTHENTICATED_SESSION_READ_ATTEMPTS = 5;
 // PID reuse) recoverable instead of permanently wedging the state machine.
 const LEARN_CLAIM_LEASE_MS = 30_000;
 
+/** A complete retry can safely replace only this proven stale directory view. */
+class ConcurrentSessionPublicationError extends Error {
+  constructor() {
+    super("Session activity event appeared after the reader snapshot");
+    this.name = "ConcurrentSessionPublicationError";
+  }
+}
+
 function isConcurrentSessionRead(error: unknown): boolean {
+  if (error instanceof ConcurrentSessionPublicationError) return true;
   if (!(error instanceof Error)) return false;
   return [
     /^(?:Activity record|Session (?:checkpoint|head) record|Session record) changed while reading$/,
@@ -108,6 +117,12 @@ class InjectedSessionCommitCrash extends Error {
 
 function throwSessionCommitFault(point: SessionCommitFault): void {
   if (sessionCommitFault === point) throw new InjectedSessionCommitCrash(point);
+}
+
+/** Test-only pause point after a recovery reader captured its activity index. */
+let sessionRecoveryHook: (() => Promise<void> | void) | undefined;
+export function setSessionRecoveryHookForTest(value: (() => Promise<void> | void) | undefined): void {
+  sessionRecoveryHook = value;
 }
 
 export type LearnTransitionHookPoint = "after-claim" | "before-release";
@@ -1867,6 +1882,7 @@ async function recoverSessionCommits(
   );
   let checkpoints = await readSessionCheckpoints(workspace, projectId, files);
   let heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
+  await sessionRecoveryHook?.();
   const fileByName = new Map(files.map((file) => [file.name, file]));
   const bySession = new Map<string, SessionCheckpoint[]>();
   for (const checkpoint of checkpoints) {
@@ -1900,6 +1916,16 @@ async function recoverSessionCommits(
     }
     const session = await readSessionRecordForRecovery(workspace, projectId, sessionId);
     if (eventFile === undefined) {
+      const currentEventPath = assertPathInsideWorkspace(
+        workspace.activityPath,
+        join(workspace.activityPath, `${candidate.eventId}.json`),
+      );
+      // A matching event appearing after `files` was captured is the exact
+      // checkpoint-before-event publication race. Retry a complete snapshot;
+      // a genuinely absent event remains fail-closed below.
+      if (await pathExists(currentEventPath)) {
+        throw new ConcurrentSessionPublicationError();
+      }
       const currentMatchesHead = session !== undefined && head !== undefined &&
         sessionCheckpointHash(session) === head.sessionHash;
       if ((session === undefined && head === undefined) || currentMatchesHead) {
