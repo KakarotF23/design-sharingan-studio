@@ -12,6 +12,7 @@
   "devDependencies": {
     "@playwright/test": "latest",
     "turbo": "latest",
-    "typescript": "latest"
+    "typescript": "latest",
+    "vitest": "latest"
   }
 }
