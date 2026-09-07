@@ -14,6 +14,7 @@ import type {
 
 export interface CodexProviderThreadOptions {
   workingDirectory: string;
+  skipGitRepoCheck: boolean;
 }
 
 export interface CodexProviderRunInput {
@@ -67,7 +68,10 @@ class OfficialCodexProvider implements CodexProvider {
   }
 
   private threadOptions(options: CodexProviderThreadOptions): SdkThreadOptions {
-    return { workingDirectory: options.workingDirectory };
+    return {
+      workingDirectory: options.workingDirectory,
+      skipGitRepoCheck: options.skipGitRepoCheck,
+    };
   }
 
   private wrapThread(
@@ -112,7 +116,12 @@ export class CodexAgent {
     input: CodexAgentRunInput,
   ): Promise<CodexAgentResult<TStructured>> {
     try {
-      const threadOptions = { workingDirectory: input.workingDirectory };
+      const threadOptions = {
+        workingDirectory: input.workingDirectory,
+        // Analysis may run from private V1 staging state rather than target code,
+        // which intentionally is not required to be a Git checkout.
+        skipGitRepoCheck: true,
+      };
       const thread = input.threadId
         ? this.provider.resumeThread(input.threadId, threadOptions)
         : this.provider.startThread(threadOptions);

@@ -7,7 +7,8 @@
     "build": "turbo build",
     "test": "turbo test",
     "typecheck": "turbo typecheck",
-    "e2e": "NO_COLOR= playwright test -c tests/e2e/playwright.config.ts"
+    "e2e": "NO_COLOR= playwright test -c tests/e2e/playwright.config.ts",
+    "acceptance": "vitest run tests/acceptance/policy-pressure.test.ts"
   },
   "devDependencies": {
     "@playwright/test": "latest",

@@ -32,9 +32,11 @@ function providerReturning(
 }
 
 describe("CodexAgent", () => {
-  // Production break caught: dropping project/image/schema context would make the shared runtime analyze the wrong evidence or return unvalidated prose.
-  it("passes working directory, images, and output schema to Codex", async () => {
-    let fakeThreadOptions: CodexProviderThreadOptions | undefined;
+  // Production break caught: dropping project/image/schema context or requiring an isolated analysis directory to be a Git checkout would make V1 analyze the wrong evidence or reject valid local analysis state.
+  it("passes isolated working directory, image, schema, and non-Git analysis support to Codex", async () => {
+    let fakeThreadOptions:
+      | (CodexProviderThreadOptions & { skipGitRepoCheck?: boolean })
+      | undefined;
     let fakeRunInput: CodexProviderRunInput | undefined;
     let fakeRunOptions: CodexProviderRunOptions | undefined;
 
@@ -72,7 +74,10 @@ describe("CodexAgent", () => {
       outputSchema,
     });
 
-    expect(fakeThreadOptions?.workingDirectory).toBe("/project");
+    expect(fakeThreadOptions).toEqual({
+      workingDirectory: "/project",
+      skipGitRepoCheck: true,
+    });
     expect(fakeRunInput?.images).toEqual([
       "/project/.design-sharingan/references/ref.png",
     ]);
