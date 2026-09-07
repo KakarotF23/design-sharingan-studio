@@ -38,16 +38,43 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-assert_no_symlink_components() {
+validated_absolute_path() {
   local path="$1"
   local label="$2"
-  case "$path" in
-    *$'\n'*|*$'\r'*) fail "$label contains a control character" ;;
-  esac
-  case "/$path/" in
-    */../*) fail "$label must not contain parent traversal" ;;
-  esac
-  [[ ! -L "$path" ]] || fail "$label is a symbolic-link alias: $path"
+  local require_existing="$3"
+  command -v node >/dev/null 2>&1 || fail "Node.js is required for safe path validation"
+  node - "$path" "$label" "$require_existing" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const [input, label, requireExisting] = process.argv.slice(2);
+function reject(message) {
+  process.stderr.write(`Skill pack verification FAILED: ${label} ${message}\n`);
+  process.exit(1);
+}
+if (!input || /[\0\r\n]/.test(input)) reject("contains an invalid control character");
+if (input.split(/[\\/]+/).includes("..")) reject("must not contain parent traversal");
+const absolute = path.resolve(input);
+const parsed = path.parse(absolute);
+let current = parsed.root;
+let missing = false;
+for (const component of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+  current = path.join(current, component);
+  if (missing) continue;
+  try {
+    const entry = fs.lstatSync(current);
+    if (entry.isSymbolicLink()) reject(`contains a symbolic-link ancestor: ${current}`);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      missing = true;
+      continue;
+    }
+    reject(`cannot be inspected safely: ${current}`);
+  }
+}
+if (requireExisting === "1" && missing) reject(`does not exist: ${absolute}`);
+process.stdout.write(`${absolute}\n`);
+NODE
 }
 
 link_count() {
@@ -122,6 +149,26 @@ required_files() {
   esac
 }
 
+required_directories() {
+  case "$1" in
+    design-sharingan|mangekyo-sharingan)
+      printf '%s\n' agents references scripts
+      ;;
+    eternal-sharingan)
+      printf '%s\n' agents references scripts templates
+      ;;
+    *) fail "unsupported skill contract: $1" ;;
+  esac
+}
+
+invocation_heading() {
+  case "$1" in
+    design-sharingan) printf '%s\n' '## Invocation Modes' ;;
+    mangekyo-sharingan|eternal-sharingan) printf '%s\n' '## Invocation' ;;
+    *) fail "unsupported skill contract: $1" ;;
+  esac
+}
+
 required_modes() {
   case "$1" in
     design-sharingan) printf '%s\n' scan assimilate evolve verify ;;
@@ -135,7 +182,8 @@ verify_skill() {
   local pack_root="$1"
   local skill="$2"
   local skill_root="$pack_root/$skill"
-  local relative_path expected_files actual_files mode name_count all_name_count
+  local relative_path expected_files actual_files expected_directories actual_directories
+  local expected_modes actual_modes name_count all_name_count closing_line invocation_section
   validate_plain_tree "$skill_root" "$skill source"
   while IFS= read -r relative_path; do
     [[ -f "$skill_root/$relative_path" && ! -L "$skill_root/$relative_path" ]] ||
@@ -145,37 +193,61 @@ verify_skill() {
   actual_files="$(cd "$skill_root" && find . -type f -print | sed 's#^\./##' | LC_ALL=C sort)"
   [[ "$actual_files" == "$expected_files" ]] ||
     fail "$skill has an unexpected or missing resource"
+  expected_directories="$(required_directories "$skill" | LC_ALL=C sort)"
+  actual_directories="$(cd "$skill_root" && find . -mindepth 1 -type d -print | sed 's#^\./##' | LC_ALL=C sort)"
+  [[ "$actual_directories" == "$expected_directories" ]] ||
+    fail "$skill has an unexpected or missing directory"
 
   [[ "$(sed -n '1p' "$skill_root/SKILL.md")" == "---" ]] ||
     fail "$skill SKILL.md frontmatter is invalid"
-  name_count="$(sed -n '2,/^---$/p' "$skill_root/SKILL.md" | grep -Ec "^name: ${skill}$" || true)"
-  all_name_count="$(sed -n '2,/^---$/p' "$skill_root/SKILL.md" | grep -Ec '^name:' || true)"
+  closing_line="$(awk 'NR > 1 && $0 == "---" { print NR; exit }' "$skill_root/SKILL.md")"
+  [[ -n "$closing_line" && "$closing_line" -gt 2 ]] ||
+    fail "$skill SKILL.md frontmatter has no closing delimiter"
+  name_count="$(sed -n "2,$((closing_line - 1))p" "$skill_root/SKILL.md" | grep -Ec "^name: ${skill}$" || true)"
+  all_name_count="$(sed -n "2,$((closing_line - 1))p" "$skill_root/SKILL.md" | grep -Ec '^name:' || true)"
   [[ "$name_count" == "1" && "$all_name_count" == "1" ]] ||
     fail "$skill SKILL.md frontmatter name is invalid"
-  grep -Fq "\$$skill" "$skill_root/SKILL.md" || fail "$skill invocation name is missing"
-  grep -Fq "\$$skill" "$skill_root/agents/openai.yaml" ||
-    fail "$skill manifest invocation name is missing"
-  while IFS= read -r mode; do
-    grep -Fq "\`$mode\`" "$skill_root/SKILL.md" ||
-      fail "$skill invocation mode is missing: $mode"
-  done < <(required_modes "$skill")
+
+  invocation_section="$(awk -v heading="$(invocation_heading "$skill")" '
+    $0 == heading { found = 1; next }
+    found && /^## / { exit }
+    found { print }
+  ' "$skill_root/SKILL.md")"
+  [[ -n "$invocation_section" ]] || fail "$skill invocation contract section is missing"
+  grep -Fq "\$$skill" <<<"$invocation_section" ||
+    fail "$skill invocation name is missing from its invocation contract"
+  expected_modes="$(required_modes "$skill")"
+  actual_modes="$(sed -n 's/^| `\([^`]*\)` |.*/\1/p' <<<"$invocation_section")"
+  [[ "$actual_modes" == "$expected_modes" ]] ||
+    fail "$skill invocation mode contract is invalid"
+
+  invocation_section="$(awk '
+    $0 == "interface:" { found = 1; next }
+    found && /^[^ ]/ { exit }
+    found && /^  default_prompt:/ { print }
+  ' "$skill_root/agents/openai.yaml")"
+  [[ "$(grep -Ec '^  default_prompt:' <<<"$invocation_section" || true)" == "1" ]] ||
+    fail "$skill manifest default_prompt contract is invalid"
+  grep -Fq "\$$skill" <<<"$invocation_section" ||
+    fail "$skill manifest invocation name is missing from interface.default_prompt"
 }
 
 verify_pack() {
   local pack_root="$1"
   local label="$2"
   local skill
-  assert_no_symlink_components "$pack_root" "$label"
   [[ -d "$pack_root" && ! -L "$pack_root" ]] || fail "$label is not a regular directory"
   for skill in design-sharingan mangekyo-sharingan eternal-sharingan; do
     verify_skill "$pack_root" "$skill"
   done
 }
 
+SOURCE="$(validated_absolute_path "$SOURCE" "Skill source" 1)"
 verify_pack "$SOURCE" "Skill source"
 echo "PASS source skill pack: $SOURCE"
 
 if [[ -n "$TARGET" ]]; then
+  TARGET="$(validated_absolute_path "$TARGET" "Installed skill target" 1)"
   verify_pack "$TARGET" "Installed skill target"
   for skill in design-sharingan mangekyo-sharingan eternal-sharingan; do
     if ! diff -qr "$SOURCE/$skill" "$TARGET/$skill" >/dev/null; then
