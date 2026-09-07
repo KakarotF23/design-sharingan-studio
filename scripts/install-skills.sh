@@ -92,11 +92,11 @@ assert_disjoint_paths() {
 }
 
 link_count() {
-  if stat -f '%l' "$1" >/dev/null 2>&1; then
-    stat -f '%l' "$1"
-  else
-    stat -c '%h' "$1"
-  fi
+  node -e 'process.stdout.write(require("node:fs").lstatSync(process.argv[1], { bigint: true }).nlink.toString())' "$1"
+}
+
+directory_identity() {
+  node -e 'const value = require("node:fs").lstatSync(process.argv[1], { bigint: true }); process.stdout.write(`${value.dev}:${value.ino}`)' "$1"
 }
 
 sync_directories() {
@@ -187,7 +187,7 @@ process_identity() {
   local started
   started="$(ps -p "$pid" -o lstart= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
   [[ -n "$started" ]] || return 1
-  printf '%s' "$started" | shasum -a 256 | awk '{print $1}'
+  node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(process.argv[1]).digest("hex"))' "$started"
 }
 
 directory_mtime() {
@@ -212,19 +212,28 @@ test_hook() {
 
 assert_safe_existing_skill() {
   local root="$1"
-  local entry count
-  [[ -d "$root" && ! -L "$root" ]] || fail "installed skill is not a regular directory: $root"
-  while IFS= read -r -d '' entry; do
-    if [[ -L "$entry" ]]; then
-      fail "installed skill contains a symbolic link: $entry"
-    fi
-    if [[ -f "$entry" ]]; then
-      count="$(link_count "$entry")"
-      [[ "$count" == "1" ]] || fail "installed skill contains a hard link: $entry"
-    elif [[ ! -d "$entry" ]]; then
-      fail "installed skill contains a non-regular entry: $entry"
-    fi
-  done < <(find "$root" -mindepth 1 -print0)
+  node - "$root" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.argv[2];
+function reject(message) {
+  process.stderr.write(`Skill installation FAILED: ${message}\n`);
+  process.exit(1);
+}
+function visit(entryPath) {
+  let entry;
+  try { entry = fs.lstatSync(entryPath, { bigint: true }); }
+  catch { reject(`installed skill cannot be inspected safely: ${entryPath}`); }
+  if (entry.isSymbolicLink()) reject(`installed skill contains a symbolic link: ${entryPath}`);
+  if (entry.isFile()) {
+    if (entry.nlink !== 1n) reject(`installed skill contains a hard link: ${entryPath}`);
+    return;
+  }
+  if (!entry.isDirectory()) reject(`installed skill contains a non-regular entry: ${entryPath}`);
+  for (const child of fs.readdirSync(entryPath)) visit(path.join(entryPath, child));
+}
+visit(root);
+NODE
 }
 
 cleanup_owned_directory() {
@@ -258,6 +267,14 @@ LOCK=""
 OWNER=""
 JOURNAL=""
 LOCK_OWNED=0
+LOCK_TOKEN=""
+LOCK_IDENTITY=""
+CLAIM=""
+CLAIM_OWNED=0
+CLAIM_TOKEN=""
+CLAIM_IDENTITY=""
+CLAIM_CANDIDATE=""
+LOCK_CANDIDATE=""
 COMPLETED=0
 TRANSACTION=""
 STAGE=""
@@ -457,27 +474,46 @@ recover_transaction() {
 }
 
 owner_content() {
+  local kind="$1"
+  local token="$2"
   local identity now lease_until
   identity="$(process_identity "$$")" || fail "cannot establish installer process identity"
   now="$(date +%s)"
   lease_until=$((now + LOCK_LEASE_SECONDS))
-  printf 'version=1\npid=%s\nidentity=%s\nlease_until=%s' "$$" "$identity" "$lease_until"
+  printf 'version=2\nkind=%s\ntoken=%s\npid=%s\nidentity=%s\nlease_until=%s' \
+    "$kind" "$token" "$$" "$identity" "$lease_until"
 }
 
-write_owner() {
-  durable_write "$OWNER" "$(owner_content)"
+prepare_owner_directory() {
+  local kind="$1"
+  local prefix="$2"
+  PREPARED_TOKEN="$(random_transaction_id)"
+  PREPARED_DIRECTORY="$TARGET/$prefix.$PREPARED_TOKEN"
+  mkdir "$PREPARED_DIRECTORY"
+  sync_directories "$TARGET"
+  durable_write "$PREPARED_DIRECTORY/owner" "$(owner_content "$kind" "$PREPARED_TOKEN")"
+  sync_directories "$PREPARED_DIRECTORY"
+  PREPARED_IDENTITY="$(directory_identity "$PREPARED_DIRECTORY")"
 }
 
-read_owner() {
-  local owner_file="${1:-$OWNER}"
+read_owner_directory() {
+  local owner_directory="$1"
+  local expected_kind="$2"
+  local owner_file="$owner_directory/owner"
   local keys
+  [[ -d "$owner_directory" && ! -L "$owner_directory" ]] || return 1
   [[ -f "$owner_file" && ! -L "$owner_file" && "$(link_count "$owner_file")" == "1" ]] || return 1
   keys="$(sed 's/=.*//' "$owner_file")"
-  [[ "$keys" == $'version\npid\nidentity\nlease_until' ]] || return 1
-  [[ "$(journal_value_from "$owner_file" version)" == "1" ]] || return 1
+  [[ "$keys" == $'version\nkind\ntoken\npid\nidentity\nlease_until' ]] || return 1
+  [[ "$(journal_value_from "$owner_file" version)" == "2" ]] || return 1
+  OWNER_KIND="$(journal_value_from "$owner_file" kind)"
+  OWNER_TOKEN="$(journal_value_from "$owner_file" token)"
   OWNER_PID="$(journal_value_from "$owner_file" pid)"
   OWNER_IDENTITY="$(journal_value_from "$owner_file" identity)"
   OWNER_LEASE_UNTIL="$(journal_value_from "$owner_file" lease_until)"
+  OWNER_DIRECTORY_IDENTITY="$(directory_identity "$owner_directory")"
+  [[ "$OWNER_KIND" == "$expected_kind" ]] || return 1
+  [[ "$OWNER_TOKEN" =~ ^[a-f0-9]{32}$ ]] || return 1
   [[ "$OWNER_PID" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "$OWNER_IDENTITY" =~ ^[a-f0-9]{64}$ ]] || return 1
   [[ "$OWNER_LEASE_UNTIL" =~ ^[0-9]+$ ]] || return 1
@@ -495,89 +531,276 @@ lock_owner_is_live() {
   [[ "$current_identity" == "$OWNER_IDENTITY" ]]
 }
 
+verify_owner_directory() {
+  local directory="$1"
+  local kind="$2"
+  local token="$3"
+  local identity="$4"
+  read_owner_directory "$directory" "$kind" ||
+    fail "$kind owner directory is not fully authenticated"
+  [[ "$OWNER_TOKEN" == "$token" && "$OWNER_DIRECTORY_IDENTITY" == "$identity" ]] ||
+    fail "$kind owner directory identity changed"
+}
+
+publish_owner_directory() {
+  local prepared="$1"
+  local published="$2"
+  local kind="$3"
+  local token="$4"
+  local identity="$5"
+  node - "$prepared" "$published" "$identity" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [prepared, published, expectedIdentity] = process.argv.slice(2);
+function identity(entryPath) {
+  const value = fs.lstatSync(entryPath, { bigint: true });
+  return `${value.dev}:${value.ino}`;
+}
+if (identity(prepared) !== expectedIdentity) {
+  process.stderr.write("prepared owner directory identity changed\n");
+  process.exit(18);
+}
+try {
+  fs.renameSync(prepared, published);
+} catch (error) {
+  if (error && ["EEXIST", "ENOTEMPTY", "ENOTDIR"].includes(error.code)) process.exit(17);
+  throw error;
+}
+if (identity(published) !== expectedIdentity) {
+  process.stderr.write("published owner directory identity changed\n");
+  process.exit(18);
+}
+const descriptor = fs.openSync(path.dirname(published), "r");
+try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+NODE
+  local status=$?
+  if [[ "$status" -eq 0 ]]; then
+    verify_owner_directory "$published" "$kind" "$token" "$identity"
+  fi
+  return "$status"
+}
+
+quarantine_owner_directory() {
+  local published="$1"
+  local quarantine="$2"
+  local kind="$3"
+  local token="$4"
+  local identity="$5"
+  verify_owner_directory "$published" "$kind" "$token" "$identity"
+  [[ ! -e "$quarantine" && ! -L "$quarantine" ]] ||
+    fail "$kind recovery quarantine already exists"
+  node - "$published" "$quarantine" "$identity" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [published, quarantine, expectedIdentity] = process.argv.slice(2);
+function identity(entryPath) {
+  const value = fs.lstatSync(entryPath, { bigint: true });
+  return `${value.dev}:${value.ino}`;
+}
+if (identity(published) !== expectedIdentity) process.exit(18);
+fs.renameSync(published, quarantine);
+if (identity(quarantine) !== expectedIdentity) process.exit(18);
+const descriptor = fs.openSync(path.dirname(published), "r");
+try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+NODE
+  verify_owner_directory "$quarantine" "$kind" "$token" "$identity"
+}
+
+owner_is_reclaimable() {
+  local now
+  lock_owner_is_live && return 1
+  now="$(date +%s)"
+  (( now >= OWNER_LEASE_UNTIL ))
+}
+
+cleanup_candidate() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || return 0
+  cleanup_owned_directory "$candidate"
+}
+
+release_owned_directory() {
+  local published="$1"
+  local kind="$2"
+  local token="$3"
+  local identity="$4"
+  local quarantine="$TARGET/.design-sharingan-${kind}-release.$token"
+  quarantine_owner_directory "$published" "$quarantine" "$kind" "$token" "$identity"
+  cleanup_owned_directory "$quarantine"
+  sync_directories "$TARGET"
+}
+
 acquire_recovery_claim() {
-  local claim="$1"
-  local claim_owner="$claim/owner"
-  local now claim_mtime entries
-  if mkdir "$claim" 2>/dev/null; then
-    sync_directories "$LOCK"
-    durable_write "$claim_owner" "$(owner_content)"
+  local status existing_token existing_identity quarantine
+  prepare_owner_directory "claim" ".design-sharingan-claim-candidate"
+  CLAIM_CANDIDATE="$PREPARED_DIRECTORY"
+  local candidate_token="$PREPARED_TOKEN"
+  local candidate_identity="$PREPARED_IDENTITY"
+  test_hook "before-claim-publish"
+  if publish_owner_directory "$CLAIM_CANDIDATE" "$CLAIM" "claim" "$candidate_token" "$candidate_identity"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    CLAIM_OWNED=1
+    CLAIM_TOKEN="$candidate_token"
+    CLAIM_IDENTITY="$candidate_identity"
+    CLAIM_CANDIDATE=""
+  fi
+  test_hook "after-claim-publish-attempt"
+  if [[ "$status" -eq 0 ]]; then
+    verify_owner_directory "$CLAIM" "claim" "$CLAIM_TOKEN" "$CLAIM_IDENTITY"
     return 0
   fi
-  [[ -d "$claim" && ! -L "$claim" ]] || fail "recovery claim is not a regular directory"
-  if [[ -e "$claim_owner" || -L "$claim_owner" ]]; then
-    read_owner "$claim_owner" || fail "recovery claim owner record is invalid"
-    lock_owner_is_live && fail "another live installer is recovering the stale install lock"
-  else
-    now="$(date +%s)"
-    claim_mtime="$(directory_mtime "$claim")"
-    (( now - claim_mtime >= LOCK_LEASE_SECONDS )) ||
-      fail "a recent ownerless recovery claim is still leased"
+  [[ "$status" -eq 17 ]] || fail "could not publish recovery claim safely"
+
+  read_owner_directory "$CLAIM" "claim" || fail "recovery claim owner record is invalid"
+  existing_token="$OWNER_TOKEN"
+  existing_identity="$OWNER_DIRECTORY_IDENTITY"
+  if ! owner_is_reclaimable; then
+    cleanup_candidate "$CLAIM_CANDIDATE"
+    CLAIM_CANDIDATE=""
+    if lock_owner_is_live; then
+      fail "another live installer owns the recovery claim"
+    fi
+    fail "a changed recovery-claim owner remains leased"
   fi
-  cleanup_atomic_temps "$claim"
-  entries="$(find "$claim" -mindepth 1 -maxdepth 1 -print)"
-  if [[ -n "$entries" && "$entries" != "$claim_owner" ]]; then
-    fail "stale recovery claim contains unexpected state"
+  quarantine="$TARGET/.design-sharingan-claim-stale.$existing_token"
+  quarantine_owner_directory "$CLAIM" "$quarantine" "claim" "$existing_token" "$existing_identity"
+  if ! publish_owner_directory "$CLAIM_CANDIDATE" "$CLAIM" "claim" "$candidate_token" "$candidate_identity"; then
+    cleanup_candidate "$CLAIM_CANDIDATE"
+    CLAIM_CANDIDATE=""
+    fail "another installer won recovery-claim publication"
   fi
-  rm -f "$claim_owner"
-  rmdir "$claim"
-  sync_directories "$LOCK"
-  mkdir "$claim"
-  sync_directories "$LOCK"
-  durable_write "$claim_owner" "$(owner_content)"
+  CLAIM_OWNED=1
+  CLAIM_TOKEN="$candidate_token"
+  CLAIM_IDENTITY="$candidate_identity"
+  CLAIM_CANDIDATE=""
+  cleanup_owned_directory "$quarantine"
+  verify_owner_directory "$CLAIM" "claim" "$CLAIM_TOKEN" "$CLAIM_IDENTITY"
 }
 
 release_recovery_claim() {
-  local claim="$1"
-  rm -f "$claim/owner"
-  sync_directories "$claim"
-  rmdir "$claim"
-  sync_directories "$LOCK"
+  [[ "$CLAIM_OWNED" -eq 1 ]] || return 0
+  release_owned_directory "$CLAIM" "claim" "$CLAIM_TOKEN" "$CLAIM_IDENTITY"
+  CLAIM_OWNED=0
+  CLAIM_TOKEN=""
+  CLAIM_IDENTITY=""
 }
 
-acquire_lock() {
-  local now lock_mtime claim
-  if mkdir "$LOCK" 2>/dev/null; then
-    LOCK_OWNED=1
-    write_owner
-    test_hook "lock-acquired"
-    return 0
-  fi
-  [[ -d "$LOCK" && ! -L "$LOCK" ]] || fail "install lock is not a regular directory"
-
-  if [[ -e "$OWNER" || -L "$OWNER" ]]; then
-    read_owner || fail "install lock owner record is invalid"
-    lock_owner_is_live && fail "another live Design Sharingan skill installation is in progress"
-  else
-    now="$(date +%s)"
-    lock_mtime="$(directory_mtime "$LOCK")"
-    (( now - lock_mtime >= LOCK_LEASE_SECONDS )) ||
-      fail "a recent ownerless Design Sharingan install lock is still leased"
-  fi
-
-  claim="$LOCK/recovery-claim"
-  acquire_recovery_claim "$claim"
+recover_stale_lock() {
+  local stale_lock="$1"
+  LOCK="$stale_lock"
+  OWNER="$LOCK/owner"
+  JOURNAL="$LOCK/journal"
   cleanup_atomic_temps "$LOCK"
-  if [[ -e "$OWNER" || -L "$OWNER" ]]; then
-    read_owner || fail "install lock owner record changed during recovery"
-    if lock_owner_is_live; then
-      release_recovery_claim "$claim"
-      fail "another live Design Sharingan skill installation is in progress"
-    fi
-  fi
   if [[ -e "$JOURNAL" || -L "$JOURNAL" ]]; then
     recover_transaction
   fi
+  cleanup_owned_directory "$LOCK"
+}
+
+cleanup_orphan_owner_directories() {
+  local entry name kind now modified entries
+  now="$(date +%s)"
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    case "$name" in
+      .design-sharingan-claim-candidate.*|.design-sharingan-claim-release.*|.design-sharingan-claim-stale.*)
+        kind="claim"
+        ;;
+      .design-sharingan-lock-candidate.*|.design-sharingan-lock-release.*)
+        kind="lock"
+        ;;
+      *) continue ;;
+    esac
+    [[ -d "$entry" && ! -L "$entry" ]] || fail "orphan owner path is not a regular directory"
+    if [[ -e "$entry/owner" || -L "$entry/owner" ]]; then
+      read_owner_directory "$entry" "$kind" || fail "orphan owner record is invalid"
+      lock_owner_is_live && continue
+      (( now >= OWNER_LEASE_UNTIL )) || continue
+    else
+      modified="$(directory_mtime "$entry")"
+      (( now - modified >= LOCK_LEASE_SECONDS )) || continue
+      cleanup_atomic_temps "$entry"
+      entries="$(find "$entry" -mindepth 1 -maxdepth 1 -print)"
+      [[ -z "$entries" ]] || fail "ownerless orphan directory contains unexpected state"
+    fi
+    cleanup_owned_directory "$entry"
+  done < <(find "$TARGET" -mindepth 1 -maxdepth 1 -type d -name '.design-sharingan-*' -print0)
+  sync_directories "$TARGET"
+}
+
+recover_orphaned_stale_lock() {
+  local entry count=0
+  while IFS= read -r -d '' entry; do
+    count=$((count + 1))
+    [[ "$count" -eq 1 ]] || fail "multiple stale install-lock transactions require manual recovery"
+    read_owner_directory "$entry" "lock" || fail "stale install-lock owner record is invalid"
+    recover_stale_lock "$entry"
+  done < <(find "$TARGET" -mindepth 1 -maxdepth 1 -type d -name '.design-sharingan-lock-stale.*' -print0)
+}
+
+acquire_lock() {
+  local recovered=0 existing_token existing_identity quarantine status
+  acquire_recovery_claim
+  cleanup_orphan_owner_directories
+  recover_orphaned_stale_lock
+
+  if [[ -e "$LOCK" || -L "$LOCK" ]]; then
+    read_owner_directory "$LOCK" "lock" || fail "install lock owner record is invalid"
+    existing_token="$OWNER_TOKEN"
+    existing_identity="$OWNER_DIRECTORY_IDENTITY"
+    if ! owner_is_reclaimable; then
+      release_recovery_claim
+      if lock_owner_is_live; then
+        fail "another live Design Sharingan skill installation is in progress"
+      fi
+      fail "a changed install-lock owner remains leased"
+    fi
+    quarantine="$TARGET/.design-sharingan-lock-stale.$existing_token"
+    quarantine_owner_directory "$LOCK" "$quarantine" "lock" "$existing_token" "$existing_identity"
+    recover_stale_lock "$quarantine"
+    recovered=1
+  fi
+
+  LOCK="$TARGET/.design-sharingan-install.lock"
+  prepare_owner_directory "lock" ".design-sharingan-lock-candidate"
+  LOCK_CANDIDATE="$PREPARED_DIRECTORY"
+  LOCK_TOKEN="$PREPARED_TOKEN"
+  LOCK_IDENTITY="$PREPARED_IDENTITY"
+  test_hook "before-lock-publish"
+  if publish_owner_directory "$LOCK_CANDIDATE" "$LOCK" "lock" "$LOCK_TOKEN" "$LOCK_IDENTITY"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    if [[ "$status" -eq 17 ]]; then
+      read_owner_directory "$LOCK" "lock" || fail "competing install lock is not fully authenticated"
+    fi
+    cleanup_candidate "$LOCK_CANDIDATE"
+    LOCK_CANDIDATE=""
+    release_recovery_claim
+    fail "another installer won install-lock publication"
+  fi
   LOCK_OWNED=1
-  write_owner
-  release_recovery_claim "$claim"
-  test_hook "after-stale-recovery"
+  LOCK_CANDIDATE=""
+  OWNER="$LOCK/owner"
+  JOURNAL="$LOCK/journal"
+  test_hook "after-lock-publish-attempt"
+  verify_owner_directory "$LOCK" "lock" "$LOCK_TOKEN" "$LOCK_IDENTITY"
+  release_recovery_claim
+  [[ "$recovered" -eq 0 ]] || test_hook "after-stale-recovery"
+  test_hook "lock-acquired"
 }
 
 finish() {
   local status=$?
   trap - EXIT INT TERM HUP
   if [[ "$LOCK_OWNED" -eq 1 ]]; then
+    verify_owner_directory "$LOCK" "lock" "$LOCK_TOKEN" "$LOCK_IDENTITY"
     if [[ -e "$JOURNAL" || -L "$JOURNAL" ]]; then
       if [[ "$COMPLETED" -eq 1 ]]; then
         load_journal
@@ -588,15 +811,12 @@ finish() {
         recover_transaction
       fi
     fi
-    rm -f "$OWNER"
-    if [[ -d "$LOCK/recovery-claim" && ! -L "$LOCK/recovery-claim" ]]; then
-      rm -f "$LOCK/recovery-claim/owner"
-      rmdir "$LOCK/recovery-claim" 2>/dev/null || true
-    fi
-    sync_directories "$LOCK"
-    rmdir "$LOCK" || fail "could not release install lock cleanly"
-    sync_directories "$TARGET"
+    release_owned_directory "$LOCK" "lock" "$LOCK_TOKEN" "$LOCK_IDENTITY"
+    LOCK_OWNED=0
   fi
+  release_recovery_claim
+  cleanup_candidate "$LOCK_CANDIDATE"
+  cleanup_candidate "$CLAIM_CANDIDATE"
   exit "$status"
 }
 
@@ -626,6 +846,7 @@ LOCK_LEASE_SECONDS="${DESIGN_SHARINGAN_LOCK_LEASE_SECONDS:-30}"
 [[ "$LOCK_LEASE_SECONDS" =~ ^[1-9][0-9]*$ && "$LOCK_LEASE_SECONDS" -le 600 ]] ||
   fail "lock lease must be an integer from 1 through 600 seconds"
 LOCK="$TARGET/.design-sharingan-install.lock"
+CLAIM="$TARGET/.design-sharingan-install.claim"
 OWNER="$LOCK/owner"
 JOURNAL="$LOCK/journal"
 acquire_lock
@@ -636,6 +857,7 @@ BACKUP="$TARGET/.design-sharingan-backup.$TRANSACTION"
 DISCARD="$TARGET/.design-sharingan-discard.$TRANSACTION"
 PHASE="ACTIVE"
 write_journal
+test_hook "after-journal-created"
 mkdir "$STAGE" "$BACKUP" "$DISCARD"
 sync_directories "$TARGET"
 

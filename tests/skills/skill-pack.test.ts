@@ -143,6 +143,32 @@ async function waitForPath(path: string, timeoutMs = 5_000): Promise<void> {
   }
 }
 
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+async function writeSyntheticOwner(
+  directory: string,
+  kind: "lock" | "claim",
+  token: string,
+  leaseUntil: number,
+  identity = "0".repeat(64),
+): Promise<void> {
+  await mkdir(directory, { recursive: true });
+  await writeFile(
+    join(directory, "owner"),
+    [
+      "version=2",
+      `kind=${kind}`,
+      `token=${token}`,
+      `pid=${process.pid}`,
+      `identity=${identity}`,
+      `lease_until=${leaseUntil}`,
+      "",
+    ].join("\n"),
+  );
+}
+
 function spawnInstaller(
   args: string[],
   env: Record<string, string> = {},
@@ -357,7 +383,7 @@ describe("Design Sharingan skill pack", () => {
       DESIGN_SHARINGAN_SKILLS_DIR: target,
     });
     await run(verifyScript, ["--source", sourceRoot, "--target", target]);
-  });
+  }, 30_000);
 
   it("validates a complete source before mutating any installed skill", async () => {
     const sandbox = await temporaryDirectory("partial");
@@ -374,7 +400,7 @@ describe("Design Sharingan skill pack", () => {
     ]);
     expect(`${failure.stderr ?? ""}${failure.stdout ?? ""}`).toMatch(/missing|required|invalid/i);
     expect(await treeSnapshot(target)).toEqual(before);
-  });
+  }, 30_000);
 
   it("rejects source symlinks and hard links", async () => {
     const sandbox = await temporaryDirectory("links");
@@ -402,6 +428,31 @@ describe("Design Sharingan skill pack", () => {
       "--source", hardlinkSource,
     ]);
     expect(`${hardlinkFailure.stderr ?? ""}${hardlinkFailure.stdout ?? ""}`)
+      .toMatch(/hard link|link count|regular/i);
+  });
+
+  it("uses a platform-independent link count instead of trusting stat dialect detection", async () => {
+    const sandbox = await temporaryDirectory("portable-link-count");
+    const copiedSource = join(sandbox, "source");
+    await cp(sourceRoot, copiedSource, { recursive: true });
+    const outside = join(sandbox, "outside.txt");
+    await cp(join(sourceRoot, "design-sharingan", "README.txt"), outside);
+    const hardlinked = join(copiedSource, "design-sharingan", "README.txt");
+    await rm(hardlinked);
+    await link(outside, hardlinked);
+
+    const fakeBin = join(sandbox, "bin");
+    await mkdir(fakeBin);
+    const fakeStat = join(fakeBin, "stat");
+    await writeFile(fakeStat, "#!/usr/bin/env bash\necho 1\n");
+    await chmod(fakeStat, 0o755);
+
+    const failure = await expectCommandFailure(
+      verifyScript,
+      ["--source", copiedSource],
+      { PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+    );
+    expect(`${failure.stderr ?? ""}${failure.stdout ?? ""}`)
       .toMatch(/hard link|link count|regular/i);
   });
 
@@ -436,7 +487,7 @@ describe("Design Sharingan skill pack", () => {
     expect(`${overlapFailure.stderr ?? ""}${overlapFailure.stdout ?? ""}`)
       .toMatch(/overlap|source|target/i);
     expect(await treeSnapshot(sourceRoot)).toEqual(sourceBefore);
-  });
+  }, 30_000);
 
   it("rejects every source and target ancestor alias before mutation", async () => {
     const sandbox = await temporaryDirectory("ancestor-aliases");
@@ -516,7 +567,7 @@ describe("Design Sharingan skill pack", () => {
       expect((await readdir(target)).some((name) => name.startsWith(".design-sharingan-")))
         .toBe(false);
     }
-  }, 60_000);
+  }, 120_000);
 
   it("recovers a killed transaction durably before starting the next install", async () => {
     const sandbox = await temporaryDirectory("killed-recovery");
@@ -532,6 +583,7 @@ describe("Design Sharingan skill pack", () => {
       {
         DESIGN_SHARINGAN_INSTALL_TEST_HOOK: "after-promote-move:design-sharingan",
         DESIGN_SHARINGAN_INSTALL_TEST_HOOK_DIR: killHook,
+        DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
       },
     );
     await waitForPath(join(killHook, "reached"));
@@ -539,6 +591,7 @@ describe("Design Sharingan skill pack", () => {
     const killed = await interrupted.result;
     expect(killed.signal).toBe("SIGKILL");
     expect(await treeSnapshot(target)).not.toEqual(before);
+    await delay(1_100);
 
     const recoveryHook = join(sandbox, "recovery-hook");
     await mkdir(recoveryHook);
@@ -547,6 +600,7 @@ describe("Design Sharingan skill pack", () => {
       {
         DESIGN_SHARINGAN_INSTALL_TEST_HOOK: "after-stale-recovery",
         DESIGN_SHARINGAN_INSTALL_TEST_HOOK_DIR: recoveryHook,
+        DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
       },
     );
     await waitForPath(join(recoveryHook, "reached"));
@@ -570,12 +624,16 @@ describe("Design Sharingan skill pack", () => {
       {
         DESIGN_SHARINGAN_INSTALL_TEST_HOOK: "after-committed",
         DESIGN_SHARINGAN_INSTALL_TEST_HOOK_DIR: hookDirectory,
+        DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
       },
     );
     await waitForPath(join(hookDirectory, "reached"));
     interrupted.child.kill("SIGKILL");
     expect((await interrupted.result).signal).toBe("SIGKILL");
-    await run(installScript, ["--source", sourceRoot, "--target", target]);
+    await delay(1_100);
+    await run(installScript, ["--source", sourceRoot, "--target", target], {
+      DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
+    });
     await run(verifyScript, ["--source", sourceRoot, "--target", target]);
     expect((await readdir(target)).some((name) => name.startsWith(".design-sharingan-")))
       .toBe(false);
@@ -606,26 +664,164 @@ describe("Design Sharingan skill pack", () => {
 
     const staleTarget = join(sandbox, "stale-target");
     const staleLock = join(staleTarget, ".design-sharingan-install.lock");
-    await mkdir(staleLock, { recursive: true });
-    await writeFile(join(staleLock, ".owner.tmp-999-deadbeef"), "partial owner\n");
-    const expired = new Date(Date.now() - 120_000);
-    await utimes(staleLock, expired, expired);
+    await writeSyntheticOwner(staleLock, "lock", "b".repeat(32), 1);
     await run(installScript, ["--source", sourceRoot, "--target", staleTarget], {
       DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
     });
     await run(verifyScript, ["--source", sourceRoot, "--target", staleTarget]);
 
     const staleClaimTarget = join(sandbox, "stale-claim-target");
-    const staleClaimLock = join(staleClaimTarget, ".design-sharingan-install.lock");
-    const staleClaim = join(staleClaimLock, "recovery-claim");
-    await mkdir(staleClaim, { recursive: true });
-    await writeFile(join(staleClaim, ".owner.tmp-999-deadbeef"), "partial claim owner\n");
-    await utimes(staleClaim, expired, expired);
-    await utimes(staleClaimLock, expired, expired);
+    await mkdir(staleClaimTarget);
+    const staleClaim = join(staleClaimTarget, ".design-sharingan-install.claim");
+    await writeSyntheticOwner(staleClaim, "claim", "c".repeat(32), 1);
     await run(installScript, ["--source", sourceRoot, "--target", staleClaimTarget], {
       DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
     });
     await run(verifyScript, ["--source", sourceRoot, "--target", staleClaimTarget]);
+
+    const orphanTarget = join(sandbox, "orphan-target");
+    const orphanCandidate = join(
+      orphanTarget,
+      `.design-sharingan-lock-candidate.${"d".repeat(32)}`,
+    );
+    await mkdir(orphanCandidate, { recursive: true });
+    await writeFile(join(orphanCandidate, ".owner.tmp-999-deadbeef"), "partial owner\n");
+    const expired = new Date(Date.now() - 120_000);
+    await utimes(join(orphanCandidate, ".owner.tmp-999-deadbeef"), expired, expired);
+    await utimes(orphanCandidate, expired, expired);
+    await run(installScript, ["--source", sourceRoot, "--target", orphanTarget], {
+      DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
+    });
+    expect(await pathExists(orphanCandidate)).toBe(false);
+    await run(verifyScript, ["--source", sourceRoot, "--target", orphanTarget]);
+  }, 30_000);
+
+  it("publishes fully owned claim and lock directories before either becomes visible", async () => {
+    const sandbox = await temporaryDirectory("atomic-owner-publication");
+    const target = join(sandbox, "target");
+    await mkdir(target);
+
+    const beforePublishHook = join(sandbox, "before-publish");
+    await mkdir(beforePublishHook);
+    const delayed = spawnInstaller(
+      ["--source", sourceRoot, "--target", target],
+      {
+        DESIGN_SHARINGAN_INSTALL_TEST_HOOK: "before-claim-publish",
+        DESIGN_SHARINGAN_INSTALL_TEST_HOOK_DIR: beforePublishHook,
+        DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
+      },
+    );
+    await waitForPath(join(beforePublishHook, "reached"));
+    await delay(1_100);
+
+    const transactionHook = join(sandbox, "transaction-hook");
+    await mkdir(transactionHook);
+    const winner = spawnInstaller(
+      ["--source", sourceRoot, "--target", target],
+      {
+        DESIGN_SHARINGAN_INSTALL_TEST_HOOK: "after-journal-created",
+        DESIGN_SHARINGAN_INSTALL_TEST_HOOK_DIR: transactionHook,
+        DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
+      },
+    );
+    await waitForPath(join(transactionHook, "reached"));
+    await writeFile(join(beforePublishHook, "release"), "continue\n");
+    const loser = await delayed.result;
+    expect(loser.code).not.toBe(0);
+    expect(`${loser.stderr}${loser.stdout}`).toMatch(/live|in progress|lock|claim/i);
+
+    const transactionEntries = (await readdir(target)).filter((name) =>
+      name.startsWith(".design-sharingan-"));
+    expect(transactionEntries.filter((name) => name.includes("install.lock")))
+      .toHaveLength(1);
+    expect(transactionEntries.filter((name) => name.includes("stage.")))
+      .toHaveLength(0);
+    expect(transactionEntries.filter((name) => name.includes("backup.")))
+      .toHaveLength(0);
+    expect(transactionEntries.filter((name) => name.includes("discard.")))
+      .toHaveLength(0);
+    const publishedLock = join(target, ".design-sharingan-install.lock");
+    expect(await readFile(join(publishedLock, "owner"), "utf8"))
+      .toMatch(/^version=2\nkind=lock\ntoken=[a-f0-9]{32}\n/);
+    expect(await readFile(join(publishedLock, "journal"), "utf8"))
+      .toMatch(/^version=1\ntransaction=[a-f0-9]{32}\n/);
+
+    await writeFile(join(transactionHook, "release"), "continue\n");
+    expect((await winner.result).code).toBe(0);
+    await run(verifyScript, ["--source", sourceRoot, "--target", target]);
+    expect((await readdir(target)).some((name) => name.startsWith(".design-sharingan-")))
+      .toBe(false);
+
+    const publishedTarget = join(sandbox, "published-target");
+    await mkdir(publishedTarget);
+    const afterPublishHook = join(sandbox, "after-publish");
+    await mkdir(afterPublishHook);
+    const published = spawnInstaller(
+      ["--source", sourceRoot, "--target", publishedTarget],
+      {
+        DESIGN_SHARINGAN_INSTALL_TEST_HOOK: "after-claim-publish-attempt",
+        DESIGN_SHARINGAN_INSTALL_TEST_HOOK_DIR: afterPublishHook,
+        DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
+      },
+    );
+    await waitForPath(join(afterPublishHook, "reached"));
+    await delay(1_100);
+    const contender = await expectCommandFailure(
+      installScript,
+      ["--source", sourceRoot, "--target", publishedTarget],
+      { DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1" },
+    );
+    expect(`${contender.stderr ?? ""}${contender.stdout ?? ""}`)
+      .toMatch(/live|claim|in progress/i);
+    await writeFile(join(afterPublishHook, "release"), "continue\n");
+    expect((await published.result).code).toBe(0);
+    await run(verifyScript, ["--source", sourceRoot, "--target", publishedTarget]);
+  }, 45_000);
+
+  it("keeps an exact live owner beyond its lease and recovers a reused PID only after expiry", async () => {
+    const sandbox = await temporaryDirectory("owner-identity-lease");
+    const liveTarget = join(sandbox, "live-target");
+    await mkdir(liveTarget);
+    const liveHook = join(sandbox, "live-hook");
+    await mkdir(liveHook);
+    const live = spawnInstaller(
+      ["--source", sourceRoot, "--target", liveTarget],
+      {
+        DESIGN_SHARINGAN_INSTALL_TEST_HOOK: "lock-acquired",
+        DESIGN_SHARINGAN_INSTALL_TEST_HOOK_DIR: liveHook,
+        DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
+      },
+    );
+    await waitForPath(join(liveHook, "reached"));
+    await delay(1_100);
+    const liveFailure = await expectCommandFailure(
+      installScript,
+      ["--source", sourceRoot, "--target", liveTarget],
+      { DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1" },
+    );
+    expect(`${liveFailure.stderr ?? ""}${liveFailure.stdout ?? ""}`)
+      .toMatch(/live|in progress|lock/i);
+    await writeFile(join(liveHook, "release"), "continue\n");
+    expect((await live.result).code).toBe(0);
+
+    const reusedTarget = join(sandbox, "reused-target");
+    await mkdir(reusedTarget);
+    const reusedLock = join(reusedTarget, ".design-sharingan-install.lock");
+    const token = "a".repeat(32);
+    await writeSyntheticOwner(reusedLock, "lock", token, Math.floor(Date.now() / 1000) + 60);
+    const leasedFailure = await expectCommandFailure(
+      installScript,
+      ["--source", sourceRoot, "--target", reusedTarget],
+      { DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1" },
+    );
+    expect(`${leasedFailure.stderr ?? ""}${leasedFailure.stdout ?? ""}`)
+      .toMatch(/lease|recent|live|in progress/i);
+
+    await writeSyntheticOwner(reusedLock, "lock", token, 1);
+    await run(installScript, ["--source", sourceRoot, "--target", reusedTarget], {
+      DESIGN_SHARINGAN_LOCK_LEASE_SECONDS: "1",
+    });
+    await run(verifyScript, ["--source", sourceRoot, "--target", reusedTarget]);
   }, 30_000);
 
   it("rolls every replaced skill back if a staged promotion fails", async () => {

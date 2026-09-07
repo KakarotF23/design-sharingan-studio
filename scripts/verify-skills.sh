@@ -78,32 +78,35 @@ NODE
 }
 
 link_count() {
-  if stat -f '%l' "$1" >/dev/null 2>&1; then
-    stat -f '%l' "$1"
-  else
-    stat -c '%h' "$1"
-  fi
+  node -e 'process.stdout.write(require("node:fs").lstatSync(process.argv[1], { bigint: true }).nlink.toString())' "$1"
 }
 
 validate_plain_tree() {
   local root="$1"
   local label="$2"
-  local entry count
-  [[ -d "$root" && ! -L "$root" ]] || fail "$label is not a regular directory"
-  while IFS= read -r -d '' entry; do
-    case "$entry" in
-      *$'\n'*|*$'\r'*) fail "$label contains a control-character path" ;;
-    esac
-    if [[ -L "$entry" ]]; then
-      fail "$label contains a symbolic link: $entry"
-    fi
-    if [[ -f "$entry" ]]; then
-      count="$(link_count "$entry")"
-      [[ "$count" == "1" ]] || fail "$label contains a hard link (link count $count): $entry"
-    elif [[ ! -d "$entry" ]]; then
-      fail "$label contains a non-regular entry: $entry"
-    fi
-  done < <(find "$root" -mindepth 1 -print0)
+  node - "$root" "$label" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [root, label] = process.argv.slice(2);
+function reject(message) {
+  process.stderr.write(`Skill pack verification FAILED: ${label} ${message}\n`);
+  process.exit(1);
+}
+function visit(entryPath, isRoot = false) {
+  let entry;
+  try { entry = fs.lstatSync(entryPath, { bigint: true }); }
+  catch { reject(`cannot be inspected safely: ${entryPath}`); }
+  if (/[\r\n]/.test(entryPath)) reject("contains a control-character path");
+  if (entry.isSymbolicLink()) reject(`contains a symbolic link: ${entryPath}`);
+  if (entry.isFile()) {
+    if (entry.nlink !== 1n) reject(`contains a hard link (link count ${entry.nlink}): ${entryPath}`);
+    return;
+  }
+  if (!entry.isDirectory()) reject(`contains a non-regular entry: ${entryPath}`);
+  for (const child of fs.readdirSync(entryPath)) visit(path.join(entryPath, child));
+}
+visit(root, true);
+NODE
 }
 
 required_files() {
