@@ -6,6 +6,7 @@ import {
   normalizeGovernanceRoute,
   type GovernanceVerifiedClaim,
   type RenderArtifact,
+  type VisualIntegrityVerification,
 } from "@design-sharingan/core";
 import { loadMangekyoLoopSession } from "./mangekyo-loop-store";
 import { assertPathInsideWorkspace } from "./path-policy";
@@ -37,6 +38,25 @@ const MAX_FILE_BYTES = 64 * 1024;
 const MAX_EXCERPT_BYTES = 4_096;
 const SECRET_PATTERN = /(?:sk-[a-zA-Z0-9_-]{8,}|gh[pousr]_[a-zA-Z0-9]{12,}|AKIA[A-Z0-9]{12,}|Bearer\s+[a-zA-Z0-9._-]{8,}|(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+)/gi;
 const PATH_PATTERN = /(?:\/(?:[a-zA-Z0-9._-]+\/)+[a-zA-Z0-9._-]+|[A-Za-z]:\\[^\s,;]+)/g;
+export const AUTHENTICATED_PRODUCT_LANGUAGE_RULE = "Preserve the established product hierarchy and component language.";
+
+/**
+ * A product-consistency result becomes a Genome-eligible rule only after the
+ * persisted rendered round has passed and supplied explicit evidence. The
+ * caller attaches this claim to the catalog entry carrying the render ID.
+ */
+export function verifiedClaimsForProductConsistency(
+  route: string,
+  verification: Pick<VisualIntegrityVerification, "status" | "evidence">,
+): GovernanceVerifiedClaim[] {
+  if (verification.status !== "PASS" || verification.evidence.length === 0) return [];
+  return [{
+    claimType: "RULE",
+    category: "VISUAL_INVARIANT",
+    statement: AUTHENTICATED_PRODUCT_LANGUAGE_RULE,
+    scope: { routes: [route] },
+  }];
+}
 
 function scrub(value: string): string {
   return value
@@ -146,12 +166,24 @@ function evidenceId(factory: () => string): string {
   return id;
 }
 
-function renderArtifacts(session: Awaited<ReturnType<typeof loadMangekyoLoopSession>>): RenderArtifact[] {
-  return [
-    session.initialRender,
-    session.finalRender,
-    ...session.rounds.flatMap(({ round }) => [round.beforeRender, round.afterRender]),
-  ].filter((artifact): artifact is RenderArtifact => artifact !== undefined);
+function renderArtifacts(session: Awaited<ReturnType<typeof loadMangekyoLoopSession>>): Array<{
+  artifact: RenderArtifact;
+  verifiedClaims: GovernanceVerifiedClaim[];
+}> {
+  const plainArtifacts = [session.initialRender, session.finalRender]
+    .filter((artifact): artifact is RenderArtifact => artifact !== undefined)
+    .map((artifact) => ({ artifact, verifiedClaims: [] as GovernanceVerifiedClaim[] }));
+  const auditedArtifacts = session.rounds.flatMap(({ round }) => {
+    if (round.afterRender === undefined) return [];
+    return [{
+      artifact: round.afterRender,
+      verifiedClaims: verifiedClaimsForProductConsistency(
+        round.afterRender.route,
+        round.productConsistency,
+      ),
+    }];
+  });
+  return [...plainArtifacts, ...auditedArtifacts];
 }
 
 export async function collectGovernanceEvidence(
@@ -219,7 +251,7 @@ export async function collectGovernanceEvidence(
       .slice(0, 3);
     for (const record of sessionRecords) {
       const session = await loadMangekyoLoopSession(root, input.projectId, record.id);
-      for (const artifact of renderArtifacts(session).slice(-4)) {
+      for (const { artifact, verifiedClaims } of renderArtifacts(session).slice(-4)) {
         if (!routes.includes(artifact.route)) continue;
         evidence.push({
           id: evidenceId(createId),
@@ -234,7 +266,7 @@ export async function collectGovernanceEvidence(
                 renderSourceRevisionFingerprint: artifact.sourceRevision.worktreeFingerprint,
               }
             : {}),
-          verifiedClaims: [],
+          verifiedClaims,
         });
       }
     }

@@ -1,6 +1,10 @@
-import type { DesignGenome } from "@design-sharingan/core";
+import type { DesignGenome, VisualFinding } from "@design-sharingan/core";
 import { describe, expect, it } from "vitest";
-import { AUDIT_ORDER, runDriftAudit } from "../audit";
+import {
+  AUDIT_ORDER,
+  driftObservationFromAuthenticatedVisualFinding,
+  runDriftAudit,
+} from "../audit";
 
 function approvedGenome(): DesignGenome {
   return {
@@ -39,6 +43,34 @@ function completeIntentionalObservations() {
 }
 
 describe("Drift audit", () => {
+  it("maps an authenticated important hierarchy result into a catalog-bound audit observation", () => {
+    const finding: Pick<VisualFinding, "category" | "severity" | "evidence" | "reason" | "recommendedAction" | "status"> = {
+      category: "HIERARCHY",
+      severity: "IMPORTANT",
+      evidence: ["The rendered heading and support copy retain similar visual weight."],
+      reason: "The first scan does not establish a decisive entry point.",
+      recommendedAction: "Refine one hierarchy objective while preserving navigation.",
+      status: "OPEN",
+    };
+
+    expect(driftObservationFromAuthenticatedVisualFinding(
+      finding,
+      "Preserve the established product hierarchy and component language.",
+    )).toEqual({
+      category: "HIERARCHY",
+      severity: "IMPORTANT",
+      expectedRule: "Preserve the established product hierarchy and component language.",
+      observedEvidence: finding.evidence,
+      whyItMatters: finding.reason,
+      recommendedFix: finding.recommendedAction,
+      status: "OPEN",
+    });
+    expect(driftObservationFromAuthenticatedVisualFinding({
+      ...finding,
+      category: "SPACING",
+    }, "Preserve the established product hierarchy and component language.")).toBeUndefined();
+  });
+
   it("cannot call a one-screen audit a whole-app audit", async () => {
     const report = await runDriftAudit({
       requestedScope: "WHOLE_APP",

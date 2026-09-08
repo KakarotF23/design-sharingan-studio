@@ -25,6 +25,7 @@ const GIT_TIMEOUT_MS = 5_000;
 const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 const UNVERSIONED_EXCLUDED_DIRECTORIES = new Set([
   ".design-sharingan",
+  "design-governance",
   ".git",
   ".next",
   ".turbo",
@@ -275,7 +276,8 @@ function assertSafeSourcePath(rootPath: string, path: string): string {
     isAbsolute(path) || path === "" || path === "." || path === ".." ||
     path.startsWith("../") || path.includes("\0") || path.includes("\r") || path.includes("\n") ||
     path === ".git" || path.startsWith(".git/") ||
-    path === ".design-sharingan" || path.startsWith(".design-sharingan/")
+    path === ".design-sharingan" || path.startsWith(".design-sharingan/") ||
+    path === "design-governance" || path.startsWith("design-governance/")
   ) {
     throw new Error("Git source evidence contained an unsafe path");
   }
@@ -472,7 +474,13 @@ async function requireGit(cwd: string, args: readonly string[], label: string): 
   return result.output;
 }
 
-const SOURCE_PATHSPECS = [".", ":(exclude).design-sharingan", ":(exclude).design-sharingan/**"] as const;
+const SOURCE_PATHSPECS = [
+  ".",
+  ":(exclude).design-sharingan",
+  ":(exclude).design-sharingan/**",
+  ":(exclude)design-governance",
+  ":(exclude)design-governance/**",
+] as const;
 const IGNORED_RENDER_INPUT_PATHSPECS = [
   ".env*",
   ":(glob)**/.env*",
@@ -484,6 +492,7 @@ const IGNORED_RENDER_INPUT_PATHSPECS = [
   ":(exclude,glob)**/.turbo/**",
   ":(exclude,glob)**/.cache/**",
   ":(exclude,glob).design-sharingan/**",
+  ":(exclude,glob)design-governance/**",
 ] as const;
 
 async function captureGitSnapshot(

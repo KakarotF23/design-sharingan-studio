@@ -2,7 +2,11 @@ import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { collectGovernanceEvidence } from "../governance-evidence";
+import {
+  AUTHENTICATED_PRODUCT_LANGUAGE_RULE,
+  collectGovernanceEvidence,
+  verifiedClaimsForProductConsistency,
+} from "../governance-evidence";
 
 const roots: string[] = [];
 
@@ -20,6 +24,27 @@ async function fixture(): Promise<string> {
 }
 
 describe("governance representative evidence", () => {
+  it("registers a visual-invariant claim only for a rendered product-consistency pass with evidence", () => {
+    expect(verifiedClaimsForProductConsistency("/overview", {
+      status: "PASS",
+      evidence: ["The verified render preserves its established hierarchy."],
+    })).toEqual([{
+      claimType: "RULE",
+      category: "VISUAL_INVARIANT",
+      statement: AUTHENTICATED_PRODUCT_LANGUAGE_RULE,
+      scope: { routes: ["/overview"] },
+    }]);
+
+    expect(verifiedClaimsForProductConsistency("/overview", {
+      status: "NOT_VERIFIED",
+      evidence: ["The render is incomplete."],
+    })).toEqual([]);
+    expect(verifiedClaimsForProductConsistency("/overview", {
+      status: "PASS",
+      evidence: [],
+    })).toEqual([]);
+  });
+
   it("returns bounded server identities and sanitized read-only excerpts", async () => {
     const root = await fixture();
     let sequence = 0;

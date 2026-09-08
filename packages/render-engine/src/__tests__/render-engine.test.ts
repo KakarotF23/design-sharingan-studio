@@ -856,6 +856,31 @@ it("excludes .design-sharingan runtime artifacts from Git status and source fing
   });
 });
 
+// Production break caught: human-readable governance documents changed after a
+// render and made its otherwise identical product source appear stale.
+it("excludes design-governance documents from Git status and source fingerprints", async () => {
+  const active = await workspace();
+  await execFileAsync("git", ["init"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
+  await execFileAsync("git", ["config", "user.name", "Render Test"], { cwd: active.rootPath });
+  await writeFile(join(active.rootPath, "tracked.txt"), "committed\n");
+  await execFileAsync("git", ["add", "tracked.txt"], { cwd: active.rootPath });
+  await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: active.rootPath });
+  const gitWorkspace = { ...active, hasGit: true, capabilities: { ...active.capabilities, canUseGit: true } };
+  const first = await captureWorkspaceSourceRevision(gitWorkspace);
+
+  await mkdir(join(active.rootPath, "design-governance"));
+  await writeFile(join(active.rootPath, "design-governance", "DESIGN-GENOME.md"), "# Draft\n");
+  const second = await captureWorkspaceSourceRevision(gitWorkspace);
+
+  expect(second).toMatchObject({
+    kind: "GIT",
+    status: "CLEAN",
+    entries: [],
+    worktreeFingerprint: first.kind === "GIT" ? first.worktreeFingerprint : "unreachable",
+  });
+});
+
 it.each(["dist/styles.css", "build/client.js"])(
   "authenticates excluded changed path %s in an unversioned source revision",
   async (changedPath) => {

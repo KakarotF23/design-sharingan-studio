@@ -7,8 +7,10 @@ import {
 } from "@design-sharingan/core";
 import {
   evaluateReleaseGate,
+  driftObservationFromAuthenticatedVisualFinding,
   initializeGenomeWithCodex,
   runDriftAudit,
+  type DriftObservation,
 } from "@design-sharingan/eternal-engine";
 import {
   approveGenome,
@@ -24,9 +26,12 @@ import {
   saveDriftReport,
 } from "@design-sharingan/governance";
 import {
+  AUTHENTICATED_PRODUCT_LANGUAGE_RULE,
   collectGovernanceEvidence,
   detectProject,
+  loadMangekyoLoopSession,
   loadSession,
+  listSessions,
   saveSession,
   type ProjectWorkspace,
 } from "@design-sharingan/project-adapters";
@@ -375,6 +380,42 @@ async function workspaceFor(project: Project): Promise<ProjectWorkspace> {
   };
 }
 
+/**
+ * A persisted Mangekyō visual result is useful to an audit only when its
+ * exact captured render has also attested the same approved rule. This keeps
+ * an agent finding as an observation, while the catalog remains the sole
+ * authority for its route, state, and render identity.
+ */
+async function driftObservationsByRender(
+  project: Project,
+  genome: Awaited<ReturnType<typeof readGenome>>,
+): Promise<Map<string, DriftObservation[]>> {
+  if (!genome.value.visualInvariants.includes(AUTHENTICATED_PRODUCT_LANGUAGE_RULE)) {
+    return new Map();
+  }
+  const observations = new Map<string, DriftObservation[]>();
+  const sessions = (await listSessions(project.rootPath, project.id))
+    .filter(({ type }) => type === "MANGEKYO_LOOP")
+    .slice(0, 3);
+  for (const record of sessions) {
+    const session = await loadMangekyoLoopSession(project.rootPath, project.id, record.id);
+    for (const { round } of session.rounds) {
+      if (round.afterRender === undefined || round.productConsistency.status !== "PASS") continue;
+      const hierarchyObservations = round.findingsAfter.flatMap((finding) => {
+        const observation = driftObservationFromAuthenticatedVisualFinding(
+          finding,
+          AUTHENTICATED_PRODUCT_LANGUAGE_RULE,
+        );
+        return observation === undefined ? [] : [observation];
+      });
+      if (hierarchyObservations.length > 0) {
+        observations.set(round.afterRender.id, hierarchyObservations);
+      }
+    }
+  }
+  return observations;
+}
+
 async function freshRenderEvidenceIds(
   project: Project,
 ): Promise<{ ids: Set<string>; sourceRevisionFingerprint?: string }> {
@@ -628,7 +669,7 @@ export async function auditProjectDrift(
   if (routes.length === 0 || routes.length > 16) {
     throw new Error("Drift audit scope must be explicitly bounded to supported registered routes");
   }
-  const [newEvidence, existingEvidence, currentRevision] = await Promise.all([
+  const [newEvidence, existingEvidence, currentRevision, observationsByRender] = await Promise.all([
     collectGovernanceEvidence({
       rootPath: project.rootPath,
       projectId: project.id,
@@ -638,11 +679,12 @@ export async function auditProjectDrift(
     }),
     readEvidenceCatalog(project.rootPath, project.id),
     captureWorkspaceSourceRevision(workspace).catch(() => undefined),
+    driftObservationsByRender(project, genome),
   ]);
   const catalog = [...existingEvidence, ...newEvidence];
   const freshRenderByRoute = new Map<string, string[]>();
   if (currentRevision?.available === true) {
-    for (const entry of catalog) {
+    for (const entry of newEvidence) {
       if (
         entry.kind === "RENDER" &&
         entry.authenticatedRenderId !== undefined &&
@@ -650,10 +692,7 @@ export async function auditProjectDrift(
         entry.renderCapturedAt !== undefined &&
         entry.renderSourceRevisionFingerprint === currentRevision.worktreeFingerprint
       ) {
-        freshRenderByRoute.set(entry.route, [
-          ...(freshRenderByRoute.get(entry.route) ?? []),
-          entry.id,
-        ]);
+        freshRenderByRoute.set(entry.route, [entry.id]);
       }
     }
   }
@@ -667,7 +706,16 @@ export async function auditProjectDrift(
     evidence: registry.records.flatMap((record) => record.requiredStates.map((state) => {
       const freshEvidence = state === "default" ? freshRenderByRoute.get(record.route) ?? [] : [];
       return freshEvidence.length > 0
-        ? { screen: record.route, state, status: "INSPECTED" as const, evidenceIds: freshEvidence }
+        ? {
+            screen: record.route,
+            state,
+            status: "INSPECTED" as const,
+            evidenceIds: freshEvidence,
+            observations: freshEvidence.flatMap((id) => {
+              const renderId = catalog.find((entry) => entry.id === id)?.authenticatedRenderId;
+              return renderId === undefined ? [] : observationsByRender.get(renderId) ?? [];
+            }),
+          }
         : {
             screen: record.route,
             state,

@@ -7,6 +7,7 @@ import type {
   DriftFinding,
   DriftReport,
   DriftSeverity,
+  VisualFinding,
 } from "@design-sharingan/core";
 import { createHash } from "node:crypto";
 import { normalizeGovernanceRoute } from "@design-sharingan/core";
@@ -54,6 +55,32 @@ function text(value: string, label: string): string {
     throw new Error(`${label} must be a non-empty bounded string`);
   }
   return value;
+}
+
+/**
+ * Converts the persisted visual result that is paired with an authenticated
+ * render catalog entry into an audit observation. The caller supplies the
+ * approved invariant; unsupported or evidence-free findings cannot enter the
+ * deterministic drift comparison.
+ */
+export function driftObservationFromAuthenticatedVisualFinding(
+  finding: Pick<VisualFinding, "category" | "severity" | "evidence" | "reason" | "recommendedAction" | "status">,
+  expectedRule: string,
+): DriftObservation | undefined {
+  if (
+    finding.category !== "HIERARCHY" ||
+    finding.severity !== "IMPORTANT" ||
+    finding.evidence.length === 0
+  ) return undefined;
+  return {
+    category: "HIERARCHY",
+    severity: "IMPORTANT",
+    expectedRule: text(expectedRule, "Expected rule"),
+    observedEvidence: [...finding.evidence],
+    whyItMatters: finding.reason,
+    recommendedFix: finding.recommendedAction,
+    status: finding.status,
+  };
 }
 
 function scopeKey(screen: string, state: string): string {

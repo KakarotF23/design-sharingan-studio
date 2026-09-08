@@ -24,6 +24,13 @@ function fakeAgent(input: InitializeGenomeInput): GenomeInitAgent {
   if (first === undefined) throw new Error("Fake Genome service requires representative evidence");
   const grounded = catalog.find(({ kind }) => kind !== "ROUTE") ?? first;
   const navigation = catalog.find(({ kind }) => kind === "NAVIGATION" || kind === "COMPONENT") ?? grounded;
+  const productLanguageEvidence = catalog.find(({ verifiedClaims = [] }) =>
+    verifiedClaims.some((claim) =>
+      claim.claimType === "RULE" &&
+      claim.category === "VISUAL_INVARIANT" &&
+      claim.statement === "Preserve the established product hierarchy and component language.",
+    ),
+  );
   const routeFor = (evidenceId: string): string =>
     input.representativeEvidence.find(({ evidence }) =>
       evidence.some(({ id }) => id === evidenceId),
@@ -52,6 +59,13 @@ function fakeAgent(input: InitializeGenomeInput): GenomeInitAgent {
         evidence: [first.id],
         scope: { routes: [routeFor(first.id)] },
       },
+      ...(productLanguageEvidence === undefined ? [] : [{
+        category: "VISUAL_INVARIANT" as const,
+        statement: "Preserve the established product hierarchy and component language.",
+        confidence: "CONFIRMED" as const,
+        evidence: [productLanguageEvidence.id],
+        scope: { routes: [routeFor(productLanguageEvidence.id)] },
+      }]),
       {
         category: "ACCESSIBILITY_RULE",
         statement: "Preserve visible focus and readable contrast.",

@@ -411,12 +411,35 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   expect(drift.value).toMatchObject({
     requestedScope: "WHOLE_APP",
     expectedScope: [{ screen: "/", states: ["default", "loading", "error"] }],
-    inspectedScope: [],
+    inspectedScope: ["/#default"],
     overallStatus: "NOT_VERIFIED",
-    findings: [],
   });
+  expect(drift.value.findings).toHaveLength(1);
+  const [hierarchyFinding] = drift.value.findings;
+  expect(hierarchyFinding).toMatchObject({
+    category: "HIERARCHY",
+    severity: "IMPORTANT",
+    scope: "/#default",
+    expectedRule: "Preserve the established product hierarchy and component language.",
+    observedEvidence: ["The rendered heading and support copy retain similar visual weight."],
+  });
+  expect(hierarchyFinding?.evidenceIds).toHaveLength(1);
+  const [hierarchyEvidenceId] = hierarchyFinding?.evidenceIds ?? [];
+  const hierarchyEvidence = catalog.find(({ id }) => id === hierarchyEvidenceId);
+  expect(hierarchyEvidence).toMatchObject({
+    kind: "RENDER",
+    route: "/",
+    authenticatedRenderId: render.id,
+    renderState: "default",
+    verifiedClaims: [expect.objectContaining({
+      claimType: "RULE",
+      category: "VISUAL_INVARIANT",
+      statement: "Preserve the established product hierarchy and component language.",
+      scope: { routes: ["/"] },
+    })],
+  });
+  expect(drift.value.evidenceIds).toContain(hierarchyEvidenceId);
   expect(drift.value.unavailableScope).toEqual([
-    "/#default: No authenticated fresh rendered evidence exists for this required state.",
     "/#loading: No authenticated fresh rendered evidence exists for this required state.",
     "/#error: No authenticated fresh rendered evidence exists for this required state.",
   ]);
@@ -426,16 +449,14 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     "ACCESSIBILITY_REQUIRED_STATES: Deterministic analysis is unavailable.",
     "PRODUCT_IDENTITY_SCREEN_FAMILY: Deterministic analysis is unavailable.",
     "COMPONENTS_TOKENS: Deterministic analysis is unavailable.",
-    "HIERARCHY: Deterministic analysis is unavailable.",
     "MOTION: Deterministic analysis is unavailable.",
     "POLISH: Deterministic analysis is unavailable.",
   ]));
-  expect(drift.value.unverifiedScope.slice(-7)).toEqual([
+  expect(drift.value.unverifiedScope.slice(-6)).toEqual([
     "UX_NAVIGATION: Deterministic analysis is unavailable.",
     "ACCESSIBILITY_REQUIRED_STATES: Deterministic analysis is unavailable.",
     "PRODUCT_IDENTITY_SCREEN_FAMILY: Deterministic analysis is unavailable.",
     "COMPONENTS_TOKENS: Deterministic analysis is unavailable.",
-    "HIERARCHY: Deterministic analysis is unavailable.",
     "MOTION: Deterministic analysis is unavailable.",
     "POLISH: Deterministic analysis is unavailable.",
   ]);
