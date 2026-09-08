@@ -18,6 +18,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { expect, test } from "@playwright/test";
 import {
+  governanceRootFingerprint,
   parseGovernanceMetadata,
   readDriftReport,
   readEvidenceCatalog,
@@ -78,10 +79,49 @@ async function snapshotProductTree(rootPath: string): Promise<Record<string, str
   return snapshot;
 }
 
+function changedProductPaths(
+  before: Readonly<Record<string, string>>,
+  after: Readonly<Record<string, string>>,
+): string[] {
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((path) => before[path] !== after[path])
+    .sort();
+}
+
+function canonicalJson(value: unknown): string {
+  function sort(entry: unknown): unknown {
+    if (Array.isArray(entry)) return entry.map(sort);
+    if (entry !== null && typeof entry === "object") {
+      return Object.fromEntries(
+        Object.entries(entry)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, nested]) => [key, sort(nested)]),
+      );
+    }
+    return entry;
+  }
+  const serialized = JSON.stringify(sort(value));
+  if (serialized === undefined) throw new Error("Expected governance artifact is not serializable");
+  return serialized;
+}
+
+function governanceArtifactFingerprint(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
 function isInside(parentPath: string, candidatePath: string): boolean {
   const offset = relative(parentPath, candidatePath);
   return offset !== ".." && !offset.startsWith(`..${sep}`) && !isAbsolute(offset);
 }
+
+// Production break caught: comparing only paths that survive in the after
+// snapshot makes an unauthorized deletion invisible to the Safe Mode check.
+test("includes deleted product paths in mutation snapshot differences", () => {
+  expect(changedProductPaths(
+    { "package.json": "file:before", "src/obsolete.ts": "file:before" },
+    { "package.json": "file:after" },
+  )).toEqual(["package.json", "src/obsolete.ts"]);
+});
 
 test.beforeAll(async () => {
   sandboxPath = await mkdtemp(join(tmpdir(), "design-sharingan-full-loop-"));
@@ -178,7 +218,8 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   const projectId = decodeURIComponent(
     new URL(studioPath as string, "http://studio.invalid").pathname.split("/")[2] ?? "",
   );
-  await expect(loadProjectMetadata(projectPath, projectId)).resolves.toMatchObject({
+  const project = await loadProjectMetadata(projectPath, projectId);
+  expect(project).toMatchObject({
     id: projectId,
     rootPath: projectPath,
     status: "READY",
@@ -224,9 +265,7 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   await page.getByRole("button", { name: "Approve & Execute" }).click();
   await expect(page.getByRole("heading", { name: "Approved mutation applied" })).toBeVisible();
   const afterSafeMode = await snapshotProductTree(projectPath);
-  expect(Object.keys(afterSafeMode).filter((path) => afterSafeMode[path] !== beforeV1[path])).toEqual([
-    "package.json",
-  ]);
+  expect(changedProductPaths(beforeV1, afterSafeMode)).toEqual(["package.json"]);
 
   await page.getByRole("button", { name: "Mangekyō" }).click();
   await page.getByRole("button", { name: "Start Mangekyō loop" }).click();
@@ -345,6 +384,9 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   ]);
   expect(genome.value.status).toBe("APPROVED");
   expect(genome.authority).toBe("AUTHORITATIVE");
+  expect(genome.value.unconfirmedRules).toContain(
+    "Use restrained contrast to separate primary action from evidence.",
+  );
   expect(genome.metadata.authority).toMatchObject({
     projectId,
     genomeEntityId: genome.metadata.entityId,
@@ -366,6 +408,38 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     registryEntityId: registry.metadata.entityId,
     registryRevision: registry.metadata.revision,
   });
+  expect(drift.value).toMatchObject({
+    requestedScope: "WHOLE_APP",
+    expectedScope: [{ screen: "/", states: ["default", "loading", "error"] }],
+    inspectedScope: [],
+    overallStatus: "NOT_VERIFIED",
+    findings: [],
+  });
+  expect(drift.value.unavailableScope).toEqual([
+    "/#default: No authenticated fresh rendered evidence exists for this required state.",
+    "/#loading: No authenticated fresh rendered evidence exists for this required state.",
+    "/#error: No authenticated fresh rendered evidence exists for this required state.",
+  ]);
+  expect(drift.value.unverifiedScope).toEqual(expect.arrayContaining([
+    "Whole-product scope requires more than one distinct canonical screen.",
+    "UX_NAVIGATION: Deterministic analysis is unavailable.",
+    "ACCESSIBILITY_REQUIRED_STATES: Deterministic analysis is unavailable.",
+    "PRODUCT_IDENTITY_SCREEN_FAMILY: Deterministic analysis is unavailable.",
+    "COMPONENTS_TOKENS: Deterministic analysis is unavailable.",
+    "HIERARCHY: Deterministic analysis is unavailable.",
+    "MOTION: Deterministic analysis is unavailable.",
+    "POLISH: Deterministic analysis is unavailable.",
+  ]));
+  expect(drift.value.unverifiedScope.slice(-7)).toEqual([
+    "UX_NAVIGATION: Deterministic analysis is unavailable.",
+    "ACCESSIBILITY_REQUIRED_STATES: Deterministic analysis is unavailable.",
+    "PRODUCT_IDENTITY_SCREEN_FAMILY: Deterministic analysis is unavailable.",
+    "COMPONENTS_TOKENS: Deterministic analysis is unavailable.",
+    "HIERARCHY: Deterministic analysis is unavailable.",
+    "MOTION: Deterministic analysis is unavailable.",
+    "POLISH: Deterministic analysis is unavailable.",
+  ]);
+  expect(drift.value.evidenceIds.length).toBeGreaterThan(0);
   expect(drift.value.evidenceIds.every((id) => catalog.some((entry) => entry.id === id))).toBe(true);
   expect(catalog).toContainEqual(expect.objectContaining({
     kind: "RENDER",
@@ -390,7 +464,27 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     entityId: drift.metadata.entityId,
     revision: drift.metadata.revision,
   });
-
+  const rootFingerprint = await governanceRootFingerprint(projectPath);
+  expect(genomeSession).toMatchObject({
+    entityId: genome.metadata.entityId,
+    revision: genome.metadata.revision,
+    artifactFingerprint: governanceArtifactFingerprint({
+      metadata: genome.metadata,
+      value: genome.value,
+      payloadHash: genome.payloadHash,
+      authority: genome.authority,
+    }),
+    rootFingerprint,
+  });
+  expect(driftSession).toMatchObject({
+    entityId: drift.metadata.entityId,
+    revision: drift.metadata.revision,
+    artifactFingerprint: governanceArtifactFingerprint({
+      metadata: drift.metadata,
+      value: drift.value,
+    }),
+    rootFingerprint,
+  });
   const projectBasePath = (studioPath as string).replace(/\/overview$/, "");
   const governanceResponse = await page.evaluate(async (path) => {
     const response = await fetch(`${path}/govern/data`, { cache: "no-store" });
@@ -422,6 +516,20 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     };
   }, projectBasePath);
   expect(reportsResponse.status).toBe(200);
+  expect(reportsResponse.payload.sessions).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      id: genomeSession.id,
+      type: "GENOME_INIT",
+      status: "APPROVED",
+      result: "APPROVED",
+    }),
+    expect.objectContaining({
+      id: driftSession.id,
+      type: "DRIFT_AUDIT",
+      status: "NOT_VERIFIED",
+      result: "NOT_VERIFIED",
+    }),
+  ]));
   expect(reportsResponse.payload.sessions).toContainEqual(expect.objectContaining({
     id: releaseSession.id,
     type: "RELEASE_GATE",

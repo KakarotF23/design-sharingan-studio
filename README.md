@@ -46,8 +46,8 @@ pnpm exec playwright install chromium
 Install the bundled Design Sharingan skills, then start a new Codex session so they are discovered:
 
 ```bash
-bash scripts/install-project-skills.sh
-bash scripts/verify-kickoff-pack.sh
+bash scripts/install-skills.sh --source ./skills
+bash scripts/verify-skills.sh --source ./skills --target "$HOME/.agents/skills"
 ```
 
 ## Verification
