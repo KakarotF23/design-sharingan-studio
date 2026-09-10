@@ -16,6 +16,18 @@ export const GOVERNANCE_SCHEMA_VERSION = 1 as const;
 export const GOVERNANCE_METADATA_PREFIX = "<!-- design-sharingan-metadata:";
 export const GOVERNANCE_METADATA_SUFFIX = " -->";
 
+export interface GenomeApprovalClaimProof {
+  claimId: string;
+  claimType: "RULE";
+  category: Exclude<GovernanceClaimCategory, "PRODUCT_IDENTITY">;
+  statement: string;
+  evidenceId: string;
+  route: string;
+  state: string;
+  authenticatedRenderId: string;
+  sourceRevisionFingerprint: string;
+}
+
 export interface GenomeAuthorityProof {
   kind: "GENOME_AUTHORITY";
   projectId: string;
@@ -27,6 +39,7 @@ export interface GenomeAuthorityProof {
   payloadHash: string;
   approvedBy: "local-user";
   approvedAt: string;
+  acceptedClaim?: GenomeApprovalClaimProof;
   signature: string;
 }
 
@@ -431,17 +444,25 @@ function parseInspectedScope(value: unknown): GovernanceInspectedScope {
 
 function parseClaimCitation(value: unknown): GovernanceClaimCitation {
   const citation = objectValue(value, "Genome claim citation");
-  exactKeys(citation, ["claimType", "category", "statement", "confidence", "requestedConfidence", "scope", "evidenceIds"], [], "Genome claim citation");
+  exactKeys(citation, ["claimType", "category", "statement", "confidence", "requestedConfidence", "scope", "evidenceIds"], ["id"], "Genome claim citation");
   if (citation.claimType !== "PRODUCT_IDENTITY" && citation.claimType !== "RULE") throw new Error("Genome claim type is invalid");
   if (!CLAIM_CATEGORIES.has(citation.category as GovernanceClaimCategory)) throw new Error("Genome claim category is invalid");
   if ((citation.claimType === "PRODUCT_IDENTITY") !== (citation.category === "PRODUCT_IDENTITY")) throw new Error("Genome claim type and category are inconsistent");
   if (citation.confidence !== "CONFIRMED" && citation.confidence !== "UNCONFIRMED") throw new Error("Genome claim confidence is invalid");
   if (citation.requestedConfidence !== "CONFIRMED" && citation.requestedConfidence !== "UNCONFIRMED") throw new Error("Genome requested claim confidence is invalid");
   if (!Array.isArray(citation.evidenceIds) || citation.evidenceIds.length > MAX_RULES) throw new Error("Genome claim evidence must be bounded");
+  const statement = boundedString(citation.statement, "Genome claim statement");
+  const id = citation.id === undefined
+    ? `claim-${createHash("sha256")
+        .update(JSON.stringify({ claimType: citation.claimType, category: citation.category, statement }), "utf8")
+        .digest("hex")
+        .slice(0, 32)}`
+    : safeId(citation.id, "Genome claim identity");
   return {
+    id,
     claimType: citation.claimType,
     category: citation.category as GovernanceClaimCategory,
-    statement: boundedString(citation.statement, "Genome claim statement"),
+    statement,
     confidence: citation.confidence,
     requestedConfidence: citation.requestedConfidence,
     scope: parseClaimScope(citation.scope, "Genome claim scope"),
@@ -482,11 +503,34 @@ export function genomePayloadHash(genomeInput: DesignGenome): string {
   return createHash("sha256").update(JSON.stringify(rules), "utf8").digest("hex");
 }
 
+function parseApprovalClaim(value: unknown): GenomeApprovalClaimProof {
+  const claim = objectValue(value, "Genome approval claim");
+  exactKeys(claim, ["claimId", "claimType", "category", "statement", "evidenceId", "route", "state", "authenticatedRenderId", "sourceRevisionFingerprint"], [], "Genome approval claim");
+  if (claim.claimType !== "RULE" || claim.category === "PRODUCT_IDENTITY" || !CLAIM_CATEGORIES.has(claim.category as GovernanceClaimCategory)) {
+    throw new Error("Genome approval claim category is invalid");
+  }
+  if (typeof claim.state !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(claim.state)) {
+    throw new Error("Genome approval claim state is invalid");
+  }
+  return {
+    claimId: safeId(claim.claimId, "Genome approval claim identity"),
+    claimType: "RULE",
+    category: claim.category as Exclude<GovernanceClaimCategory, "PRODUCT_IDENTITY">,
+    statement: boundedString(claim.statement, "Genome approval claim statement"),
+    evidenceId: evidenceId(claim.evidenceId, "Genome approval claim evidence"),
+    route: safeRoute(claim.route),
+    state: claim.state,
+    authenticatedRenderId: safeId(claim.authenticatedRenderId, "Genome approval render identity"),
+    sourceRevisionFingerprint: hash(claim.sourceRevisionFingerprint, "Genome approval source revision"),
+  };
+}
+
 function parseAuthority(value: unknown): GenomeAuthorityProof {
   const proof = objectValue(value, "Genome authority proof");
-  exactKeys(proof, ["kind", "projectId", "rootFingerprint", "genomeEntityId", "genomeVersion", "approvedDraftRevision", "documentRevision", "payloadHash", "approvedBy", "approvedAt", "signature"], [], "Genome authority proof");
+  exactKeys(proof, ["kind", "projectId", "rootFingerprint", "genomeEntityId", "genomeVersion", "approvedDraftRevision", "documentRevision", "payloadHash", "approvedBy", "approvedAt", "signature"], ["acceptedClaim"], "Genome authority proof");
   if (proof.kind !== "GENOME_AUTHORITY" || proof.approvedBy !== "local-user") throw new Error("Genome authority actor or kind is invalid");
-  return { kind: "GENOME_AUTHORITY", projectId: safeId(proof.projectId, "Authority project identity"), rootFingerprint: hash(proof.rootFingerprint, "Authority root fingerprint"), genomeEntityId: safeId(proof.genomeEntityId, "Authority Genome identity"), genomeVersion: boundedString(proof.genomeVersion, "Authority Genome version", MAX_SHORT_TEXT_LENGTH), approvedDraftRevision: positiveRevision(proof.approvedDraftRevision), documentRevision: positiveRevision(proof.documentRevision), payloadHash: hash(proof.payloadHash, "Authority payload hash"), approvedBy: "local-user", approvedAt: isoTimestamp(proof.approvedAt, "Authority approval time"), signature: hash(proof.signature, "Authority signature") };
+  const acceptedClaim = proof.acceptedClaim === undefined ? undefined : parseApprovalClaim(proof.acceptedClaim);
+  return { kind: "GENOME_AUTHORITY", projectId: safeId(proof.projectId, "Authority project identity"), rootFingerprint: hash(proof.rootFingerprint, "Authority root fingerprint"), genomeEntityId: safeId(proof.genomeEntityId, "Authority Genome identity"), genomeVersion: boundedString(proof.genomeVersion, "Authority Genome version", MAX_SHORT_TEXT_LENGTH), approvedDraftRevision: positiveRevision(proof.approvedDraftRevision), documentRevision: positiveRevision(proof.documentRevision), payloadHash: hash(proof.payloadHash, "Authority payload hash"), approvedBy: "local-user", approvedAt: isoTimestamp(proof.approvedAt, "Authority approval time"), ...(acceptedClaim === undefined ? {} : { acceptedClaim }), signature: hash(proof.signature, "Authority signature") };
 }
 
 function safeRoute(value: unknown): string {
@@ -711,6 +755,7 @@ export function parseGovernanceMetadata(markdown: string): GovernanceMetadata {
   try { parsed = JSON.parse(firstLine.slice(GOVERNANCE_METADATA_PREFIX.length, -GOVERNANCE_METADATA_SUFFIX.length)); } catch { throw new Error("Governance document metadata is malformed"); }
   const metadata = objectValue(parsed, "Governance metadata");
   let normalized: GovernanceMetadata;
+  let legacyGenomeCitations = false;
   if (metadata.kind === "DESIGN_GENOME") {
     exactKeys(metadata, ["schemaVersion", "kind", "projectId", "entityId", "revision", "status", "inspectedScope", "claimCitations", "value"], ["authority"], "Design Genome metadata");
     assertBaseMetadata(metadata, "DESIGN_GENOME");
@@ -719,6 +764,14 @@ export function parseGovernanceMetadata(markdown: string): GovernanceMetadata {
     const authority = metadata.authority === undefined ? undefined : parseAuthority(metadata.authority);
     const inspectedScope = parseInspectedScope(metadata.inspectedScope);
     if (!Array.isArray(metadata.claimCitations) || metadata.claimCitations.length > MAX_RECORDS) throw new Error("Genome claim citations must be bounded");
+    const legacyCitationCount = metadata.claimCitations.filter((citation) =>
+      citation !== null && typeof citation === "object" && !Array.isArray(citation) &&
+      !Object.hasOwn(citation, "id"),
+    ).length;
+    if (legacyCitationCount !== 0 && legacyCitationCount !== metadata.claimCitations.length) {
+      throw new Error("Genome claim citation identity migration is incomplete");
+    }
+    legacyGenomeCitations = legacyCitationCount > 0;
     const claimCitations = metadata.claimCitations.map(parseClaimCitation);
     const inspectedRoutes = new Set(inspectedScope.routes);
     const inspectedEvidence = new Set(inspectedScope.evidenceIds);
@@ -776,7 +829,13 @@ export function parseGovernanceMetadata(markdown: string): GovernanceMetadata {
     };
   } else throw new Error("Governance document kind is invalid");
   const canonical = normalized.kind === "DESIGN_GENOME" ? renderGenome(normalized) : normalized.kind === "SCREEN_REGISTRY" ? renderScreenRegistry(normalized) : normalized.kind === "DESIGN_DECISIONS" ? renderDesignDecisions(normalized) : renderDriftReport(normalized);
-  if (canonical !== markdown) throw new Error("Governance Markdown body or metadata is not canonical");
+  const legacyCanonical = normalized.kind === "DESIGN_GENOME" && legacyGenomeCitations
+    ? renderGenome({
+        ...normalized,
+        claimCitations: normalized.claimCitations.map(({ id: _id, ...citation }) => citation),
+      } as unknown as GenomeMetadata)
+    : undefined;
+  if (canonical !== markdown && legacyCanonical !== markdown) throw new Error("Governance Markdown body or metadata is not canonical");
   return normalized;
 }
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   CodexAgentResult,
   CodexAgentRunInput,
@@ -475,6 +476,17 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
 
+function claimCitationId(
+  claimType: GovernanceClaimCitation["claimType"],
+  category: GovernanceClaimCitation["category"],
+  statement: string,
+): string {
+  return `claim-${createHash("sha256")
+    .update(JSON.stringify({ claimType, category, statement }), "utf8")
+    .digest("hex")
+    .slice(0, 32)}`;
+}
+
 export async function initializeGenome(
   rawInput: InitializeGenomeInput,
   dependencies: InitializeGenomeDependencies,
@@ -498,38 +510,13 @@ export async function initializeGenome(
     throw new Error("Initialized screens must exactly match representative evidence coverage");
   }
 
-  const evidenceCatalog = new Map(
-    input.representativeEvidence.flatMap((entry) => entry.evidence.map((evidence) => [evidence.id, evidence] as const)),
+  const evidenceIds = new Set(
+    input.representativeEvidence.flatMap((entry) => entry.evidence.map((evidence) => evidence.id)),
   );
   const routeByEvidence = new Map(
     input.representativeEvidence.flatMap((entry) =>
       entry.evidence.map((evidence) => [evidence.id, entry.route] as const)),
   );
-  const verifiedClaim = (
-    claimType: GovernanceVerifiedClaim["claimType"],
-    category: GovernanceClaimCategory,
-    confidenceValue: GenomeRuleConfidence,
-    citations: string[],
-    statement: string,
-    scope: GovernanceClaimScope,
-  ): boolean => {
-    if (confidenceValue !== "CONFIRMED" || citations.some((id) => !evidenceCatalog.has(id))) return false;
-    const citedRoutes = unique(citations.flatMap((id) => {
-      const route = routeByEvidence.get(id);
-      return route === undefined ? [] : [route];
-    })).sort();
-    if (JSON.stringify([...scope.routes].sort()) !== JSON.stringify(citedRoutes)) return false;
-    return citations.every((id) => {
-      const evidence = evidenceCatalog.get(id);
-      const route = routeByEvidence.get(id);
-      return evidence !== undefined && route !== undefined &&
-        (evidence.verifiedClaims ?? []).some((claim) =>
-          claim.claimType === claimType && claim.category === category &&
-          claim.statement === statement && claim.scope.routes.length === 1 &&
-          claim.scope.routes[0] === route,
-        );
-    });
-  };
   const auditedScope = (citations: string[]): GovernanceClaimScope => {
     const routes = unique(citations.flatMap((id) => {
       const route = routeByEvidence.get(id);
@@ -538,34 +525,36 @@ export async function initializeGenome(
     return { routes };
   };
   const claimCitations: GovernanceClaimCitation[] = [];
-  const normalizedRules = output.rules.map((rule) => {
+  const exactRuleKeys = new Set<string>();
+  const distinctRules = output.rules.filter((rule) => {
+    const key = JSON.stringify(rule);
+    if (exactRuleKeys.has(key)) return false;
+    exactRuleKeys.add(key);
+    return true;
+  });
+  const normalizedRules = distinctRules.map((rule) => {
     const statement = sanitizedString(rule.statement, "Genome rule");
-    const evidenceIds = rule.evidence.filter((id) => evidenceCatalog.has(id));
-    const normalizedConfidence = verifiedClaim(
-      "RULE", rule.category, rule.confidence, evidenceIds, statement, rule.scope,
-    ) ? "CONFIRMED" as const : "UNCONFIRMED" as const;
+    const citedEvidenceIds = rule.evidence.filter((id) => evidenceIds.has(id));
+    const normalizedConfidence = "UNCONFIRMED" as const;
     claimCitations.push({
+      id: claimCitationId("RULE", rule.category, statement),
       claimType: "RULE",
       category: rule.category,
       statement,
       confidence: normalizedConfidence,
       requestedConfidence: rule.confidence,
-      scope: auditedScope(evidenceIds),
-      evidenceIds,
+      scope: auditedScope(citedEvidenceIds),
+      evidenceIds: citedEvidenceIds,
     });
-    return { ...rule, statement, evidence: evidenceIds, confidence: normalizedConfidence };
+    return { ...rule, statement, evidence: citedEvidenceIds, confidence: normalizedConfidence };
   });
-  const confirmed = normalizedRules.filter((rule) => rule.confidence === "CONFIRMED");
+  const confirmed: GenomeInitRule[] = [];
   const confirmedStatements = new Set(confirmed.map((rule) => rule.statement));
-  const unconfirmed = normalizedRules
-    .filter((rule) => rule.confidence === "UNCONFIRMED")
-    .map((rule) => rule.statement);
-  const identityEvidenceIds = output.productIdentity.evidence.filter((id) => evidenceCatalog.has(id));
-  const identityConfirmed = verifiedClaim(
-    "PRODUCT_IDENTITY", "PRODUCT_IDENTITY", output.productIdentity.confidence,
-    identityEvidenceIds, output.productIdentity.statement, output.productIdentity.scope,
-  );
+  const unconfirmed = normalizedRules.map((rule) => rule.statement);
+  const identityEvidenceIds = output.productIdentity.evidence.filter((id) => evidenceIds.has(id));
+  const identityConfirmed = false;
   claimCitations.push({
+    id: claimCitationId("PRODUCT_IDENTITY", "PRODUCT_IDENTITY", output.productIdentity.statement),
     claimType: "PRODUCT_IDENTITY",
     category: "PRODUCT_IDENTITY",
     statement: sanitizedString(output.productIdentity.statement, "Product identity", 4_000),

@@ -4,18 +4,26 @@ import { readProjectJson } from "../../../../../features/projects/project-reques
 
 export const runtime = "nodejs";
 
-function approvalBody(value: unknown): value is { expectedRevision: number; expectedPayloadHash: string } {
+function approvalBody(value: unknown): value is {
+  expectedRevision: number;
+  expectedPayloadHash: string;
+  acceptedClaimId: string;
+} {
   return (
     value !== null &&
     typeof value === "object" &&
     !Array.isArray(value) &&
-    Object.keys(value).length === 2 &&
+    Object.keys(value).length === 3 &&
+    Object.keys(value).every((key) => ["expectedRevision", "expectedPayloadHash", "acceptedClaimId"].includes(key)) &&
     Object.hasOwn(value, "expectedRevision") &&
     Object.hasOwn(value, "expectedPayloadHash") &&
+    Object.hasOwn(value, "acceptedClaimId") &&
     Number.isSafeInteger((value as { expectedRevision?: unknown }).expectedRevision) &&
     ((value as { expectedRevision: number }).expectedRevision >= 1) &&
     typeof (value as { expectedPayloadHash?: unknown }).expectedPayloadHash === "string" &&
-    /^[a-f0-9]{64}$/.test((value as { expectedPayloadHash: string }).expectedPayloadHash)
+    /^[a-f0-9]{64}$/.test((value as { expectedPayloadHash: string }).expectedPayloadHash) &&
+    typeof (value as { acceptedClaimId?: unknown }).acceptedClaimId === "string" &&
+    /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test((value as { acceptedClaimId: string }).acceptedClaimId)
   );
 }
 
@@ -36,6 +44,7 @@ export async function POST(
         project,
         parsed.body.expectedRevision,
         parsed.body.expectedPayloadHash,
+        parsed.body.acceptedClaimId,
       ),
     );
   } catch {

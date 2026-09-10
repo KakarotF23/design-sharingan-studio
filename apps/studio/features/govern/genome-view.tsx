@@ -56,8 +56,9 @@ export function GenomeView({
 }: {
   genome: GovernGenomeProjection;
   busy: boolean;
-  onApprove(): void;
+  onApprove(acceptedClaimId: string): void;
 }) {
+  const [acceptedClaimId, setAcceptedClaimId] = useState<string>();
   return (
     <section className="genome-view" aria-labelledby="genome-title">
       <header className="genome-view__header">
@@ -73,13 +74,35 @@ export function GenomeView({
           <strong>{genome.authority}</strong>
           <small>Revision {genome.revision}</small>
           {genome.status === "DRAFT" ? (
-            <button className="primary-action" type="button" disabled={busy} onClick={onApprove}>
+            <button
+              className="primary-action"
+              type="button"
+              disabled={busy || acceptedClaimId === undefined}
+              onClick={() => { if (acceptedClaimId !== undefined) onApprove(acceptedClaimId); }}
+            >
               <span>{busy ? "Recording approval…" : "Approve Genome"}</span>
               <span aria-hidden="true">→</span>
             </button>
           ) : null}
         </div>
       </header>
+      {genome.status === "DRAFT" && genome.approvableClaims.length > 0 ? (
+        <fieldset className="genome-rule-group genome-rule-group--unconfirmed">
+          <legend>Approve one evidence-bound rule</legend>
+          {genome.approvableClaims.map((claim) => (
+            <label key={claim.id}>
+              <input
+                type="radio"
+                name="accepted-genome-claim"
+                value={claim.id}
+                checked={acceptedClaimId === claim.id}
+                onChange={() => setAcceptedClaimId(claim.id)}
+              />
+              {claim.statement}
+            </label>
+          ))}
+        </fieldset>
+      ) : null}
       <div className="genome-view__rules">
         <GenomeRuleGroup title="UX Invariants" values={genome.uxInvariants} />
         <GenomeRuleGroup title="Visual Invariants" values={genome.visualInvariants} />
@@ -149,7 +172,10 @@ export function GovernWorkspace() {
       });
   }, [load, setShellGenome]);
 
-  async function action(endpoint: "initialize" | "approve" | "audit" | "release") {
+  async function action(
+    endpoint: "initialize" | "approve" | "audit" | "release",
+    acceptedClaimId?: string,
+  ) {
     setBusy(true);
     setError(undefined);
     try {
@@ -158,6 +184,7 @@ export function GovernWorkspace() {
           ? {
               expectedRevision: projection.genome.revision,
               expectedPayloadHash: projection.genome.payloadHash,
+              ...(acceptedClaimId === undefined ? {} : { acceptedClaimId }),
             }
           : {};
       const response = await fetch(
@@ -237,7 +264,7 @@ export function GovernWorkspace() {
           <GenomeView
             genome={projection.genome}
             busy={busy}
-            onApprove={() => action("approve")}
+            onApprove={(acceptedClaimId) => action("approve", acceptedClaimId)}
           />
           <ScreenRegistry screens={projection.screens} />
           <DriftView

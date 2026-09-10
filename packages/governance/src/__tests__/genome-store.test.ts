@@ -6,6 +6,7 @@ import {
   realpath,
   rm,
   symlink,
+  unlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -17,6 +18,7 @@ import {
   approveGenome,
   governanceIsInitialized,
   initializeGovernance,
+  readEvidenceCatalog,
   readDesignDecisions,
   readGenome,
   readScreenRegistry,
@@ -27,6 +29,7 @@ import {
   renderScreenRegistry,
   saveDesignDecisions,
   saveScreenRegistry,
+  setGenomeApprovalTransactionFaultForTest,
 } from "../index";
 
 const roots: string[] = [];
@@ -70,6 +73,62 @@ function evidenceCatalog() {
     excerpt: "Authenticated project inspection detected this current route.",
     verifiedClaims: [],
   }];
+}
+
+const HUMAN_APPROVAL_RULE = "Keep human decisions explicit.";
+const HUMAN_APPROVAL_CLAIM_ID = "claim-human-decisions";
+const HUMAN_APPROVAL_EVIDENCE_ID = "ev_render_overview_01";
+const HUMAN_APPROVAL_RENDER_ID = "render-overview-01";
+const HUMAN_APPROVAL_FINGERPRINT = "a".repeat(64);
+
+function approvalDraftGenome(): DesignGenome {
+  return {
+    ...draftGenome(),
+    uxInvariants: [],
+    unconfirmedRules: [HUMAN_APPROVAL_RULE],
+  };
+}
+
+function approvalEvidenceCatalog() {
+  return [{
+    id: HUMAN_APPROVAL_EVIDENCE_ID,
+    kind: "RENDER" as const,
+    route: "/overview",
+    excerpt: "Authenticated overview render before explicit Genome approval.",
+    verifiedClaims: [],
+    authenticatedRenderId: HUMAN_APPROVAL_RENDER_ID,
+    renderState: "default",
+    renderCapturedAt: "2026-09-08T00:00:00.000Z",
+    renderSourceRevisionFingerprint: HUMAN_APPROVAL_FINGERPRINT,
+  }];
+}
+
+function approvalCitations() {
+  return [{
+    id: HUMAN_APPROVAL_CLAIM_ID,
+    claimType: "RULE" as const,
+    category: "UX_INVARIANT" as const,
+    statement: HUMAN_APPROVAL_RULE,
+    confidence: "UNCONFIRMED" as const,
+    requestedConfidence: "CONFIRMED" as const,
+    scope: { routes: ["/overview"] },
+    evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+  }];
+}
+
+function acceptedHumanClaim(overrides: Record<string, unknown> = {}) {
+  return {
+    claimId: HUMAN_APPROVAL_CLAIM_ID,
+    claimType: "RULE" as const,
+    category: "UX_INVARIANT" as const,
+    statement: HUMAN_APPROVAL_RULE,
+    evidenceId: HUMAN_APPROVAL_EVIDENCE_ID,
+    route: "/overview",
+    state: "default",
+    authenticatedRenderId: HUMAN_APPROVAL_RENDER_ID,
+    sourceRevisionFingerprint: HUMAN_APPROVAL_FINGERPRINT,
+    ...overrides,
+  };
 }
 
 async function projectRoot(): Promise<string> {
@@ -124,9 +183,16 @@ describe("Genome governance store", () => {
     await initializeGovernance({
       rootPath: root,
       projectId: "project-a",
-      genome: draftGenome(),
+      genome: approvalDraftGenome(),
       screens: [],
       decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
     });
 
     const approved = await approveGenome(root, "project-a", {
@@ -135,6 +201,7 @@ describe("Genome governance store", () => {
       expectedPayloadHash: createdPayloadHash(
         await readGenome(root, "project-a"),
       ),
+      acceptedClaim: acceptedHumanClaim(),
     });
 
     expect(approved.value.status).toBe("APPROVED");
@@ -154,14 +221,456 @@ describe("Genome governance store", () => {
       .toContain("**Status:** APPROVED");
   });
 
+  it("promotes only the exact human-approved, render-bound draft claim", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+    expect(draft.value.uxInvariants).toEqual([]);
+    expect(draft.metadata.claimCitations).toContainEqual(expect.objectContaining({
+      id: HUMAN_APPROVAL_CLAIM_ID,
+      confidence: "UNCONFIRMED",
+    }));
+
+    const approved = await approveGenome(root, "project-a", {
+      approvedBy: "local-user",
+      expectedRevision: draft.metadata.revision,
+      expectedPayloadHash: draft.payloadHash,
+      acceptedClaim: acceptedHumanClaim(),
+    });
+
+    expect(approved.value.uxInvariants).toEqual([HUMAN_APPROVAL_RULE]);
+    expect(approved.value.unconfirmedRules).not.toContain(HUMAN_APPROVAL_RULE);
+    expect(approved.metadata.claimCitations).toContainEqual(expect.objectContaining({
+      id: HUMAN_APPROVAL_CLAIM_ID,
+      confidence: "CONFIRMED",
+      evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+    }));
+    expect(await readEvidenceCatalog(root, "project-a")).toContainEqual(expect.objectContaining({
+      id: HUMAN_APPROVAL_EVIDENCE_ID,
+      verifiedClaims: [{
+        claimType: "RULE",
+        category: "UX_INVARIANT",
+        statement: HUMAN_APPROVAL_RULE,
+        scope: { routes: ["/overview"] },
+      }],
+    }));
+  });
+
+  it("rejects Genome approval when no exact draft claim is selected", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+
+    await expect(approveGenome(root, "project-a", {
+      approvedBy: "local-user",
+      expectedRevision: draft.metadata.revision,
+      expectedPayloadHash: draft.payloadHash,
+    } as Parameters<typeof approveGenome>[2])).rejects.toThrow(/claim.*required|select/i);
+    expect((await readGenome(root, "project-a")).value.status).toBe("DRAFT");
+  });
+
+  it.each([
+    ["a forged rule id", { claimId: "claim-forged" }],
+    ["mismatched rule text", { statement: "Forged rule." }],
+    ["mismatched evidence", { evidenceId: "ev_render_forged_01" }],
+    ["mismatched route", { route: "/different" }],
+    ["mismatched state", { state: "loading" }],
+    ["mismatched render", { authenticatedRenderId: "render-forged-01" }],
+    ["stale source revision", { sourceRevisionFingerprint: "b".repeat(64) }],
+  ])("fails closed for %s", async (_label, overrides) => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+
+    await expect(approveGenome(root, "project-a", {
+      approvedBy: "local-user",
+      expectedRevision: draft.metadata.revision,
+      expectedPayloadHash: draft.payloadHash,
+      acceptedClaim: acceptedHumanClaim(overrides),
+    })).rejects.toThrow(/claim|evidence|render|route|state|revision/i);
+    expect((await readGenome(root, "project-a")).value.status).toBe("DRAFT");
+  });
+
+  it("serializes a bound-claim approval so a claim cannot be reused", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+    const request = {
+      approvedBy: "local-user" as const,
+      expectedRevision: draft.metadata.revision,
+      expectedPayloadHash: draft.payloadHash,
+      acceptedClaim: acceptedHumanClaim(),
+    };
+    const results = await Promise.allSettled([
+      approveGenome(root, "project-a", request),
+      approveGenome(root, "project-a", request),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect((await readGenome(root, "project-a")).value.uxInvariants).toEqual([HUMAN_APPROVAL_RULE]);
+  });
+
+  it("recovers one atomic approval after a crash between catalog and Genome promotion", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+    setGenomeApprovalTransactionFaultForTest("after-catalog-before-genome");
+    try {
+      await expect(approveGenome(root, "project-a", {
+        approvedBy: "local-user",
+        expectedRevision: draft.metadata.revision,
+        expectedPayloadHash: draft.payloadHash,
+        acceptedClaim: acceptedHumanClaim(),
+      })).rejects.toThrow(/injected.*approval.*fault/i);
+    } finally {
+      setGenomeApprovalTransactionFaultForTest(undefined);
+    }
+
+    const recovered = await readGenome(root, "project-a");
+    expect(recovered).toMatchObject({
+      authority: "AUTHORITATIVE",
+      value: { status: "APPROVED", uxInvariants: [HUMAN_APPROVAL_RULE] },
+      metadata: { authority: { acceptedClaim: acceptedHumanClaim() } },
+    });
+    expect(await readEvidenceCatalog(root, "project-a")).toContainEqual(expect.objectContaining({
+      id: HUMAN_APPROVAL_EVIDENCE_ID,
+      verifiedClaims: [expect.objectContaining({ statement: HUMAN_APPROVAL_RULE })],
+    }));
+  });
+
+  it("recovers an authenticated approval transaction when its pointer is missing", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: { representative: true, routes: ["/overview"], evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID] },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+    setGenomeApprovalTransactionFaultForTest("after-catalog-before-genome");
+    try {
+      await expect(approveGenome(root, "project-a", {
+        approvedBy: "local-user",
+        expectedRevision: draft.metadata.revision,
+        expectedPayloadHash: draft.payloadHash,
+        acceptedClaim: acceptedHumanClaim(),
+      })).rejects.toThrow(/injected/i);
+    } finally {
+      setGenomeApprovalTransactionFaultForTest(undefined);
+    }
+    await unlink(join(root, ".design-sharingan", "pending-genome-approval.json"));
+
+    await expect(readGenome(root, "project-a")).resolves.toMatchObject({
+      authority: "AUTHORITATIVE",
+      value: { status: "APPROVED", uxInvariants: [HUMAN_APPROVAL_RULE] },
+    });
+  });
+
+  it("rejects replay of a consumed approval transaction over intervening governance", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: { representative: true, routes: ["/overview"], evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID] },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+    setGenomeApprovalTransactionFaultForTest("after-catalog-before-genome");
+    try {
+      await expect(approveGenome(root, "project-a", {
+        approvedBy: "local-user",
+        expectedRevision: draft.metadata.revision,
+        expectedPayloadHash: draft.payloadHash,
+        acceptedClaim: acceptedHumanClaim(),
+      })).rejects.toThrow(/injected/i);
+    } finally {
+      setGenomeApprovalTransactionFaultForTest(undefined);
+    }
+    const machine = join(root, ".design-sharingan");
+    const staging = join(machine, "genome-approval-transaction");
+    const saved = {
+      pointer: await readFile(join(machine, "pending-genome-approval.json"), "utf8"),
+      manifest: await readFile(join(staging, "approval-transaction.json"), "utf8"),
+      genome: await readFile(join(staging, "DESIGN-GENOME.md"), "utf8"),
+      catalog: await readFile(join(staging, "governance-evidence.json"), "utf8"),
+    };
+    await readGenome(root, "project-a");
+    const genomePath = join(root, "design-governance", "DESIGN-GENOME.md");
+    const intervening = `${await readFile(genomePath, "utf8")}\n`;
+    await writeFile(genomePath, intervening);
+    await mkdir(staging, { mode: 0o700 });
+    await writeFile(join(staging, "approval-transaction.json"), saved.manifest);
+    await writeFile(join(staging, "DESIGN-GENOME.md"), saved.genome);
+    await writeFile(join(staging, "governance-evidence.json"), saved.catalog);
+    await writeFile(join(machine, "pending-genome-approval.json"), saved.pointer);
+
+    await expect(readGenome(root, "project-a")).rejects.toThrow(/replay|intervening|transaction/i);
+    expect(await readFile(genomePath, "utf8")).toBe(intervening);
+  });
+
+  it("fails closed for a symlinked approval staging directory", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: { representative: true, routes: ["/overview"], evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID] },
+      claimCitations: approvalCitations(),
+    });
+    const outside = await projectRoot();
+    const marker = join(outside, "preserve.txt");
+    await writeFile(marker, "preserve");
+    await symlink(outside, join(root, ".design-sharingan", "genome-approval-transaction"));
+
+    await expect(readGenome(root, "project-a")).rejects.toThrow(/outside|staging.*unsafe|symbolic link/i);
+    expect(await readFile(marker, "utf8")).toBe("preserve");
+  });
+
+  it.each([
+    ["empty", []],
+    ["after the Genome payload", ["DESIGN-GENOME.md"]],
+    ["after both payloads", ["DESIGN-GENOME.md", "governance-evidence.json"]],
+  ])("cleans validated pre-commit approval residue %s", async (_label, files) => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: { representative: true, routes: ["/overview"], evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID] },
+      claimCitations: approvalCitations(),
+    });
+    const staging = join(root, ".design-sharingan", "genome-approval-transaction");
+    await mkdir(staging, { mode: 0o700 });
+    for (const file of files) await writeFile(join(staging, file), "pre-commit residue");
+
+    await expect(readGenome(root, "project-a")).resolves.toMatchObject({ value: { status: "DRAFT" } });
+    await expect(realpath(staging)).rejects.toThrow(/ENOENT/);
+  });
+
+  it("recovers when pointer publication succeeds but its caller observes an error", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: { representative: true, routes: ["/overview"], evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID] },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+    setGenomeApprovalTransactionFaultForTest("after-pointer-publish-before-return");
+    try {
+      await expect(approveGenome(root, "project-a", {
+        approvedBy: "local-user",
+        expectedRevision: draft.metadata.revision,
+        expectedPayloadHash: draft.payloadHash,
+        acceptedClaim: acceptedHumanClaim(),
+      })).rejects.toThrow(/injected/i);
+    } finally {
+      setGenomeApprovalTransactionFaultForTest(undefined);
+    }
+
+    await expect(readGenome(root, "project-a")).resolves.toMatchObject({
+      authority: "AUTHORITATIVE",
+      value: { status: "APPROVED", uxInvariants: [HUMAN_APPROVAL_RULE] },
+    });
+  });
+
+  it("rejects a claim whose evidence is shared by another draft candidate", async () => {
+    const root = await projectRoot();
+    const sharedRule = "Keep the approved screen hierarchy stable.";
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: {
+        ...approvalDraftGenome(),
+        unconfirmedRules: [HUMAN_APPROVAL_RULE, sharedRule],
+      },
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: [
+        ...approvalCitations(),
+        {
+          ...approvalCitations()[0]!,
+          id: "claim-shared-evidence",
+          statement: sharedRule,
+        },
+      ],
+    });
+    const draft = await readGenome(root, "project-a");
+
+    await expect(approveGenome(root, "project-a", {
+      approvedBy: "local-user",
+      expectedRevision: draft.metadata.revision,
+      expectedPayloadHash: draft.payloadHash,
+      acceptedClaim: acceptedHumanClaim(),
+    })).rejects.toThrow(/shared/i);
+    expect((await readGenome(root, "project-a")).value.status).toBe("DRAFT");
+  });
+
+  it("rejects semantically duplicate draft claims even when their ids and evidence differ", async () => {
+    const root = await projectRoot();
+    const secondEvidenceId = "ev_render_overview_02";
+    await expect(initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: [
+        ...approvalEvidenceCatalog(),
+        { ...approvalEvidenceCatalog()[0]!, id: secondEvidenceId, authenticatedRenderId: "render-overview-02" },
+      ],
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID, secondEvidenceId],
+      },
+      claimCitations: [
+        ...approvalCitations(),
+        { ...approvalCitations()[0]!, id: "claim-human-decisions-alias", evidenceIds: [secondEvidenceId] },
+      ],
+    })).rejects.toThrow(/semantic|equivalent|duplicate/i);
+  });
+
+  it("rejects reuse of a rule already verified anywhere in the signed catalog", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog().map((entry) => ({
+        ...entry,
+        verifiedClaims: [{
+          claimType: "RULE" as const,
+          category: "UX_INVARIANT" as const,
+          statement: HUMAN_APPROVAL_RULE,
+          scope: { routes: ["/overview"] },
+        }],
+      })),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
+    });
+    const draft = await readGenome(root, "project-a");
+
+    await expect(approveGenome(root, "project-a", {
+      approvedBy: "local-user",
+      expectedRevision: draft.metadata.revision,
+      expectedPayloadHash: draft.payloadHash,
+      acceptedClaim: acceptedHumanClaim(),
+    })).rejects.toThrow(/already been used/i);
+    expect((await readGenome(root, "project-a")).value.status).toBe("DRAFT");
+  });
+
   it("serializes concurrent approval and rejects stale revisions", async () => {
     const root = await projectRoot();
     await initializeGovernance({
       rootPath: root,
       projectId: "project-a",
-      genome: draftGenome(),
+      genome: approvalDraftGenome(),
       screens: [],
       decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
     });
 
     const results = await Promise.allSettled([
@@ -169,11 +678,13 @@ describe("Genome governance store", () => {
         approvedBy: "local-user",
         expectedRevision: 1,
         expectedPayloadHash: createdPayloadHash(await readGenome(root, "project-a")),
+        acceptedClaim: acceptedHumanClaim(),
       }),
       approveGenome(root, "project-a", {
         approvedBy: "local-user",
         expectedRevision: 1,
         expectedPayloadHash: createdPayloadHash(await readGenome(root, "project-a")),
+        acceptedClaim: acceptedHumanClaim(),
       }),
     ]);
 
@@ -339,6 +850,7 @@ describe("Genome governance store", () => {
         approvedBy: "local-user",
         expectedRevision: 1,
         expectedPayloadHash: payloadHash,
+        acceptedClaim: acceptedHumanClaim(),
       }),
     ).rejects.toThrow(/hard link/i);
   });
@@ -371,6 +883,7 @@ describe("Genome governance store", () => {
         approvedBy: "local-user",
         expectedRevision: created.genome.metadata.revision,
         expectedPayloadHash: "0".repeat(64),
+        acceptedClaim: acceptedHumanClaim(),
       }),
     ).rejects.toThrow(/payload.*stale|hash.*stale/i);
     expect((await readGenome(root, "project-a")).value.status).toBe("DRAFT");
@@ -381,14 +894,22 @@ describe("Genome governance store", () => {
     const created = await initializeGovernance({
       rootPath: root,
       projectId: "project-a",
-      genome: draftGenome(),
+      genome: approvalDraftGenome(),
       screens: [],
       decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
     });
     await approveGenome(root, "project-a", {
       approvedBy: "local-user",
       expectedRevision: 1,
       expectedPayloadHash: created.genome.payloadHash,
+      acceptedClaim: acceptedHumanClaim(),
     });
     const path = join(root, "design-governance", "DESIGN-GENOME.md");
     const original = parseGovernanceMetadata(await readFile(path, "utf8"));
@@ -414,6 +935,45 @@ describe("Genome governance store", () => {
       mutate(forged);
       await writeFile(path, renderGenome(forged));
       await expect(readGenome(root, forged.projectId)).rejects.toThrow();
+    }
+  });
+
+  it("rejects an approved Genome whose signed claim no longer matches its confirmed citation", async () => {
+    const root = await projectRoot();
+    const created = await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
+    });
+    await approveGenome(root, "project-a", {
+      approvedBy: "local-user",
+      expectedRevision: 1,
+      expectedPayloadHash: created.genome.payloadHash,
+      acceptedClaim: acceptedHumanClaim(),
+    });
+    const path = join(root, "design-governance", "DESIGN-GENOME.md");
+    const original = parseGovernanceMetadata(await readFile(path, "utf8"));
+    if (original.kind !== "DESIGN_GENOME") throw new Error("test fixture lacks Genome metadata");
+    type ParsedGenome = Extract<ReturnType<typeof parseGovernanceMetadata>, { kind: "DESIGN_GENOME" }>;
+    const mutations: Array<(metadata: ParsedGenome) => void> = [
+      (metadata) => { metadata.claimCitations[0]!.id = "claim-substituted"; },
+      (metadata) => { metadata.claimCitations[0]!.confidence = "UNCONFIRMED"; },
+      (metadata) => { metadata.claimCitations = []; },
+    ];
+    for (const mutate of mutations) {
+      const forged = structuredClone(original);
+      mutate(forged);
+      await writeFile(path, renderGenome(forged));
+      await expect(readGenome(root, "project-a")).rejects.toThrow(/accepted|citation|claim|authority/i);
     }
   });
 
@@ -448,6 +1008,63 @@ describe("Genome governance store", () => {
       decisions: [],
     });
     expect((await readGenome(root, "project-a")).value).toEqual(unusual);
+  });
+
+  it("reads a canonical schema-v1 draft whose legacy citations predate stable claim ids", async () => {
+    const root = await projectRoot();
+    await initializeGovernance({
+      rootPath: root,
+      projectId: "project-a",
+      genome: approvalDraftGenome(),
+      screens: [],
+      decisions: [],
+      evidenceCatalog: approvalEvidenceCatalog(),
+      inspectedScope: {
+        representative: true,
+        routes: ["/overview"],
+        evidenceIds: [HUMAN_APPROVAL_EVIDENCE_ID],
+      },
+      claimCitations: approvalCitations(),
+    });
+    const path = join(root, "design-governance", "DESIGN-GENOME.md");
+    const legacy = await readFile(
+      new URL("./fixtures/design-genome-schema-v1-pre-claim-id.md", import.meta.url),
+      "utf8",
+    );
+    await writeFile(path, legacy);
+
+    const migrated = await readGenome(root, "project-a");
+    expect(migrated).toMatchObject({
+      value: { status: "DRAFT" },
+      metadata: {
+        schemaVersion: 1,
+        claimCitations: [expect.objectContaining({
+          id: expect.stringMatching(/^claim-[a-f0-9]{32}$/),
+          statement: HUMAN_APPROVAL_RULE,
+        })],
+      },
+    });
+    const migratedClaim = migrated.metadata.claimCitations[0]!;
+    const approved = await approveGenome(root, "project-a", {
+      approvedBy: "local-user",
+      expectedRevision: migrated.metadata.revision,
+      expectedPayloadHash: migrated.payloadHash,
+      acceptedClaim: {
+        ...acceptedHumanClaim(),
+        claimId: migratedClaim.id,
+      },
+    });
+    expect(approved).toMatchObject({
+      value: { status: "APPROVED", uxInvariants: [HUMAN_APPROVAL_RULE] },
+      metadata: {
+        revision: 2,
+        claimCitations: [expect.objectContaining({
+          id: migratedClaim.id,
+          confidence: "CONFIRMED",
+        })],
+      },
+    });
+    expect(await readFile(path, "utf8")).toContain(`\"id\":\"${migratedClaim.id}\"`);
   });
 
   it("rejects unsafe, duplicate, and relation-invalid Screen Registry records", async () => {

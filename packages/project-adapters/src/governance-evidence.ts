@@ -41,21 +41,16 @@ const PATH_PATTERN = /(?:\/(?:[a-zA-Z0-9._-]+\/)+[a-zA-Z0-9._-]+|[A-Za-z]:\\[^\s
 export const AUTHENTICATED_PRODUCT_LANGUAGE_RULE = "Preserve the established product hierarchy and component language.";
 
 /**
- * A product-consistency result becomes a Genome-eligible rule only after the
- * persisted rendered round has passed and supplied explicit evidence. The
- * caller attaches this claim to the catalog entry carrying the render ID.
+ * Agent visual analysis is observational. It must never mint a signed
+ * governance claim: only the explicit approval transaction can do that.
  */
 export function verifiedClaimsForProductConsistency(
   route: string,
   verification: Pick<VisualIntegrityVerification, "status" | "evidence">,
 ): GovernanceVerifiedClaim[] {
-  if (verification.status !== "PASS" || verification.evidence.length === 0) return [];
-  return [{
-    claimType: "RULE",
-    category: "VISUAL_INVARIANT",
-    statement: AUTHENTICATED_PRODUCT_LANGUAGE_RULE,
-    scope: { routes: [route] },
-  }];
+  void route;
+  void verification;
+  return [];
 }
 
 function scrub(value: string): string {
@@ -177,10 +172,7 @@ function renderArtifacts(session: Awaited<ReturnType<typeof loadMangekyoLoopSess
     if (round.afterRender === undefined) return [];
     return [{
       artifact: round.afterRender,
-      verifiedClaims: verifiedClaimsForProductConsistency(
-        round.afterRender.route,
-        round.productConsistency,
-      ),
+      verifiedClaims: verifiedClaimsForProductConsistency(round.afterRender.route, round.productConsistency),
     }];
   });
   return [...plainArtifacts, ...auditedArtifacts];

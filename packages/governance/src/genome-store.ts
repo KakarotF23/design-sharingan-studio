@@ -57,6 +57,10 @@ const MAX_LOCK_ATTEMPTS = 100;
 const LOCK_STALE_MILLISECONDS = 30_000;
 const STAGING_DIRECTORY = "governance-staging";
 const EVIDENCE_CATALOG_FILE = "governance-evidence.json";
+const GENOME_APPROVAL_STAGING_DIRECTORY = "genome-approval-transaction";
+const GENOME_APPROVAL_POINTER_FILE = "pending-genome-approval.json";
+const GENOME_APPROVAL_MANIFEST_FILE = "approval-transaction.json";
+const GENOME_APPROVAL_HEAD_FILE = "last-genome-approval.json";
 const AUDIT_GENERATIONS_DIRECTORY = "audit-generations";
 const AUDIT_GENERATION_POINTER_FILE = "active-audit-generation.json";
 const AUDIT_GENERATION_INVALIDATION_FILE = "inactive-audit-generation.json";
@@ -73,6 +77,24 @@ export type AuditTransactionFault =
   | "after-pointer-before-activation"
   | "after-pointer";
 let auditTransactionFault: AuditTransactionFault | undefined;
+
+export type GenomeApprovalTransactionFault =
+  | "after-catalog-before-genome"
+  | "after-pointer-publish-before-return";
+let genomeApprovalTransactionFault: GenomeApprovalTransactionFault | undefined;
+
+/** Test-only fault injection for the approval materialization boundary. */
+export function setGenomeApprovalTransactionFaultForTest(
+  value: GenomeApprovalTransactionFault | undefined,
+): void {
+  genomeApprovalTransactionFault = value;
+}
+
+function throwGenomeApprovalTransactionFault(point: GenomeApprovalTransactionFault): void {
+  if (genomeApprovalTransactionFault === point) {
+    throw new Error(`Injected Genome approval transaction fault: ${point}`);
+  }
+}
 
 /** Test-only fault injection for the generation promotion boundaries. */
 export function setAuditTransactionFaultForTest(value: AuditTransactionFault | undefined): void {
@@ -121,6 +143,67 @@ export interface ApproveGenomeInput {
   approvedBy: "local-user";
   expectedRevision: number;
   expectedPayloadHash: string;
+  acceptedClaim: GenomeClaimApproval;
+}
+
+/**
+ * The browser may request an approval, but the store independently verifies
+ * every relation against its signed draft and catalog before signing a claim.
+ */
+export interface GenomeClaimApproval {
+  claimId: string;
+  claimType: "RULE";
+  category: Exclude<GovernanceClaimCitation["category"], "PRODUCT_IDENTITY">;
+  statement: string;
+  evidenceId: string;
+  route: string;
+  state: string;
+  authenticatedRenderId: string;
+  sourceRevisionFingerprint: string;
+}
+
+const GENOME_RULE_FIELDS = {
+  UX_INVARIANT: "uxInvariants",
+  VISUAL_INVARIANT: "visualInvariants",
+  MOTION_RULE: "motionRules",
+  ACCESSIBILITY_RULE: "accessibilityRules",
+  COMPONENT_DNA: "componentDNA",
+  SCREEN_FAMILY: "screenFamilies",
+  CONTENT_VOICE: "contentVoice",
+} as const satisfies Record<GenomeClaimApproval["category"], keyof DesignGenome>;
+
+function normalizeGenomeClaimApproval(value: unknown): GenomeClaimApproval {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Genome approval claim is invalid");
+  }
+  const claim = value as Record<string, unknown>;
+  exactObjectKeys(claim, [
+    "claimId", "claimType", "category", "statement", "evidenceId", "route", "state",
+    "authenticatedRenderId", "sourceRevisionFingerprint",
+  ], "Genome approval claim");
+  if (
+    typeof claim.claimId !== "string" || !SAFE_ID_PATTERN.test(claim.claimId) ||
+    claim.claimType !== "RULE" || typeof claim.category !== "string" ||
+    !Object.hasOwn(GENOME_RULE_FIELDS, claim.category) ||
+    typeof claim.statement !== "string" || claim.statement.trim().length === 0 ||
+    claim.statement.length > 1_000 || SECRET_OR_PATH_PATTERN.test(claim.statement) ||
+    typeof claim.evidenceId !== "string" || !EVIDENCE_ID_PATTERN.test(claim.evidenceId) ||
+    typeof claim.route !== "string" ||
+    typeof claim.state !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(claim.state) ||
+    typeof claim.authenticatedRenderId !== "string" || !SAFE_ID_PATTERN.test(claim.authenticatedRenderId) ||
+    typeof claim.sourceRevisionFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(claim.sourceRevisionFingerprint)
+  ) throw new Error("Genome approval claim is invalid");
+  return {
+    claimId: claim.claimId,
+    claimType: "RULE",
+    category: claim.category as GenomeClaimApproval["category"],
+    statement: claim.statement,
+    evidenceId: claim.evidenceId,
+    route: normalizeGovernanceRoute(claim.route),
+    state: claim.state,
+    authenticatedRenderId: claim.authenticatedRenderId,
+    sourceRevisionFingerprint: claim.sourceRevisionFingerprint,
+  };
 }
 
 export function incrementGovernanceRevision(revision: number): number {
@@ -588,6 +671,203 @@ export async function writeEvidenceCatalogUnderLock(
   const path = join(machineDirectory, EVIDENCE_CATALOG_FILE);
   const identity = await assertRegularDocument(path);
   return { path, dev: Number(identity.dev), ino: Number(identity.ino) };
+}
+
+interface PendingGenomeApproval {
+  kind: "DESIGN_SHARINGAN_PENDING_GENOME_APPROVAL";
+  projectId: string;
+  rootFingerprint: string;
+  transactionId: string;
+  baseGenomeDigest: string;
+  baseCatalogDigest: string;
+  genomeDigest: string;
+  catalogDigest: string;
+  createdAt: string;
+  signature: string;
+}
+
+function pendingGenomeApprovalSignature(
+  key: Buffer,
+  value: Omit<PendingGenomeApproval, "signature">,
+): string {
+  return createHmac("sha256", key).update(JSON.stringify(value), "utf8").digest("hex");
+}
+
+function renderPendingGenomeApproval(value: PendingGenomeApproval): string {
+  return `${JSON.stringify(value)}\n`;
+}
+
+async function readPendingGenomeApproval(
+  rootPath: string,
+  machineDirectory: string,
+  path = assertPathInsideWorkspace(
+    machineDirectory,
+    join(machineDirectory, GENOME_APPROVAL_POINTER_FILE),
+  ),
+): Promise<PendingGenomeApproval | undefined> {
+  if (!(await entryExists(path))) return undefined;
+  const raw = await readBoundedDocument(path);
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("Pending Genome approval is malformed"); }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Pending Genome approval is malformed");
+  }
+  const value = parsed as Record<string, unknown>;
+  exactObjectKeys(value, [
+    "kind", "projectId", "rootFingerprint", "transactionId", "baseGenomeDigest",
+    "baseCatalogDigest", "genomeDigest",
+    "catalogDigest", "createdAt", "signature",
+  ], "Pending Genome approval");
+  const canonicalRoot = await canonicalProjectRoot(rootPath);
+  if (
+    value.kind !== "DESIGN_SHARINGAN_PENDING_GENOME_APPROVAL" ||
+    typeof value.projectId !== "string" || !SAFE_ID_PATTERN.test(value.projectId) ||
+    value.rootFingerprint !== rootFingerprint(canonicalRoot) ||
+    typeof value.transactionId !== "string" || !/^[a-f0-9-]{36}$/.test(value.transactionId) ||
+    typeof value.baseGenomeDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.baseGenomeDigest) ||
+    typeof value.baseCatalogDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.baseCatalogDigest) ||
+    typeof value.genomeDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.genomeDigest) ||
+    typeof value.catalogDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.catalogDigest) ||
+    typeof value.createdAt !== "string" || new Date(value.createdAt).toISOString() !== value.createdAt ||
+    typeof value.signature !== "string" || !/^[a-f0-9]{64}$/.test(value.signature)
+  ) throw new Error("Pending Genome approval identity is invalid");
+  const pending = value as unknown as PendingGenomeApproval;
+  const { signature, ...unsigned } = pending;
+  const key = await authorityKey(rootPath, false);
+  const expected = Buffer.from(pendingGenomeApprovalSignature(key, unsigned), "hex");
+  const actual = Buffer.from(signature, "hex");
+  if (
+    actual.length !== expected.length || !timingSafeEqual(actual, expected) ||
+    raw !== renderPendingGenomeApproval(pending)
+  ) throw new Error("Pending Genome approval is not authenticated");
+  return pending;
+}
+
+async function pendingGenomeApprovalExists(rootPath: string): Promise<boolean> {
+  const machineDirectory = await machineStateDirectory(rootPath, false);
+  const pointer = assertPathInsideWorkspace(
+    machineDirectory,
+    join(machineDirectory, GENOME_APPROVAL_POINTER_FILE),
+  );
+  const staging = assertPathInsideWorkspace(
+    machineDirectory,
+    join(machineDirectory, GENOME_APPROVAL_STAGING_DIRECTORY),
+  );
+  return (await entryExists(pointer)) || (await entryExists(staging));
+}
+
+async function reconcileGenomeApprovalTransaction(
+  rootPath: string,
+  machineDirectory: string,
+): Promise<void> {
+  const staging = assertPathInsideWorkspace(
+    machineDirectory,
+    join(machineDirectory, GENOME_APPROVAL_STAGING_DIRECTORY),
+  );
+  const stagingExists = await entryExists(staging);
+  if (stagingExists) {
+    const stagingEntry = await lstat(staging);
+    if (stagingEntry.isSymbolicLink() || !stagingEntry.isDirectory()) {
+      throw new Error("Genome approval staging directory is unsafe");
+    }
+  }
+  const pointerPath = assertPathInsideWorkspace(
+    machineDirectory,
+    join(machineDirectory, GENOME_APPROVAL_POINTER_FILE),
+  );
+  const manifestPath = stagingExists
+    ? assertPathInsideWorkspace(staging, join(staging, GENOME_APPROVAL_MANIFEST_FILE))
+    : undefined;
+  const [pointer, manifest] = await Promise.all([
+    readPendingGenomeApproval(rootPath, machineDirectory, pointerPath),
+    manifestPath === undefined
+      ? undefined
+      : readPendingGenomeApproval(rootPath, machineDirectory, manifestPath),
+  ]);
+  if (
+    pointer !== undefined && manifest !== undefined &&
+    renderPendingGenomeApproval(pointer) !== renderPendingGenomeApproval(manifest)
+  ) throw new Error("Genome approval pointer and manifest do not match");
+  const pending = pointer ?? manifest;
+  if (pending === undefined) {
+    if (stagingExists) {
+      const entries = await readdir(staging, { withFileTypes: true });
+      if (entries.length > 8) throw new Error("Genome approval pre-commit staging exceeds its recovery bound");
+      const allowed = new Set([DESIGN_GENOME_FILE, EVIDENCE_CATALOG_FILE]);
+      for (const entry of entries) {
+        const isOwnedTemporary = /^\.(DESIGN-GENOME\.md|governance-evidence\.json)\.tmp-[0-9]+-[a-f0-9-]{36}$/.test(entry.name);
+        if ((!allowed.has(entry.name) && !isOwnedTemporary) || !entry.isFile() || entry.isSymbolicLink()) {
+          throw new Error("Genome approval pre-commit staging contains unsafe residue");
+        }
+        await assertRegularDocument(assertPathInsideWorkspace(staging, join(staging, entry.name)));
+      }
+      await rm(staging, { recursive: true, force: false });
+      await syncDirectory(machineDirectory);
+    }
+    return;
+  }
+  if (!stagingExists || manifest === undefined) {
+    throw new Error("Genome approval transaction is missing its authenticated staging manifest");
+  }
+  const genomePath = assertPathInsideWorkspace(staging, join(staging, DESIGN_GENOME_FILE));
+  const catalogPath = assertPathInsideWorkspace(staging, join(staging, EVIDENCE_CATALOG_FILE));
+  const genomeMarkdown = await readBoundedDocument(genomePath);
+  const catalogMarkdown = await readBoundedDocument(catalogPath);
+  if (
+    documentDigest(genomeMarkdown) !== pending.genomeDigest ||
+    documentDigest(catalogMarkdown) !== pending.catalogDigest
+  ) throw new Error("Pending Genome approval document digest is inconsistent");
+  const genomeMetadata = parseGovernanceMetadata(genomeMarkdown);
+  if (
+    genomeMetadata.kind !== "DESIGN_GENOME" || genomeMetadata.projectId !== pending.projectId ||
+    genomeMetadata.value.status !== "APPROVED" || !(await verifyAuthority(rootPath, genomeMetadata))
+  ) throw new Error("Pending Genome approval document is not authoritative");
+  const catalog = await readAuthenticatedEvidenceCatalogAtPath(
+    rootPath,
+    pending.projectId,
+    catalogPath,
+    pending.catalogDigest,
+  );
+  assertGenomeEvidenceRelationships(genomeMetadata.inspectedScope, genomeMetadata.claimCitations, catalog);
+  assertAcceptedClaimRelationship(genomeMetadata, catalog);
+  const governance = await governanceDirectory(rootPath, false);
+  const liveGenomeMarkdown = await readBoundedDocument(
+    assertPathInsideWorkspace(governance, join(governance, DESIGN_GENOME_FILE)),
+  );
+  const liveCatalogMarkdown = await readBoundedDocument(
+    assertPathInsideWorkspace(machineDirectory, join(machineDirectory, EVIDENCE_CATALOG_FILE)),
+  );
+  const liveGenomeDigest = documentDigest(liveGenomeMarkdown);
+  const liveCatalogDigest = documentDigest(liveCatalogMarkdown);
+  const headPath = assertPathInsideWorkspace(
+    machineDirectory,
+    join(machineDirectory, GENOME_APPROVAL_HEAD_FILE),
+  );
+  const head = await readPendingGenomeApproval(rootPath, machineDirectory, headPath);
+  if (head?.transactionId === pending.transactionId) {
+    if (liveGenomeDigest !== pending.genomeDigest || liveCatalogDigest !== pending.catalogDigest) {
+      throw new Error("Consumed Genome approval transaction cannot be replayed over intervening governance");
+    }
+  } else {
+    const liveStateIsRecoverable =
+      (liveGenomeDigest === pending.baseGenomeDigest && liveCatalogDigest === pending.baseCatalogDigest) ||
+      (liveGenomeDigest === pending.baseGenomeDigest && liveCatalogDigest === pending.catalogDigest) ||
+      (liveGenomeDigest === pending.genomeDigest && liveCatalogDigest === pending.catalogDigest);
+    if (!liveStateIsRecoverable) {
+      throw new Error("Genome approval transaction base state is stale or replayed");
+    }
+    if (liveCatalogDigest !== pending.catalogDigest) {
+      await atomicWriteDocument(machineDirectory, EVIDENCE_CATALOG_FILE, catalogMarkdown);
+    }
+    throwGenomeApprovalTransactionFault("after-catalog-before-genome");
+    if (liveGenomeDigest !== pending.genomeDigest) {
+      await atomicWriteDocument(governance, DESIGN_GENOME_FILE, genomeMarkdown);
+    }
+    await atomicWriteDocument(machineDirectory, GENOME_APPROVAL_HEAD_FILE, renderPendingGenomeApproval(pending));
+  }
+  if (await entryExists(pointerPath)) await unlink(pointerPath);
+  await rm(staging, { recursive: true, force: false });
+  await syncDirectory(machineDirectory);
 }
 
 function documentDigest(value: string): string {
@@ -1513,7 +1793,7 @@ export async function clearActiveAuditGenerationUnderLock(
   }
 }
 
-export async function readEvidenceCatalog(
+async function readEvidenceCatalogCurrent(
   rootPath: string,
   projectId: string,
 ): Promise<GovernanceEvidenceCatalogEntry[]> {
@@ -1524,11 +1804,38 @@ export async function readEvidenceCatalog(
   return readAuthenticatedEvidenceCatalogAtPath(rootPath, projectId, path, active?.digest);
 }
 
+export async function readEvidenceCatalog(
+  rootPath: string,
+  projectId: string,
+): Promise<GovernanceEvidenceCatalogEntry[]> {
+  if (await pendingGenomeApprovalExists(rootPath)) {
+    return withMachineGovernanceLock(rootPath, async () =>
+      readEvidenceCatalogCurrent(rootPath, projectId));
+  }
+  const catalog = await readEvidenceCatalogCurrent(rootPath, projectId);
+  if (await pendingGenomeApprovalExists(rootPath)) {
+    return withMachineGovernanceLock(rootPath, async () =>
+      readEvidenceCatalogCurrent(rootPath, projectId));
+  }
+  return catalog;
+}
+
 function assertGenomeEvidenceRelationships(
   inspectedScope: GovernanceInspectedScope,
   claimCitations: GovernanceClaimCitation[],
   catalog: GovernanceEvidenceCatalogEntry[],
 ): void {
+  if (new Set(claimCitations.map((citation) => citation.id)).size !== claimCitations.length) {
+    throw new Error("Genome claim identities must be unique");
+  }
+  const semanticClaimKeys = claimCitations.map((citation) => JSON.stringify([
+    citation.claimType,
+    citation.category,
+    citation.statement,
+  ]));
+  if (new Set(semanticClaimKeys).size !== semanticClaimKeys.length) {
+    throw new Error("Genome semantically equivalent claims must be unique");
+  }
   const catalogById = new Map(catalog.map((entry) => [entry.id, entry]));
   const catalogRoutes = [...new Set(catalog.map(({ route }) => route))];
   if (
@@ -1554,6 +1861,34 @@ function assertGenomeEvidenceRelationships(
         claim.statement === citation.statement && claim.scope.routes[0] === entry.route,
       ))) throw new Error("Confirmed Genome claim lacks exact server-owned verification");
   }
+}
+
+function assertAcceptedClaimRelationship(
+  metadata: GenomeMetadata,
+  catalog: GovernanceEvidenceCatalogEntry[],
+): void {
+  const accepted = metadata.authority?.acceptedClaim;
+  if (accepted === undefined) return;
+  const matchingCitations = metadata.claimCitations.filter((citation) =>
+    citation.id === accepted.claimId && citation.claimType === accepted.claimType &&
+    citation.category === accepted.category && citation.statement === accepted.statement &&
+    citation.confidence === "CONFIRMED" && citation.evidenceIds.length === 1 &&
+    citation.evidenceIds[0] === accepted.evidenceId && citation.scope.routes.length === 1 &&
+    citation.scope.routes[0] === accepted.route,
+  );
+  const evidence = catalog.find(({ id }) => id === accepted.evidenceId);
+  const matchingClaims = evidence?.verifiedClaims.filter((claim) =>
+    claim.claimType === accepted.claimType && claim.category === accepted.category &&
+    claim.statement === accepted.statement && claim.scope.routes.length === 1 &&
+    claim.scope.routes[0] === accepted.route,
+  ) ?? [];
+  if (
+    matchingCitations.length !== 1 || evidence === undefined || evidence.kind !== "RENDER" ||
+    evidence.route !== accepted.route || evidence.renderState !== accepted.state ||
+    evidence.authenticatedRenderId !== accepted.authenticatedRenderId ||
+    evidence.renderSourceRevisionFingerprint !== accepted.sourceRevisionFingerprint ||
+    matchingClaims.length !== 1
+  ) throw new Error("Genome accepted claim does not match its confirmed citation and catalog authority");
 }
 
 async function verifyAuthority(
@@ -1930,6 +2265,7 @@ async function withMachineGovernanceLock<T>(
   let operationError: unknown;
   try {
     await reconcileOwnedStaging(directory);
+    await reconcileGenomeApprovalTransaction(rootPath, directory);
     await reconcileAuditGenerations(rootPath, directory);
     result = await operation(directory);
   } catch (error) {
@@ -2353,7 +2689,7 @@ export async function initializeGovernance(
   });
 }
 
-export async function readGenome(
+async function readGenomeCurrent(
   rootPath: string,
   projectId: string,
 ): Promise<GenomeDocument> {
@@ -2365,17 +2701,32 @@ export async function readGenome(
   if (metadata.kind !== "DESIGN_GENOME") {
     throw new Error("DESIGN-GENOME.md contains the wrong governance document kind");
   }
-  const evidenceCatalog = await readEvidenceCatalog(rootPath, projectId);
+  const evidenceCatalog = await readEvidenceCatalogCurrent(rootPath, projectId);
   assertGenomeEvidenceRelationships(
     metadata.inspectedScope,
     metadata.claimCitations,
     evidenceCatalog,
   );
+  assertAcceptedClaimRelationship(metadata, evidenceCatalog);
   const authenticated = await verifyAuthority(rootPath, metadata);
   if (metadata.value.status === "APPROVED" && !authenticated) {
     throw new Error("Approved Genome authority proof could not be authenticated");
   }
   return genomeDocument(metadata, authenticated);
+}
+
+export async function readGenome(
+  rootPath: string,
+  projectId: string,
+): Promise<GenomeDocument> {
+  if (await pendingGenomeApprovalExists(rootPath)) {
+    return withMachineGovernanceLock(rootPath, async () => readGenomeCurrent(rootPath, projectId));
+  }
+  const genome = await readGenomeCurrent(rootPath, projectId);
+  if (await pendingGenomeApprovalExists(rootPath)) {
+    return withMachineGovernanceLock(rootPath, async () => readGenomeCurrent(rootPath, projectId));
+  }
+  return genome;
 }
 
 export async function approveGenome(
@@ -2393,8 +2744,13 @@ export async function approveGenome(
   if (!/^[a-f0-9]{64}$/.test(input.expectedPayloadHash)) {
     throw new Error("Expected Genome payload hash is invalid");
   }
-  return withGovernanceLock(rootPath, async (directory) => {
-    const current = await readGenome(rootPath, projectId);
+  if (input.acceptedClaim === undefined) {
+    throw new Error("An exact Genome approval claim selection is required");
+  }
+  const acceptedClaim = normalizeGenomeClaimApproval(input.acceptedClaim);
+  return withMachineGovernanceLock(rootPath, async (machineDirectory) => {
+    const directory = await governanceDirectory(rootPath, false);
+    const current = await readGenomeCurrent(rootPath, projectId);
     if (current.metadata.revision !== input.expectedRevision) {
       throw new Error("Genome approval revision is stale");
     }
@@ -2404,9 +2760,60 @@ export async function approveGenome(
     if (current.payloadHash !== input.expectedPayloadHash) {
       throw new Error("Genome approval payload hash is stale");
     }
+    const catalog = await readEvidenceCatalogCurrent(rootPath, projectId);
+    let value: DesignGenome = { ...current.value, status: "APPROVED" };
+    let claimCitations = current.metadata.claimCitations;
+    let nextCatalog = catalog;
+    {
+      const citation = current.metadata.claimCitations.find(({ id }) => id === acceptedClaim.claimId);
+      if (
+        citation === undefined || citation.claimType !== "RULE" || citation.confidence !== "UNCONFIRMED" ||
+        citation.category !== acceptedClaim.category || citation.statement !== acceptedClaim.statement ||
+        citation.scope.routes.length !== 1 || citation.scope.routes[0] !== acceptedClaim.route ||
+        citation.evidenceIds.length !== 1 || citation.evidenceIds[0] !== acceptedClaim.evidenceId
+      ) throw new Error("Genome approval claim does not match the exact draft rule and evidence");
+      if (current.value.unconfirmedRules.filter((rule) => rule === citation.statement).length !== 1) {
+        throw new Error("Genome approval claim is missing or ambiguous in the draft rules");
+      }
+      if (current.metadata.claimCitations.filter(({ evidenceIds }) =>
+        evidenceIds.includes(acceptedClaim.evidenceId)).length !== 1) {
+        throw new Error("Genome approval evidence is shared by multiple draft claims");
+      }
+      const evidence = catalog.find(({ id }) => id === acceptedClaim.evidenceId);
+      if (
+        evidence === undefined || evidence.kind !== "RENDER" || evidence.route !== acceptedClaim.route ||
+        evidence.renderState !== acceptedClaim.state ||
+        evidence.authenticatedRenderId !== acceptedClaim.authenticatedRenderId ||
+        evidence.renderSourceRevisionFingerprint !== acceptedClaim.sourceRevisionFingerprint
+      ) throw new Error("Genome approval render evidence relation is stale or mismatched");
+      const alreadyVerified = catalog.some(({ verifiedClaims }) => verifiedClaims.some((claim) =>
+        claim.claimType === "RULE" && claim.category === citation.category &&
+        claim.statement === citation.statement,
+      ));
+      if (alreadyVerified || evidence.verifiedClaims.length !== 0) {
+        throw new Error("Genome approval claim or evidence has already been used");
+      }
+      const field = GENOME_RULE_FIELDS[acceptedClaim.category];
+      value = {
+        ...value,
+        [field]: [...(value[field] as string[]), citation.statement],
+        unconfirmedRules: value.unconfirmedRules.filter((rule) => rule !== citation.statement),
+      };
+      claimCitations = current.metadata.claimCitations.map((candidate) =>
+        candidate.id === citation.id ? { ...candidate, confidence: "CONFIRMED" as const } : candidate,
+      );
+      nextCatalog = catalog.map((entry) => entry.id === evidence.id ? {
+        ...entry,
+        verifiedClaims: [...entry.verifiedClaims, {
+          claimType: "RULE" as const,
+          category: citation.category,
+          statement: citation.statement,
+          scope: { routes: [acceptedClaim.route] },
+        }],
+      } : entry);
+    }
     const nextRevision = incrementGovernanceRevision(current.metadata.revision);
     const approvedAt = new Date().toISOString();
-    const value: DesignGenome = { ...current.value, status: "APPROVED" };
     const canonicalRoot = await canonicalProjectRoot(rootPath);
     const key = await authorityKey(rootPath, true);
     const unsignedAuthority: Omit<GenomeAuthorityProof, "signature"> = {
@@ -2420,18 +2827,80 @@ export async function approveGenome(
       payloadHash: genomePayloadHash(value),
       approvedBy: "local-user",
       approvedAt,
+      acceptedClaim,
     };
     const metadata: GenomeMetadata = {
       ...current.metadata,
       revision: nextRevision,
       status: "APPROVED",
+      claimCitations,
       authority: {
         ...unsignedAuthority,
         signature: authoritySignature(key, unsignedAuthority),
       },
       value,
     };
-    await atomicWriteDocument(directory, DESIGN_GENOME_FILE, renderGenome(metadata));
+    assertGenomeEvidenceRelationships(metadata.inspectedScope, claimCitations, nextCatalog);
+    assertAcceptedClaimRelationship(metadata, nextCatalog);
+    const genomeMarkdown = renderGenome(metadata);
+    const renderedCatalog = await renderAuthenticatedEvidenceCatalog(rootPath, projectId, nextCatalog);
+    const baseGenomeMarkdown = await readBoundedDocument(
+      assertPathInsideWorkspace(directory, join(directory, DESIGN_GENOME_FILE)),
+    );
+    const baseCatalogMarkdown = await readBoundedDocument(
+      assertPathInsideWorkspace(machineDirectory, join(machineDirectory, EVIDENCE_CATALOG_FILE)),
+    );
+    const staging = assertPathInsideWorkspace(
+      machineDirectory,
+      join(machineDirectory, GENOME_APPROVAL_STAGING_DIRECTORY),
+    );
+    if (await entryExists(staging)) {
+      throw new Error("A prior Genome approval transaction was not reconciled");
+    }
+    await mkdir(staging, { mode: 0o700 });
+    const unsignedPending: Omit<PendingGenomeApproval, "signature"> = {
+      kind: "DESIGN_SHARINGAN_PENDING_GENOME_APPROVAL",
+      projectId,
+      rootFingerprint: rootFingerprint(canonicalRoot),
+      transactionId: randomUUID(),
+      baseGenomeDigest: documentDigest(baseGenomeMarkdown),
+      baseCatalogDigest: documentDigest(baseCatalogMarkdown),
+      genomeDigest: documentDigest(genomeMarkdown),
+      catalogDigest: documentDigest(renderedCatalog.markdown),
+      createdAt: new Date().toISOString(),
+    };
+    const pending: PendingGenomeApproval = {
+      ...unsignedPending,
+      signature: pendingGenomeApprovalSignature(key, unsignedPending),
+    };
+    let pointerPublished = false;
+    try {
+      await atomicWriteDocument(staging, DESIGN_GENOME_FILE, genomeMarkdown);
+      await atomicWriteDocument(staging, EVIDENCE_CATALOG_FILE, renderedCatalog.markdown);
+      await syncDirectory(staging);
+      await atomicWriteDocument(
+        staging,
+        GENOME_APPROVAL_MANIFEST_FILE,
+        renderPendingGenomeApproval(pending),
+      );
+      await syncDirectory(staging);
+      await atomicWriteDocument(
+        machineDirectory,
+        GENOME_APPROVAL_POINTER_FILE,
+        renderPendingGenomeApproval(pending),
+      );
+      throwGenomeApprovalTransactionFault("after-pointer-publish-before-return");
+      pointerPublished = true;
+      await reconcileGenomeApprovalTransaction(rootPath, machineDirectory);
+    } catch (error) {
+      if (!pointerPublished) {
+        const published = await readPendingGenomeApproval(rootPath, machineDirectory).catch(() => undefined);
+        pointerPublished = published !== undefined &&
+          renderPendingGenomeApproval(published) === renderPendingGenomeApproval(pending);
+      }
+      if (!pointerPublished) await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
     return genomeDocument(metadata, true);
   });
 }

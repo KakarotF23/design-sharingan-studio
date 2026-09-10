@@ -25,7 +25,7 @@ function genome(): DesignGenome {
     version: "0.1.0",
     status: "DRAFT",
     productIdentity: "A calm local-first design intelligence environment.",
-    uxInvariants: ["Keep human decisions explicit."],
+    uxInvariants: [],
     visualInvariants: [],
     motionRules: [],
     accessibilityRules: ["Maintain visible focus."],
@@ -33,7 +33,7 @@ function genome(): DesignGenome {
     screenFamilies: ["Project workspaces"],
     contentVoice: [],
     intentionalExceptions: [],
-    unconfirmedRules: [],
+    unconfirmedRules: ["Keep human decisions explicit."],
   };
 }
 
@@ -43,7 +43,7 @@ function screen(): ScreenRecord {
     route: "/overview",
     name: "Overview",
     family: "Project workspaces",
-    inheritedRules: ["Keep human decisions explicit."],
+    inheritedRules: [],
     exceptions: [],
     requiredStates: ["default"],
     evidence: ["ev_route_overview_01"],
@@ -73,10 +73,24 @@ async function initializeDraft(rootPath: string): Promise<void> {
     decisions: [],
     evidenceCatalog: [{
       id: "ev_route_overview_01",
-      kind: "ROUTE",
+      kind: "RENDER",
       route: "/overview",
-      excerpt: "Authenticated route inventory.",
+      excerpt: "Authenticated overview render.",
       verifiedClaims: [],
+      authenticatedRenderId: "render-overview-01",
+      renderState: "default",
+      renderCapturedAt: "2026-09-08T00:00:00.000Z",
+      renderSourceRevisionFingerprint: "a".repeat(64),
+    }],
+    claimCitations: [{
+      id: "claim-human-decisions",
+      claimType: "RULE",
+      category: "UX_INVARIANT",
+      statement: "Keep human decisions explicit.",
+      confidence: "UNCONFIRMED",
+      requestedConfidence: "CONFIRMED",
+      scope: { routes: ["/overview"] },
+      evidenceIds: ["ev_route_overview_01"],
     }],
   });
 }
@@ -88,6 +102,17 @@ async function initialize(rootPath: string): Promise<void> {
     approvedBy: "local-user",
     expectedRevision: draft.metadata.revision,
     expectedPayloadHash: draft.payloadHash,
+    acceptedClaim: {
+      claimId: "claim-human-decisions",
+      claimType: "RULE",
+      category: "UX_INVARIANT",
+      statement: "Keep human decisions explicit.",
+      evidenceId: "ev_route_overview_01",
+      route: "/overview",
+      state: "default",
+      authenticatedRenderId: "render-overview-01",
+      sourceRevisionFingerprint: "a".repeat(64),
+    },
   });
 }
 
@@ -270,15 +295,21 @@ describe("Drift Report governance store", () => {
       rootPath: root,
       projectId: "project-a",
       expectedRevision: 1,
-      evidenceCatalog: [],
+      evidenceCatalog: [{
+        id: "ev_route_unbound_01",
+        kind: "ROUTE",
+        route: "/overview",
+        excerpt: "Authenticated route inventory without state-bound render evidence.",
+        verifiedClaims: [],
+      }],
       report: {
         ...unavailableReport(),
-        evidenceIds: ["ev_route_overview_01"],
+        evidenceIds: ["ev_route_unbound_01"],
         findings: [{
           category: "UX_NAVIGATION",
           severity: "IMPORTANT",
           scope: "/overview#default",
-          evidenceIds: ["ev_route_overview_01"],
+          evidenceIds: ["ev_route_unbound_01"],
           genomeRuleId,
           expectedRule,
           observedEvidence: ["The primary action is missing from this captured state."],

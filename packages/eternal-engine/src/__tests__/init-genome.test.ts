@@ -153,7 +153,7 @@ describe("Design Genome initialization", () => {
       ],
     });
     expect(result.claimCitations).toEqual(expect.arrayContaining([
-      {
+      expect.objectContaining({
         claimType: "RULE",
         category: "UX_INVARIANT",
         statement: "Keep human decisions explicit.",
@@ -161,7 +161,7 @@ describe("Design Genome initialization", () => {
         requestedConfidence: "CONFIRMED",
         scope: { routes: ["/overview"] },
         evidenceIds: ["ev_render_overview_01"],
-      },
+      }),
     ]));
     expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0]?.workingDirectory).toBe("/authenticated/project");
@@ -309,7 +309,7 @@ describe("Design Genome initialization", () => {
     });
   });
 
-  it("confirms only an exact claim and scope proved by server-owned evidence", async () => {
+  it("keeps even an exact agent assertion unconfirmed until a human approves it", async () => {
     const focused = structuredClone(output);
     focused.productIdentity.confidence = "UNCONFIRMED";
     focused.rules = [focused.rules[0]!];
@@ -344,15 +344,49 @@ describe("Design Genome initialization", () => {
       { agent: fake.agent, createId: () => "screen-1" },
     );
 
-    expect(result.genome.uxInvariants).toEqual(["Keep human decisions explicit."]);
-    expect(result.claimCitations).toContainEqual({
+    expect(result.genome.uxInvariants).toEqual([]);
+    expect(result.claimCitations).toContainEqual(expect.objectContaining({
       claimType: "RULE",
       category: "UX_INVARIANT",
       statement: "Keep human decisions explicit.",
-      confidence: "CONFIRMED",
+      confidence: "UNCONFIRMED",
       requestedConfidence: "CONFIRMED",
       scope: { routes: ["/overview"] },
       evidenceIds: ["ev_render_overview_01"],
-    });
+    }));
+  });
+
+  it("deduplicates identical agent rule candidates before assigning stable claim ids", async () => {
+    const duplicated = structuredClone(output);
+    duplicated.rules = [duplicated.rules[0]!, structuredClone(duplicated.rules[0]!)];
+    const fake = agentWith(duplicated);
+
+    const result = await initializeGenome(
+      {
+        workingDirectory: "/authenticated/project",
+        projectContext: {
+          projectId: "project-a",
+          name: "Studio fixture",
+          framework: "nextjs",
+          routes: ["/overview"],
+          componentDirectories: ["components"],
+          designDocuments: ["README.md"],
+        },
+        representativeEvidence: [{
+          route: "/overview",
+          observations: ["Explicit human decisions."],
+          evidence: [{
+            id: "ev_render_overview_01",
+            kind: "RENDER",
+            excerpt: "Authenticated current overview render.",
+          }],
+        }],
+      },
+      { agent: fake.agent, createId: () => "screen-1" },
+    );
+
+    expect(result.claimCitations.filter(({ claimType }) => claimType === "RULE")).toHaveLength(1);
+    expect(result.genome.unconfirmedRules.filter((rule) =>
+      rule === "Keep human decisions explicit.")).toHaveLength(1);
   });
 });

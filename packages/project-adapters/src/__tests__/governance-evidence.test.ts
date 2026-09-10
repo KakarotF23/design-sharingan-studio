@@ -24,16 +24,11 @@ async function fixture(): Promise<string> {
 }
 
 describe("governance representative evidence", () => {
-  it("registers a visual-invariant claim only for a rendered product-consistency pass with evidence", () => {
+  it("keeps an agent product-consistency PASS as an unsigned observation", () => {
     expect(verifiedClaimsForProductConsistency("/overview", {
       status: "PASS",
       evidence: ["The verified render preserves its established hierarchy."],
-    })).toEqual([{
-      claimType: "RULE",
-      category: "VISUAL_INVARIANT",
-      statement: AUTHENTICATED_PRODUCT_LANGUAGE_RULE,
-      scope: { routes: ["/overview"] },
-    }]);
+    })).toEqual([]);
 
     expect(verifiedClaimsForProductConsistency("/overview", {
       status: "NOT_VERIFIED",

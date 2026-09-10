@@ -856,9 +856,9 @@ it("excludes .design-sharingan runtime artifacts from Git status and source fing
   });
 });
 
-// Production break caught: human-readable governance documents changed after a
-// render and made its otherwise identical product source appear stale.
-it("excludes design-governance documents from Git status and source fingerprints", async () => {
+// Regression caught: governance documents are target-project knowledge and
+// may affect runtime behavior, so their write must invalidate a prior render.
+it("includes design-governance documents in Git status and source fingerprints", async () => {
   const active = await workspace();
   await execFileAsync("git", ["init"], { cwd: active.rootPath });
   await execFileAsync("git", ["config", "user.email", "render@example.test"], { cwd: active.rootPath });
@@ -875,10 +875,11 @@ it("excludes design-governance documents from Git status and source fingerprints
 
   expect(second).toMatchObject({
     kind: "GIT",
-    status: "CLEAN",
-    entries: [],
-    worktreeFingerprint: first.kind === "GIT" ? first.worktreeFingerprint : "unreachable",
+    status: "DIRTY",
+    entries: [expect.objectContaining({ path: "design-governance/DESIGN-GENOME.md" })],
   });
+  expect(second.kind === "GIT" && first.kind === "GIT" && second.worktreeFingerprint)
+    .not.toBe(first.kind === "GIT" ? first.worktreeFingerprint : undefined);
 });
 
 it.each(["dist/styles.css", "build/client.js"])(

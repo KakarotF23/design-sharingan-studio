@@ -10,6 +10,7 @@ import { runDriftAudit } from "../../packages/eternal-engine/src/audit";
 import { guardFeature } from "../../packages/eternal-engine/src/guard";
 import { evaluateStopCriteria } from "../../packages/mangekyo-engine/src/stop-criteria";
 import { describe, expect, it } from "vitest";
+import { canPromoteApprovedClaimToRender } from "../../apps/studio/features/govern/govern-server";
 
 const verifiedIntegrity = {
   uxIntegrity: "PASS",
@@ -46,6 +47,39 @@ function approvedGenome(): DesignGenome {
 }
 
 describe("v0.1 policy pressure acceptance", () => {
+  it("does not promote a human-approved rule onto a fresh render without a matching visual observation", () => {
+    const entry = {
+      kind: "RENDER" as const,
+      route: "/overview",
+      authenticatedRenderId: "render-current-01",
+      renderState: "default",
+      renderSourceRevisionFingerprint: "a".repeat(64),
+    };
+    const approvedClaim = {
+      route: "/overview",
+      state: "default",
+    };
+
+    expect(canPromoteApprovedClaimToRender(
+      entry,
+      "a".repeat(64),
+      approvedClaim,
+      new Map(),
+    )).toBe(false);
+    expect(canPromoteApprovedClaimToRender(
+      entry,
+      "a".repeat(64),
+      approvedClaim,
+      new Map([["render-current-01", []]]),
+    )).toBe(false);
+    expect(canPromoteApprovedClaimToRender(
+      entry,
+      "a".repeat(64),
+      approvedClaim,
+      new Map([["render-current-01", [{ category: "HIERARCHY" }]]]),
+    )).toBe(true);
+  });
+
   it.each([
     ["dependency installation", "DEPENDENCY_INSTALL", ["package.json"]],
     ["navigation mutation", "NAVIGATION_CHANGE", ["src/navigation.ts"]],

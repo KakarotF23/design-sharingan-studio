@@ -54,6 +54,36 @@ export interface GovernGenomeProjection {
   contentVoice: string[];
   intentionalExceptions: string[];
   unconfirmedRules: string[];
+  approvableClaims: GovernGenomeClaimProjection[];
+}
+
+export interface GovernGenomeClaimProjection {
+  id: string;
+  category: string;
+  statement: string;
+  evidenceId: string;
+  route: string;
+  state: string;
+}
+
+export function canPromoteApprovedClaimToRender(
+  entry: {
+    kind: string;
+    route: string;
+    authenticatedRenderId?: string;
+    renderState?: string;
+    renderSourceRevisionFingerprint?: string;
+  },
+  currentRevisionFingerprint: string | undefined,
+  approvedClaim: { route: string; state: string } | undefined,
+  observationsByRender: ReadonlyMap<string, readonly unknown[]>,
+): boolean {
+  return currentRevisionFingerprint !== undefined && approvedClaim !== undefined &&
+    entry.kind === "RENDER" && entry.route === approvedClaim.route &&
+    entry.renderState === approvedClaim.state &&
+    entry.renderSourceRevisionFingerprint === currentRevisionFingerprint &&
+    entry.authenticatedRenderId !== undefined &&
+    (observationsByRender.get(entry.authenticatedRenderId)?.length ?? 0) > 0;
 }
 
 export interface GovernScreenProjection {
@@ -522,10 +552,35 @@ export async function loadGovernanceProjection(
   if (!(await governanceIsInitialized(project.rootPath))) {
     return { initialized: false };
   }
-  const [genome, registry] = await Promise.all([
+  const [genome, registry, catalog] = await Promise.all([
     readGenome(project.rootPath, project.id),
     readScreenRegistry(project.rootPath, project.id),
+    readEvidenceCatalog(project.rootPath, project.id),
   ]);
+  const approvableClaims: GovernGenomeClaimProjection[] = genome.value.status === "DRAFT"
+    ? genome.metadata.claimCitations.flatMap((citation) => {
+        if (
+          citation.claimType !== "RULE" || citation.confidence !== "UNCONFIRMED" ||
+          citation.evidenceIds.length !== 1 || citation.scope.routes.length !== 1 ||
+          genome.metadata.claimCitations.filter(({ evidenceIds }) =>
+            evidenceIds.includes(citation.evidenceIds[0]!)).length !== 1
+        ) return [];
+        const evidence = catalog.find(({ id }) => id === citation.evidenceIds[0]);
+        if (
+          evidence?.kind !== "RENDER" || evidence.authenticatedRenderId === undefined ||
+          evidence.renderState === undefined || evidence.renderSourceRevisionFingerprint === undefined ||
+          evidence.route !== citation.scope.routes[0] || evidence.verifiedClaims.length !== 0
+        ) return [];
+        return [{
+          id: citation.id,
+          category: citation.category,
+          statement: citation.statement,
+          evidenceId: evidence.id,
+          route: evidence.route,
+          state: evidence.renderState,
+        }];
+      })
+    : [];
   let drift: DriftReport | undefined;
   try {
     drift = (await readDriftReport(project.rootPath, project.id)).value;
@@ -553,6 +608,7 @@ export async function loadGovernanceProjection(
       contentVoice: genome.value.contentVoice,
       intentionalExceptions: genome.value.intentionalExceptions,
       unconfirmedRules: genome.value.unconfirmedRules,
+      approvableClaims,
     },
     screens: registry.records.map((screen) => ({ ...screen })),
     ...(drift === undefined ? {} : { drift }),
@@ -642,11 +698,43 @@ export async function approveProjectGenome(
   project: Project,
   expectedRevision: number,
   expectedPayloadHash: string,
+  acceptedClaimId: string,
 ): Promise<GovernanceProjection> {
+  let acceptedClaim: Parameters<typeof approveGenome>[2]["acceptedClaim"];
+  {
+    const [genome, catalog] = await Promise.all([
+      readGenome(project.rootPath, project.id),
+      readEvidenceCatalog(project.rootPath, project.id),
+    ]);
+    const citation = genome.metadata.claimCitations.find(({ id }) => id === acceptedClaimId);
+    if (
+      citation === undefined || citation.claimType !== "RULE" || citation.category === "PRODUCT_IDENTITY" ||
+      citation.confidence !== "UNCONFIRMED" || citation.evidenceIds.length !== 1 ||
+      citation.scope.routes.length !== 1
+    ) throw new Error("Selected Genome claim is unavailable or ambiguous");
+    const evidence = catalog.find(({ id }) => id === citation.evidenceIds[0]);
+    if (
+      evidence?.kind !== "RENDER" || evidence.authenticatedRenderId === undefined ||
+      evidence.renderState === undefined || evidence.renderSourceRevisionFingerprint === undefined ||
+      evidence.route !== citation.scope.routes[0]
+    ) throw new Error("Selected Genome claim lacks exact authenticated render evidence");
+    acceptedClaim = {
+      claimId: citation.id,
+      claimType: "RULE",
+      category: citation.category,
+      statement: citation.statement,
+      evidenceId: evidence.id,
+      route: evidence.route,
+      state: evidence.renderState,
+      authenticatedRenderId: evidence.authenticatedRenderId,
+      sourceRevisionFingerprint: evidence.renderSourceRevisionFingerprint,
+    };
+  }
   await approveGenome(project.rootPath, project.id, {
     approvedBy: "local-user",
     expectedRevision,
     expectedPayloadHash,
+    acceptedClaim,
   });
   const projection = await loadGovernanceProjection(project);
   if (!projection.initialized) throw new Error("Approved Genome projection is unavailable");
@@ -681,10 +769,28 @@ export async function auditProjectDrift(
     captureWorkspaceSourceRevision(workspace).catch(() => undefined),
     driftObservationsByRender(project, genome),
   ]);
-  const catalog = [...existingEvidence, ...newEvidence];
+  const approvedClaim = genome.metadata.authority?.acceptedClaim;
+  const authenticatedNewEvidence = newEvidence.map((entry) => {
+    const isFreshApprovedScope = canPromoteApprovedClaimToRender(
+      entry,
+      currentRevision?.available === true ? currentRevision.worktreeFingerprint : undefined,
+      approvedClaim,
+      observationsByRender,
+    );
+    return !isFreshApprovedScope || approvedClaim === undefined ? entry : {
+      ...entry,
+      verifiedClaims: [{
+        claimType: "RULE" as const,
+        category: approvedClaim.category,
+        statement: approvedClaim.statement,
+        scope: { routes: [approvedClaim.route] },
+      }],
+    };
+  });
+  const catalog = [...existingEvidence, ...authenticatedNewEvidence];
   const freshRenderByRoute = new Map<string, string[]>();
   if (currentRevision?.available === true) {
-    for (const entry of newEvidence) {
+    for (const entry of authenticatedNewEvidence) {
       if (
         entry.kind === "RENDER" &&
         entry.authenticatedRenderId !== undefined &&
@@ -742,7 +848,7 @@ export async function auditProjectDrift(
     rootPath: project.rootPath,
     projectId: project.id,
     expectedRevision: registry.metadata.revision,
-    evidenceCatalog: newEvidence,
+    evidenceCatalog: authenticatedNewEvidence,
     report,
     verifiedRegistry,
   });

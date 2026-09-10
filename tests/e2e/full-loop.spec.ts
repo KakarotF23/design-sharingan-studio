@@ -278,9 +278,38 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   await page.goto((studioPath as string).replace(/\/overview$/, "/govern"));
   await page.getByRole("button", { name: "Initialize Draft Genome" }).click();
   await expect(page.getByText("DRAFT", { exact: true })).toBeVisible();
+  await page.getByLabel("Preserve the established product hierarchy and component language.").check();
+  const preApprovalLoop = (await listSessions(projectPath, projectId))
+    .find((session) => session.type === "MANGEKYO_LOOP");
+  expect(preApprovalLoop && isMangekyoLoopSession(preApprovalLoop)).toBe(true);
+  if (!preApprovalLoop || !isMangekyoLoopSession(preApprovalLoop)) {
+    throw new Error("Pre-approval Mangekyō evidence is unavailable");
+  }
+  const preApprovalRender = preApprovalLoop.rounds.at(-1)?.round.afterRender;
+  expect(preApprovalRender?.sourceRevision.available).toBe(true);
   await page.getByRole("button", { name: "Approve Genome" }).click();
   await expect(page.getByLabel("Design Genome").getByText("AUTHORITATIVE", { exact: true })).toBeVisible();
+
+  // Governance is target-project input, so approval invalidates the earlier
+  // render. Continue the existing Human Gate path to produce a real capture
+  // from the post-approval source revision before auditing.
+  await page.goto((studioPath as string).replace(/\/overview$/, "/execute"));
+  await page.getByRole("button", { name: "Mangekyō" }).click();
+  await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible();
+  await page.getByRole("button", { name: "Approve Once" }).click();
+  await expect(page.getByText("Round 02", { exact: true })).toBeVisible({ timeout: 90_000 });
+  await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible({ timeout: 90_000 });
+
+  await page.goto((studioPath as string).replace(/\/overview$/, "/govern"));
+  const auditResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith("/govern/audit"),
+  );
   await page.getByRole("button", { name: "Run drift audit" }).click();
+  const auditResult = await auditResponse;
+  expect({ status: auditResult.status(), payload: await auditResult.json() as unknown }).toMatchObject({
+    status: 200,
+    payload: { initialized: true, drift: { overallStatus: "NOT_VERIFIED" } },
+  });
   await expect(page.getByRole("heading", { name: "Drift audit" })).toBeVisible();
   const releaseResponse = page.waitForResponse((response) =>
     response.request().method() === "POST" && response.url().endsWith("/govern/release"),
@@ -364,12 +393,19 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     directionApprovalId: evolveSession.approval.id,
     referenceIds: [reference.id],
   });
-  expect(mangekyoSession.rounds).toHaveLength(1);
-  const render = mangekyoSession.rounds[0]?.round.afterRender;
+  expect(mangekyoSession.rounds).toHaveLength(2);
+  const render = mangekyoSession.rounds.at(-1)?.round.afterRender;
   expect(render).toBeDefined();
   if (render === undefined) throw new Error("Mangekyo round did not retain its render");
   expect(render.sessionId).toBe(mangekyoSession.id);
-  expect(render.roundId).toBe("round-1");
+  expect(render.roundId).toBe("round-2");
+  expect(render.sourceRevision.available).toBe(true);
+  expect(render.sourceRevision.available && preApprovalRender?.sourceRevision.available &&
+    render.sourceRevision.worktreeFingerprint).not.toBe(
+    preApprovalRender?.sourceRevision.available
+      ? preApprovalRender.sourceRevision.worktreeFingerprint
+      : undefined,
+  );
   expect(isInside(join(projectPath, ".design-sharingan", "renders"), await realpath(render.imagePath))).toBe(true);
   expect((await stat(render.imagePath)).size).toBeGreaterThan(1_000);
   expect((await readFile(render.imagePath)).subarray(0, 8)).toEqual(
@@ -384,6 +420,9 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   ]);
   expect(genome.value.status).toBe("APPROVED");
   expect(genome.authority).toBe("AUTHORITATIVE");
+  expect(genome.value.visualInvariants).toContain(
+    "Preserve the established product hierarchy and component language.",
+  );
   expect(genome.value.unconfirmedRules).toContain(
     "Use restrained contrast to separate primary action from evidence.",
   );
@@ -393,6 +432,11 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     genomeVersion: genome.value.version,
     documentRevision: genome.metadata.revision,
     approvedBy: "local-user",
+    acceptedClaim: expect.objectContaining({
+      claimType: "RULE",
+      category: "VISUAL_INVARIANT",
+      statement: "Preserve the established product hierarchy and component language.",
+    }),
   });
   expect(registry.metadata).toMatchObject({
     projectId,
@@ -431,6 +475,9 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     route: "/",
     authenticatedRenderId: render.id,
     renderState: "default",
+    renderSourceRevisionFingerprint: render.sourceRevision.available
+      ? render.sourceRevision.worktreeFingerprint
+      : undefined,
     verifiedClaims: [expect.objectContaining({
       claimType: "RULE",
       category: "VISUAL_INVARIANT",

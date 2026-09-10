@@ -24,13 +24,10 @@ function fakeAgent(input: InitializeGenomeInput): GenomeInitAgent {
   if (first === undefined) throw new Error("Fake Genome service requires representative evidence");
   const grounded = catalog.find(({ kind }) => kind !== "ROUTE") ?? first;
   const navigation = catalog.find(({ kind }) => kind === "NAVIGATION" || kind === "COMPONENT") ?? grounded;
-  const productLanguageEvidence = catalog.find(({ verifiedClaims = [] }) =>
-    verifiedClaims.some((claim) =>
-      claim.claimType === "RULE" &&
-      claim.category === "VISUAL_INVARIANT" &&
-      claim.statement === "Preserve the established product hierarchy and component language.",
-    ),
-  );
+  // A rendered product-consistency result is candidate evidence only. The
+  // initializer may propose the rule, but it remains UNCONFIRMED until the
+  // local user accepts its exact server-derived citation.
+  const productLanguageEvidence = catalog.filter(({ kind }) => kind === "RENDER").at(-1);
   const routeFor = (evidenceId: string): string =>
     input.representativeEvidence.find(({ evidence }) =>
       evidence.some(({ id }) => id === evidenceId),

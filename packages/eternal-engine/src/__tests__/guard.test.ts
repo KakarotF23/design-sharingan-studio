@@ -97,17 +97,60 @@ describe("Eternal feature guard", () => {
   it("inherits only from an authenticated exact local-user Genome document", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "guard-authority-")));
     try {
+      const draft = genome("DRAFT");
+      draft.uxInvariants = [];
+      draft.unconfirmedRules = [
+        "Keep human decisions explicit.",
+        ...draft.unconfirmedRules,
+      ];
       const created = await initializeGovernance({
         rootPath: root,
         projectId: "project-a",
-        genome: genome("DRAFT"),
+        genome: draft,
         screens: [],
         decisions: [],
+        evidenceCatalog: [{
+          id: "ev_render_guard_01",
+          kind: "RENDER",
+          route: "/overview",
+          excerpt: "Authenticated current render for the explicit decision rule.",
+          verifiedClaims: [],
+          authenticatedRenderId: "render-guard-01",
+          renderState: "default",
+          renderCapturedAt: "2026-09-08T00:00:00.000Z",
+          renderSourceRevisionFingerprint: "a".repeat(64),
+        }],
+        inspectedScope: {
+          representative: true,
+          routes: ["/overview"],
+          evidenceIds: ["ev_render_guard_01"],
+        },
+        claimCitations: [{
+          id: "claim-guard-human-decisions",
+          claimType: "RULE",
+          category: "UX_INVARIANT",
+          statement: "Keep human decisions explicit.",
+          confidence: "UNCONFIRMED",
+          requestedConfidence: "CONFIRMED",
+          scope: { routes: ["/overview"] },
+          evidenceIds: ["ev_render_guard_01"],
+        }],
       });
       const approved = await approveGenome(root, "project-a", {
         approvedBy: "local-user",
         expectedRevision: created.genome.metadata.revision,
         expectedPayloadHash: created.genome.payloadHash,
+        acceptedClaim: {
+          claimId: "claim-guard-human-decisions",
+          claimType: "RULE",
+          category: "UX_INVARIANT",
+          statement: "Keep human decisions explicit.",
+          evidenceId: "ev_render_guard_01",
+          route: "/overview",
+          state: "default",
+          authenticatedRenderId: "render-guard-01",
+          sourceRevisionFingerprint: "a".repeat(64),
+        },
       });
 
       const verified = await guardFeature({ genome: approved, featureBrief });

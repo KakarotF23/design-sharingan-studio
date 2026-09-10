@@ -73,7 +73,7 @@ function draftGenome(): DesignGenome {
     version: "0.1.0",
     status: "DRAFT",
     productIdentity: "A calm local-first design intelligence environment.",
-    uxInvariants: ["Keep human decisions explicit."],
+    uxInvariants: [],
     visualInvariants: ["Use one restrained accent."],
     motionRules: ["Reserve motion for state transitions."],
     accessibilityRules: ["Maintain visible focus."],
@@ -81,7 +81,7 @@ function draftGenome(): DesignGenome {
     screenFamilies: ["Project workspaces"],
     contentVoice: ["Calm, technical, and direct."],
     intentionalExceptions: ["Overview may use a wider orientation block."],
-    unconfirmedRules: ["Compact density may be preferred on evidence screens."],
+    unconfirmedRules: ["Keep human decisions explicit.", "Compact density may be preferred on evidence screens."],
   };
 }
 
@@ -91,7 +91,7 @@ function screenRecord(): ScreenRecord {
     route: "/overview",
     name: "Overview",
     family: "Project workspaces",
-    inheritedRules: ["Keep human decisions explicit."],
+    inheritedRules: [],
     exceptions: ["Overview may use a wider orientation block."],
     requiredStates: ["default"],
     evidence: ["ev_route_overview_01"],
@@ -102,11 +102,42 @@ function screenRecord(): ScreenRecord {
 function evidenceCatalog() {
   return [{
     id: "ev_route_overview_01",
-    kind: "ROUTE" as const,
+    kind: "RENDER" as const,
     route: "/overview",
     excerpt: "Authenticated project inspection detected this current route.",
     verifiedClaims: [],
+    authenticatedRenderId: "render-overview-01",
+    renderState: "default",
+    renderCapturedAt: "2026-09-08T00:00:00.000Z",
+    renderSourceRevisionFingerprint: "a".repeat(64),
   }];
+}
+
+function approvalCitations() {
+  return [{
+    id: "claim-human-decisions",
+    claimType: "RULE" as const,
+    category: "UX_INVARIANT" as const,
+    statement: "Keep human decisions explicit.",
+    confidence: "UNCONFIRMED" as const,
+    requestedConfidence: "CONFIRMED" as const,
+    scope: { routes: ["/overview"] },
+    evidenceIds: ["ev_route_overview_01"],
+  }];
+}
+
+function acceptedClaim() {
+  return {
+    claimId: "claim-human-decisions",
+    claimType: "RULE" as const,
+    category: "UX_INVARIANT" as const,
+    statement: "Keep human decisions explicit.",
+    evidenceId: "ev_route_overview_01",
+    route: "/overview",
+    state: "default",
+    authenticatedRenderId: "render-overview-01",
+    sourceRevisionFingerprint: "a".repeat(64),
+  };
 }
 
 async function projectFixture(): Promise<Project> {
@@ -134,12 +165,14 @@ async function approvedGenomeSession(project: Project) {
     genome: draftGenome(),
     screens: [screenRecord()],
     evidenceCatalog: evidenceCatalog(),
+    claimCitations: approvalCitations(),
     decisions: [],
   });
   const genome = await approveGenome(project.rootPath, project.id, {
     approvedBy: "local-user",
     expectedRevision: 1,
     expectedPayloadHash: created.genome.payloadHash,
+    acceptedClaim: acceptedClaim(),
   });
   const checkpoint: GovernanceSessionCheckpoint = {
     type: "GENOME_INIT",
@@ -222,6 +255,7 @@ describe("governance report session authentication", () => {
       genome: draftGenome(),
       screens: [screenRecord()],
       evidenceCatalog: evidenceCatalog(),
+      claimCitations: approvalCitations(),
       decisions: [],
     });
     const draftCheckpoint: GovernanceSessionCheckpoint = {
@@ -249,6 +283,7 @@ describe("governance report session authentication", () => {
       approvedBy: "local-user",
       expectedRevision: created.genome.metadata.revision,
       expectedPayloadHash: created.genome.payloadHash,
+      acceptedClaim: acceptedClaim(),
     });
     const approvedCheckpoint: GovernanceSessionCheckpoint = {
       type: "GENOME_INIT",

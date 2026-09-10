@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import {
+  chmod,
   cp,
+  mkdir,
   mkdtemp,
   readFile,
   realpath,
   readdir,
   readlink,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -19,9 +22,11 @@ import {
   renderGenome,
   renderScreenRegistry,
 } from "@design-sharingan/governance";
+import { listReferences } from "@design-sharingan/project-adapters";
 
 let sandboxPath: string;
 let projectPath: string;
+let referenceImagePath: string;
 let sourceBefore: Record<string, string>;
 
 async function snapshotSource(rootPath: string): Promise<Record<string, string>> {
@@ -58,10 +63,38 @@ async function snapshotSource(rootPath: string): Promise<Record<string, string>>
 
 test.beforeAll(async () => {
   sandboxPath = await mkdtemp(join(tmpdir(), "design-sharingan-genome-e2e-"));
-  projectPath = join(sandboxPath, "next-genome-fixture");
-  await cp(resolve(process.cwd(), "tests/fixtures/next-basic"), projectPath, {
+  projectPath = join(sandboxPath, "genome-renderable-fixture");
+  referenceImagePath = join(sandboxPath, "genome-reference.png");
+  await cp(resolve(process.cwd(), "tests/fixtures/renderable-next"), projectPath, {
     recursive: true,
   });
+  const packageRecord = JSON.parse(
+    await readFile(join(projectPath, "package.json"), "utf8"),
+  ) as Record<string, unknown>;
+  await writeFile(join(projectPath, "package.json"), `${JSON.stringify({
+    ...packageRecord,
+    scripts: { start: "react-scripts start" },
+    dependencies: { react: "latest" },
+  }, null, 2)}\n`);
+  const binPath = join(projectPath, "node_modules", ".bin");
+  await mkdir(binPath, { recursive: true });
+  const reactScriptsPath = join(binPath, "react-scripts");
+  await writeFile(
+    reactScriptsPath,
+    '#!/usr/bin/env node\nawait import(new URL("../../server.mjs", import.meta.url));\n',
+  );
+  await chmod(reactScriptsPath, 0o755);
+  await writeFile(join(projectPath, "package-lock.json"), `${JSON.stringify({
+    name: packageRecord.name,
+    lockfileVersion: 3,
+    requires: true,
+    packages: {},
+  }, null, 2)}\n`);
+  await writeFile(join(projectPath, "styles.css"), "body { color: #e8edf4; }\n");
+  await writeFile(referenceImagePath, Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  ));
   projectPath = await realpath(projectPath);
   sourceBefore = await snapshotSource(projectPath);
 });
@@ -73,6 +106,7 @@ test.afterAll(async () => {
 test("initializes a non-authoritative Genome, registers evidence-backed screens, and records local approval", async ({
   page,
 }) => {
+  test.setTimeout(180_000);
   await page.goto("/projects?source=local");
   await page.getByLabel("Project folder path").fill(projectPath);
   await page.getByRole("button", { name: "Scan project" }).click();
@@ -80,6 +114,43 @@ test("initializes a non-authoritative Genome, registers evidence-backed screens,
     .getByRole("link", { name: "Open Studio" })
     .getAttribute("href");
   expect(studioPath).not.toBeNull();
+  const projectId = decodeURIComponent(
+    new URL(studioPath as string, "http://studio.invalid").pathname.split("/")[2] ?? "",
+  );
+
+  await page.goto((studioPath as string).replace(/\/overview$/, "/references"));
+  await page.getByLabel("Reference image").setInputFiles(referenceImagePath);
+  await page.getByLabel("Reference title").fill("Genome reference");
+  await page.getByLabel("Reference tags").fill("governance, evidence");
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await expect(page.getByRole("heading", { name: "Genome reference" })).toBeVisible();
+  const [reference] = await listReferences(projectPath, projectId);
+  expect(reference).toBeDefined();
+  await page.goto((studioPath as string).replace(/\/overview$/, "/learn"));
+  await page.getByLabel("Reference to analyze").selectOption(reference.id);
+  await page.getByRole("button", { name: "Analyze" }).click();
+  await expect(page.getByRole("heading", { name: "KEEP" })).toBeVisible();
+  await page.getByRole("button", { name: "EVOLVE" }).click();
+  await page.getByLabel("Genome reference").check();
+  await page.getByLabel("Feature name").fill("Governed evidence view");
+  await page.getByLabel("Goal").fill("Preserve evidence-bound product decisions.");
+  await page.getByLabel("Description").fill("Refine evidence presentation without changing navigation.");
+  await page.getByLabel("Constraints").fill("Keep the existing route");
+  await page.getByLabel("Must keep").fill("Human approval remains explicit");
+  await page.getByLabel("Must not change").fill("Do not add navigation destinations");
+  await page.getByLabel("Success criteria").fill("A fresh render supports the governance decision");
+  await page.getByRole("button", { name: "Run EVOLVE" }).click();
+  await page.getByRole("button", { name: "Approve Guided evidence queue" }).click();
+  await page.getByRole("button", { name: "Prepare change proposal" }).click();
+  await expect(page.getByRole("heading", { name: "Safe Mode change proposal" })).toBeVisible();
+  await page.getByRole("button", { name: "Approve & Execute" }).click();
+  await expect(page.getByRole("heading", { name: "Approved mutation applied" })).toBeVisible();
+  await page.getByRole("button", { name: "Mangekyō" }).click();
+  await page.getByRole("button", { name: "Start Mangekyō loop" }).click();
+  await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible({
+    timeout: 90_000,
+  });
+  sourceBefore = await snapshotSource(projectPath);
 
   await page.goto((studioPath as string).replace(/\/overview$/, "/govern"));
   await expect(page.getByRole("heading", { name: "Govern" })).toBeVisible();
@@ -152,6 +223,7 @@ test("initializes a non-authoritative Genome, registers evidence-backed screens,
   });
   expect(rejectedGet.status()).toBe(403);
 
+  await page.getByLabel("Preserve the established product hierarchy and component language.").check();
   await page.getByRole("button", { name: "Approve Genome" }).click();
   await expect(page.getByText("APPROVED", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("AUTHORITATIVE", { exact: true }).first()).toBeVisible();

@@ -551,6 +551,8 @@ export interface GovernanceVerifiedClaim {
 }
 
 export interface GovernanceClaimCitation extends GovernanceVerifiedClaim {
+  /** Stable, human-visible identity selected by an explicit approval action. */
+  id: string;
   confidence: "CONFIRMED" | "UNCONFIRMED";
   requestedConfidence: "CONFIRMED" | "UNCONFIRMED";
   evidenceIds: string[];
