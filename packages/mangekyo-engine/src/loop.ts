@@ -108,6 +108,7 @@ export interface MangekyoLoopDependencies {
       genomeIntegrity: VisualIntegrityVerification;
     };
     genomeEvidenceVersion?: string;
+    genomeEvidence?: import("@design-sharingan/core").GenomeEvidence;
   }>;
   stopProject?(): Promise<void>;
   userStopped?(): boolean;
@@ -608,6 +609,7 @@ async function executeRound(
     ...(analysis.genomeEvidenceVersion === undefined
       ? {}
       : { genomeEvidenceVersion: analysis.genomeEvidenceVersion }),
+    ...(analysis.genomeEvidence === undefined ? {} : { genomeEvidence: analysis.genomeEvidence }),
     status: "DECIDING",
   };
   const { pendingChange: _completedPendingChange, ...completedWorking } = working;

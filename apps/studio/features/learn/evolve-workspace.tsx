@@ -23,7 +23,7 @@ interface EvolveSessionView {
   approaches: DesignApproach[];
 }
 
-export function EvolveWorkspace() {
+export function EvolveWorkspace({ initialBrief, findingKey }: { initialBrief?: FeatureBrief; findingKey?: string } = {}) {
   const project = useStudioProject();
   const [references, setReferences] = useState<ReferenceView[]>([]);
   const [session, setSession] = useState<EvolveSessionView>();
@@ -76,6 +76,7 @@ export function EvolveWorkspace() {
               successCriteria: lines(data.get("successCriteria")),
             },
             referenceIds: data.getAll("referenceIds"),
+            ...(findingKey === undefined ? {} : { findingKey }),
           }),
         },
       );
@@ -139,7 +140,7 @@ export function EvolveWorkspace() {
             State the goal, invariants, boundaries, and observable definition of success before comparing implementation directions.
           </p>
         </div>
-        <FeatureBriefForm references={references} busy={busy} />
+        <FeatureBriefForm references={references} busy={busy} initialBrief={initialBrief} />
       </form>
       {busy ? <p className="analysis-status" role="status">Mapping routes, components, states, and UX risk…</p> : null}
       {error ? <p className="form-error" role="alert">{error}</p> : null}

@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { basename, dirname, extname, join, posix } from "node:path";
 import type {
   ActivityEvent,
@@ -18,6 +19,8 @@ import type {
   DesignDNA,
   DesignSession,
   FeatureBrief,
+  GenomeEvidence,
+  GovernanceFindingSource,
   LearnSessionStatus,
   Project,
   Reference,
@@ -31,6 +34,8 @@ import {
   isCanonicalIdentifier,
   isCanonicalIsoDateTime,
   isDesignSessionEnvelope,
+  isGenomeEvidence,
+  isGovernanceFindingSource,
   orderActivityEvents,
   validateActivityEvent,
 } from "@design-sharingan/core";
@@ -48,7 +53,7 @@ const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
 const CHECKPOINT_SUFFIX = ".checkpoint.json";
 const SESSION_HEAD_SUFFIX = ".session-head.json";
 const ACTIVITY_ID_PATTERN = /^act_[a-f0-9]{64}$/;
-const AUTHENTICATED_SESSION_READ_ATTEMPTS = 5;
+const AUTHENTICATED_SESSION_READ_ATTEMPTS = 10;
 // Learn transitions are short, local durable writes. A bounded lease protects
 // a live owner across processes while still making a crashed owner (including
 // PID reuse) recoverable instead of permanently wedging the state machine.
@@ -73,6 +78,7 @@ function isConcurrentSessionRead(error: unknown): boolean {
     /^Session history filename\/identity count is invalid against its authenticated head index$/,
     /^Session page (?:index points to a missing record|record does not match its authenticated head index)$/,
     /^Session record (?:does not match its authenticated activity checkpoint head index|does not match its latest immutable checkpoint|is not part of a committed journal pair)$/,
+    /^Activity checkpoint is orphaned or belongs to another project$/,
   ].some((pattern) => pattern.test(error.message));
 }
 
@@ -180,9 +186,10 @@ interface LearnTransitionClaim {
   pid: number;
   projectId: string;
   sessionId: string;
-  expectedStatus: LearnSessionStatus;
+  expectedStatus: string;
   expectedSessionHash: string;
   leaseExpiresAt: string;
+  processStartedAt?: string;
 }
 
 const activeLearnClaimOwners = new Set<string>();
@@ -460,7 +467,11 @@ async function validateFixedDirectory(
       throw new Error(`${label} must be a real directory`);
     }
   } else {
-    await mkdir(directoryPath);
+    await mkdir(directoryPath).catch((error: unknown) => {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+      // Another initializer may have won. The exact fixed path is still
+      // validated below; a file or symlink is never accepted as that winner.
+    });
   }
 
   const createdEntry = await lstat(directoryPath);
@@ -487,7 +498,9 @@ async function validateProjectMetadataFile(
       throw new Error("Workspace project metadata must be a regular file");
     }
   } else {
-    await atomicWriteJson(workspace.machinePath, metadataPath, {});
+    await atomicCreate(workspace.machinePath, metadataPath, stableJson({})).catch((error: unknown) => {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+    });
   }
 
   const createdEntry = await lstat(metadataPath);
@@ -1371,7 +1384,10 @@ function activityDescriptor(session: DesignSession): {
       }
       return { category: "SYSTEM", message: "Reference scan created" };
     case "ASSIMILATION":
-      return { category: "AGENT", message: "Assimilation not verified" };
+    case "DESIGN_VERIFY":
+      return { category: "AGENT", message: session.status === "RESULT_READY" ? "Readonly design evidence saved" : "Analyzing design direction" };
+    case "GOVERNANCE_CAPTURE":
+      return { category: "RENDER", message: "Scoped browser and visual verification evidence saved" };
     case "FEATURE_EVOLVE":
       if (session.status === "AWAITING_DECISION") {
         return { category: "APPROVAL", message: "Waiting for approach approval" };
@@ -2415,17 +2431,23 @@ export async function loadSession(
   );
 }
 
-async function withLearnTransitionClaim<T>(
+function claimProcessStart(pid: number): string | undefined {
+  try { return execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined; }
+  catch { return undefined; }
+}
+
+export async function withLearnTransitionClaim<T>(
   rootPath: string,
   projectId: string,
   sessionId: string,
-  expectedStatus: LearnSessionStatus,
+  expectedStatus: string,
   action: () => Promise<T>,
+  claimKind: "learn" | "approval" | "safe-execution" = "learn",
 ): Promise<T> {
   const workspace = await loadValidatedProjectContext(rootPath, projectId);
   const claimPath = assertPathInsideWorkspace(
     workspace.sessionsPath,
-    join(workspace.sessionsPath, `.${sessionId}.learn.claim`),
+    join(workspace.sessionsPath, `.${sessionId}.${claimKind}.claim`),
   );
   const source = await loadSession(rootPath, projectId, sessionId);
   const claimValue: LearnTransitionClaim = {
@@ -2437,6 +2459,7 @@ async function withLearnTransitionClaim<T>(
     expectedStatus,
     expectedSessionHash: sessionCheckpointHash(source),
     leaseExpiresAt: new Date(Date.now() + LEARN_CLAIM_LEASE_MS).toISOString(),
+    processStartedAt: claimProcessStart(process.pid),
   };
   const claimContents = stableJson(claimValue);
   let claim: Awaited<ReturnType<typeof open>> | undefined;
@@ -2480,19 +2503,30 @@ async function withLearnTransitionClaim<T>(
       typeof persisted.expectedStatus !== "string" ||
       typeof persisted.expectedSessionHash !== "string" ||
       !/^[a-f0-9]{64}$/.test(persisted.expectedSessionHash) ||
+      (persisted.processStartedAt !== undefined && (typeof persisted.processStartedAt !== "string" || persisted.processStartedAt.length > 80)) ||
       Object.keys(persisted).sort().join("\0") !== [
         "expectedSessionHash", "expectedStatus", "kind", "leaseExpiresAt", "ownerId", "pid", "projectId", "sessionId",
-      ].join("\0")
+        ...(persisted.processStartedAt === undefined ? [] : ["processStartedAt"]),
+      ].sort().join("\0")
     ) throw new Error("Learn session transition claim is invalid or ambiguous");
     const claim = persisted as LearnTransitionClaim;
     const current = await loadSession(rootPath, projectId, sessionId);
+    if (claimKind === "safe-execution") {
+      // Safe's transaction spans several checkpoints and a long render. A
+      // current owner must not be displaced by a checkpoint change or lease.
+      if (activeLearnClaimOwners.has(claim.ownerId)) return false;
+      if (claim.pid !== process.pid && processIsAlive(claim.pid)) {
+        const start = claimProcessStart(claim.pid);
+        if (!claim.processStartedAt || !start || start === claim.processStartedAt) return false;
+      }
+    }
     if (sessionCheckpointHash(current) === claim.expectedSessionHash) {
       // A same-process claimant can be proven live only by its unforgeable
       // in-memory owner token. For another process, PID plus a current lease
       // is a bounded liveness proof; either may be stale after a crash.
       if (
         activeLearnClaimOwners.has(claim.ownerId) ||
-        (processIsAlive(claim.pid) && Date.parse(claim.leaseExpiresAt) > Date.now())
+        (claim.pid !== process.pid && processIsAlive(claim.pid) && Date.parse(claim.leaseExpiresAt) > Date.now())
       ) return false;
     }
     return removeExactClaim(claim, {
@@ -2554,10 +2588,14 @@ export async function transitionLearnSession(
 ): Promise<string> {
   return withLearnTransitionClaim(rootPath, session.projectId, session.id, expectedStatus, async () => {
     const existing = await loadSession(rootPath, session.projectId, session.id);
+    const oldIdentity = existing as unknown as Record<string, unknown>;
+    const newIdentity = session as unknown as Record<string, unknown>;
+    const immutableFields = ["referenceId", "referenceIds", "referenceTitle", "featureBrief", "sourceFinding", "genomeEvidence", "intendedDirection", "currentDirection"];
     if (
       existing.type !== session.type ||
       existing.status !== expectedStatus ||
       existing.createdAt !== session.createdAt ||
+      immutableFields.some((field) => stableJson({ value: oldIdentity[field] }) !== stableJson({ value: newIdentity[field] })) ||
       !canTransitionLearnSession(expectedStatus, session.status)
     ) {
       throw new Error(
@@ -2572,6 +2610,8 @@ interface FeatureEvolveSessionBase extends DesignSession {
   type: "FEATURE_EVOLVE";
   featureBrief: FeatureBrief;
   referenceIds: string[];
+  genomeEvidence?: GenomeEvidence;
+  sourceFinding?: GovernanceFindingSource;
 }
 
 export interface FeatureEvolvePendingSession
@@ -2623,11 +2663,15 @@ export function isFeatureEvolvePendingSession(
       "updatedAt",
       "featureBrief",
       "referenceIds",
+      "genomeEvidence",
+      "sourceFinding",
       "error",
     ]) &&
     session.type === "FEATURE_EVOLVE" &&
     (session.status === "DRAFT" || session.status === "ANALYZING") &&
     isFeatureBrief(session.featureBrief) &&
+    (session.genomeEvidence === undefined || isGenomeEvidence(session.genomeEvidence)) &&
+    (session.sourceFinding === undefined || isGovernanceFindingSource(session.sourceFinding)) &&
     isStringArray(session.referenceIds) &&
     new Set(session.referenceIds).size === session.referenceIds.length &&
     (session.error === undefined || typeof session.error === "string")
@@ -2649,6 +2693,8 @@ export function isFeatureEvolveResultSession(
       "updatedAt",
       "featureBrief",
       "referenceIds",
+      "genomeEvidence",
+      "sourceFinding",
       "uxImpact",
       "approaches",
       "agentThreadId",
@@ -2657,6 +2703,8 @@ export function isFeatureEvolveResultSession(
     (session.status === "RESULT_READY" ||
       session.status === "AWAITING_DECISION") &&
     isFeatureBrief(session.featureBrief) &&
+    (session.genomeEvidence === undefined || isGenomeEvidence(session.genomeEvidence)) &&
+    (session.sourceFinding === undefined || isGovernanceFindingSource(session.sourceFinding)) &&
     isStringArray(session.referenceIds) &&
     new Set(session.referenceIds).size === session.referenceIds.length &&
     Array.isArray(session.uxImpact) &&
@@ -2682,6 +2730,8 @@ export function isFeatureEvolveApprovedSession(
       "updatedAt",
       "featureBrief",
       "referenceIds",
+      "genomeEvidence",
+      "sourceFinding",
       "uxImpact",
       "approaches",
       "agentThreadId",
@@ -2692,6 +2742,8 @@ export function isFeatureEvolveApprovedSession(
     session.type === "FEATURE_EVOLVE" &&
     session.status === "APPROVED" &&
     isFeatureBrief(session.featureBrief) &&
+    (session.genomeEvidence === undefined || isGenomeEvidence(session.genomeEvidence)) &&
+    (session.sourceFinding === undefined || isGovernanceFindingSource(session.sourceFinding)) &&
     isStringArray(session.referenceIds) &&
     new Set(session.referenceIds).size === session.referenceIds.length &&
     Array.isArray(session.uxImpact) &&
@@ -2753,6 +2805,8 @@ export async function commitFeatureEvolveResult(
       existing.createdAt !== session.createdAt ||
       stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
       stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
+      stableJson(existing.genomeEvidence ?? null) !== stableJson(session.genomeEvidence ?? null) ||
+      stableJson(existing.sourceFinding ?? null) !== stableJson(session.sourceFinding ?? null) ||
       !canTransitionLearnSession("ANALYZING", session.status)
     ) {
       throw new Error(
@@ -2796,20 +2850,10 @@ export async function approveFeatureEvolveApproach(
   // pass the matching bounded read path.
   const approvalSessionContents = boundedSessionContents(session);
   const executeSessionContents = boundedSessionContents(executeSession);
-  const approvalClaimPath = assertPathInsideWorkspace(
-    workspace.sessionsPath,
-    join(workspace.sessionsPath, `.${session.id}.approval.claim`),
-  );
-  let approvalClaim: Awaited<ReturnType<typeof open>> | undefined;
+  return withLearnTransitionClaim(rootPath, session.projectId, session.id, "AWAITING_DECISION", async () => {
   const sessionCommitClaims: OwnedSessionCommitClaim[] = [];
 
   try {
-    approvalClaim = await open(approvalClaimPath, "wx", 0o600);
-    await approvalClaim.writeFile(
-      stableJson({ approvalId: approval.id, sessionId: session.id }),
-    );
-    await approvalClaim.sync();
-
     // Re-read after the exclusive claim. A request queued behind another
     // completed approval sees APPROVED here and fails closed.
     const existing = await loadSession(rootPath, session.projectId, session.id);
@@ -2825,6 +2869,8 @@ export async function approveFeatureEvolveApproach(
       existing.createdAt !== session.createdAt ||
       stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
       stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
+      stableJson(existing.genomeEvidence ?? null) !== stableJson(session.genomeEvidence ?? null) ||
+      stableJson(existing.sourceFinding ?? null) !== stableJson(session.sourceFinding ?? null) ||
       stableJson(existing.uxImpact) !== stableJson(session.uxImpact) ||
       stableJson(existing.approaches) !== stableJson(session.approaches) ||
       existing.agentThreadId !== session.agentThreadId ||
@@ -2952,11 +2998,8 @@ export async function approveFeatureEvolveApproach(
     for (const claim of sessionCommitClaims.reverse()) {
       await releaseSessionCommitClaim(claim);
     }
-    if (approvalClaim !== undefined) {
-      await approvalClaim.close().catch(() => undefined);
-      await unlink(approvalClaimPath).catch(() => undefined);
-    }
   }
+  }, "approval");
 }
 
 export async function loadApprovedExecutionDirection(

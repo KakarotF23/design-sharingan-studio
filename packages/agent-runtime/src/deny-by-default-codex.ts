@@ -14,8 +14,9 @@ import {
   type CodexProviderThread,
 } from "./codex-agent";
 import type { CodexAgentOptions } from "./types";
+import { isDisabledCapabilityNotice, restrictedCodexRuntime } from "./capability-runtime";
 
-export type DenyByDefaultCodexClientOptions = Pick<CodexOptions, "env">;
+export type DenyByDefaultCodexClientOptions = CodexOptions;
 
 export interface DenyByDefaultCodexClientThread {
   readonly id: string | null;
@@ -35,18 +36,6 @@ export interface DenyByDefaultCodexAgentOptions extends CodexAgentOptions {
   environment?: Readonly<Record<string, string | undefined>>;
 }
 
-const ENVIRONMENT_ALLOWLIST = [
-  "HOME",
-  "CODEX_HOME",
-  "PATH",
-  "TMPDIR",
-  "LANG",
-  "LC_ALL",
-  "CODEX_API_KEY",
-  "OPENAI_API_KEY",
-  "SSL_CERT_FILE",
-  "SSL_CERT_DIR",
-] as const;
 
 const THREAD_OPTIONS = {
   sandboxMode: "read-only",
@@ -69,15 +58,6 @@ const SAFE_ITEM_TYPES = new Set<ThreadItem["type"]>([
   "todo_list",
 ]);
 
-function minimalEnvironment(
-  source: Readonly<Record<string, string | undefined>>,
-): Record<string, string> {
-  const entries = ENVIRONMENT_ALLOWLIST.flatMap((key) => {
-    const value = source[key];
-    return value === undefined ? [] : [[key, value] as const];
-  });
-  return Object.fromEntries(entries);
-}
 
 class DenyByDefaultCodexProvider implements CodexProvider {
   constructor(private readonly client: DenyByDefaultCodexClient) {}
@@ -117,6 +97,7 @@ class DenyByDefaultCodexProvider implements CodexProvider {
               event.type === "item.updated" ||
               event.type === "item.completed")
           ) {
+            if (isDisabledCapabilityNotice(event.item)) continue;
             if (event.item.type === "error") throw new Error(event.item.message);
             if (
               FORBIDDEN_ITEM_TYPES.has(event.item.type) ||
@@ -149,9 +130,7 @@ export function createDenyByDefaultCodexAgent(
   options: DenyByDefaultCodexAgentOptions = {},
 ): CodexAgent {
   const environment = options.environment ?? process.env;
-  const clientOptions: DenyByDefaultCodexClientOptions = {
-    env: minimalEnvironment(environment),
-  };
+  const clientOptions = restrictedCodexRuntime(environment).options;
   const client = options.client ?? (
     options.createClient?.(clientOptions) ?? new Codex(clientOptions)
   );

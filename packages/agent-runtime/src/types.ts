@@ -3,6 +3,7 @@ import type { ThreadItem } from "@openai/codex-sdk";
 export type JsonSchema = Readonly<Record<string, unknown>>;
 
 export interface CodexAgentRunInput {
+  capabilityProfile?: "ANALYSIS" | "MUTATION_MIRROR";
   workingDirectory: string;
   prompt: string;
   images?: readonly string[];

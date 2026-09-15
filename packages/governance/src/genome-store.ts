@@ -2729,6 +2729,15 @@ export async function readGenome(
   return genome;
 }
 
+/** Approved product rules cross workflow boundaries only with their current signed identity. */
+export async function loadApprovedGenomeContext(rootPath: string, projectId: string) {
+  if (!await governanceIsInitialized(rootPath)) return undefined;
+  const document = await readGenome(rootPath, projectId);
+  if (document.value.status !== "APPROVED") return undefined;
+  if (!isAuthenticatedGenomeDocument(document)) throw new Error("Approved Genome lacks authenticated authority");
+  return { genome: document.value, evidence: { entityId: document.metadata.entityId, version: document.value.version, revision: document.metadata.revision, payloadHash: document.payloadHash } };
+}
+
 export async function approveGenome(
   rootPath: string,
   projectId: string,
@@ -2906,3 +2915,23 @@ export async function approveGenome(
 }
 
 export { atomicWriteDocument, safeProjectId };
+
+/** Explicit local-user decision writer. It cannot change the Genome, migrate data or grant mutation authority. */
+export async function recordApprovedNonConsequentialDecision(rootPath: string, projectId: string, decision: DesignDecision, expectedRevision: number): Promise<void> {
+  if (decision.status !== "APPROVED" || decision.approvedBy !== "local-user" || decision.migrationRequired || decision.genomeChanges.length > 0) throw new Error("Only an explicit non-consequential local-user decision is supported");
+  await withGovernanceLock(rootPath, async (directory) => {
+    const current = await readGovernanceDocument(rootPath, projectId, DESIGN_DECISIONS_FILE);
+    const registry = await readGovernanceDocument(rootPath, projectId, SCREEN_REGISTRY_FILE);
+    const genome = await readGenome(rootPath, projectId);
+    if (current.kind !== "DESIGN_DECISIONS" || registry.kind !== "SCREEN_REGISTRY" || current.revision !== expectedRevision || !isAuthenticatedGenomeDocument(genome) || current.decisions.some(({ id }) => id === decision.id)) throw new Error("Design decision identity, revision or Genome authority is invalid");
+    await assertAuthenticatedDecisionProofs(rootPath, current);
+    const normalizedDraft = assertDesignDecisions([{ ...decision, status: "DRAFT", approvedBy: undefined }], [], registry.records)[0]!;
+    const normalized: DesignDecision = { ...normalizedDraft, status: "APPROVED", approvedBy: "local-user" };
+    const { approvedBy: _approvedBy, ...payload } = normalized;
+    const unsigned: Omit<DecisionApprovalProof, "signature"> = { kind: "DESIGN_DECISION_APPROVAL", projectId, rootFingerprint: await governanceRootFingerprint(rootPath), genomeEntityId: genome.metadata.entityId, decisionId: normalized.id, decisionHash: createHash("sha256").update(JSON.stringify(payload)).digest("hex"), approvedBy: "local-user", approvedAt: normalized.date };
+    const proof = { ...unsigned, signature: decisionAuthoritySignature(await authorityKey(rootPath, false), unsigned) };
+    const metadata: DesignDecisionsMetadata = { ...current, revision: incrementGovernanceRevision(current.revision), genomeVersion: genome.value.version, genomeRevision: genome.metadata.revision, decisions: [...current.decisions, normalized], approvalProofs: [...current.approvalProofs, proof] };
+    assertDesignDecisions(metadata.decisions, metadata.approvalProofs, registry.records);
+    await atomicWriteDocument(directory, DESIGN_DECISIONS_FILE, renderDesignDecisions(metadata));
+  });
+}

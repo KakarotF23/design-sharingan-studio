@@ -238,6 +238,33 @@ function referenceScanPendingSessionFixture(
   };
 }
 
+// Production break caught: racing the first workspace initialization throws EEXIST or overwrites another caller's newly saved project metadata.
+it("initializes the fixed workspace concurrently without replacing project identity", async () => {
+  const root = await realpath(await temporaryProject());
+  const initializers = await Promise.allSettled(Array.from({ length: 12 }, () => ensureDesignWorkspace(root)));
+  expect(initializers.every((result) => result.status === "fulfilled")).toBe(true);
+  const project = projectFixture(root);
+  await Promise.all([saveProjectMetadata(project), ...Array.from({ length: 8 }, () => ensureDesignWorkspace(root))]);
+  await expect(loadProjectMetadata(root, project.id)).resolves.toEqual(project);
+});
+
+// Production break caught: malformed metadata must remain an error, never be reset to an empty workspace during initialization recovery.
+it("preserves malformed project JSON and refuses to infer its identity", async () => {
+  const root = await realpath(await temporaryProject()); await saveProjectMetadata(projectFixture(root));
+  const path = join(root, ".design-sharingan/project.json"); await writeFile(path, "{ malformed");
+  await expect(loadProjectMetadata(root, "project-1")).rejects.toThrow();
+  expect(await readFile(path, "utf8")).toBe("{ malformed");
+});
+
+// Production break caught: a generic Learn transition can silently switch the reference/source identity while preserving a session id.
+it("rejects reference identity substitution at the intrinsic Learn transition boundary", async () => {
+  const root = await temporaryProject(); await saveProjectMetadata(projectFixture(root));
+  const draft = referenceScanPendingSessionFixture(); await saveSession(root, draft);
+  const substituted = { ...draft, status: "ANALYZING" as const, referenceId: "different-reference", updatedAt: "2026-08-24T10:01:00.000Z" };
+  await expect(transitionLearnSession(root, "DRAFT", substituted)).rejects.toThrow(/identity/);
+  await expect(loadSession(root, "project-1", draft.id)).resolves.toEqual(draft);
+});
+
 function referenceScanResultSessionFixture(
   id = "session-1",
   designDNA = designDNAFixture(),
@@ -511,6 +538,23 @@ it.each([
 });
 
 type ApprovalCheckpointFixture = ReturnType<typeof approvalCheckpoint>;
+
+// Production break caught: an interrupted approval leaves an exclusive file forever, even when its owner died and the authenticated source session is unchanged.
+it("recovers an owner-bound expired approval claim against its authenticated source checkpoint", async () => {
+  const root = await temporaryProject();
+  await saveProjectMetadata(projectFixture(root));
+  const awaiting = featureEvolveResultSessionFixture("AWAITING_DECISION");
+  await saveSession(root, awaiting);
+  const head = JSON.parse(await readFile(join(root, ".design-sharingan/activity", `${awaiting.id}.session-head.json`), "utf8"));
+  await writeFile(join(root, ".design-sharingan/sessions", `.${awaiting.id}.approval.claim`), JSON.stringify({
+    kind: "DESIGN_SHARINGAN_LEARN_CLAIM", ownerId: "11111111-1111-4111-8111-111111111111", pid: 2_147_483_646,
+    projectId: "project-1", sessionId: awaiting.id, expectedStatus: "AWAITING_DECISION", expectedSessionHash: head.sessionHash,
+    leaseExpiresAt: "2026-08-24T09:00:01.000Z",
+  }));
+  await approveFeatureEvolveApproach(root, approvalCheckpoint(awaiting, "approach-guided-queue", "recovered"));
+  expect((await loadSession(root, "project-1", awaiting.id)).status).toBe("APPROVED");
+  expect((await loadApprovedExecutionDirection(root, "project-1")).id).toBe("safe-execution-recovered");
+});
 
 const incoherentTimestampCases: readonly [
   string,

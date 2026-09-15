@@ -100,7 +100,7 @@ function validateRepositoryUrl(repositoryUrl: string): void {
 }
 
 function validateBranch(branch: string): void {
-  if (branch.trim() === "" || /[\0\r\n]/.test(branch)) {
+  if (branch.length === 0 || branch.length > 1024 || branch === "@" || branch.startsWith("-") || branch.endsWith(".") || branch.includes("..") || branch.includes("@{") || /[\u0000-\u0020\u007f~^:?*\[\\]/.test(branch) || branch.split("/").some((part) => part.length === 0 || part.startsWith(".") || part.endsWith(".lock"))) {
     throw new Error("A valid Git branch is required");
   }
 }

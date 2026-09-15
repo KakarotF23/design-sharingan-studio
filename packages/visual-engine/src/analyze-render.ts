@@ -40,6 +40,7 @@ export interface AnalyzeRenderInput {
   analysisWorkingDirectory: string;
   screen: string;
   referenceImages: readonly VisualReferenceImage[];
+  comparisonMode?: "REFERENCE" | "APPROVED_DIRECTION";
   currentRender: RenderArtifact;
   productContext: VisualProductContext;
   genome?: DesignGenome;
@@ -183,6 +184,7 @@ async function validateImage(
 
 function analysisPrompt(input: AnalyzeRenderInput): string {
   return [
+    input.comparisonMode === "APPROVED_DIRECTION" ? "Verify the actual current render against the explicitly approved product direction. No reference-similarity claim is possible when reference evidence is absent." : "Compare reference intent with the actual current render.",
     "Inspect the rendered image output and the supplied reference image evidence, not source code as a substitute for rendered evidence.",
     "Apply this exact product-law priority: UX integrity > product consistency > accessibility > visual hierarchy > reference intent > pixel similarity.",
     "Return explicit evidence-backed UX integrity, product consistency, accessibility, and Genome integrity verification. Use NOT_VERIFIED when evidence is missing; never infer PASS from an empty finding list.",
@@ -220,7 +222,7 @@ export async function analyzeRender(
     !safeIdentifier(input.projectId) ||
     !boundedText(input.screen, 512) ||
     input.screen !== input.currentRender.route ||
-    input.referenceImages.length === 0 ||
+    (input.referenceImages.length === 0 && input.comparisonMode !== "APPROVED_DIRECTION") ||
     input.referenceImages.length > MAX_REFERENCE_IMAGES ||
     !boundedText(input.productContext.name, 256) ||
     !boundedText(input.productContext.approvedDirection) ||

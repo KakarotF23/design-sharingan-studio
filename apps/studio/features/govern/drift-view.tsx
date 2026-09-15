@@ -24,9 +24,13 @@ function ScopeList({
 function DriftCard({
   finding,
   executeHref,
+  busy,
+  onApproveDebt,
 }: {
   finding: DriftFinding;
   executeHref: string;
+  busy: boolean;
+  onApproveDebt?(key: string, rationale: string): Promise<void>;
 }) {
   return (
     <article className="drift-card">
@@ -53,10 +57,11 @@ function DriftCard({
       {finding.requiresDesignDecision ? (
         <p className="drift-card__decision">Human design decision required before this becomes a product rule.</p>
       ) : null}
-      <a className="secondary-action" href={executeHref}>
+      {finding.handoffKey && !["RESOLVED", "INTENTIONAL"].includes(finding.status) ? <a className="secondary-action" href={`${executeHref}?finding=${finding.handoffKey}`}>
         <span>Send to Execute</span>
         <span aria-hidden="true">→</span>
-      </a>
+      </a> : <p>{finding.status === "RESOLVED" ? "Resolved by fresh evidence." : "No executable current finding."}</p>}
+      {finding.handoffKey && finding.severity === "POLISH" && !finding.requiresDesignDecision && !["RESOLVED", "INTENTIONAL"].includes(finding.status) && onApproveDebt ? <form onSubmit={(event) => { event.preventDefault(); const rationale = new FormData(event.currentTarget).get("rationale"); if (typeof rationale === "string") void onApproveDebt(finding.handoffKey!, rationale); }}><label>Why is this safe to defer?<textarea name="rationale" required maxLength={2000} disabled={busy} /></label><p>This explicitly records a human decision, not a Genome rewrite. Recapture this scope afterward; accepting debt does not make stale evidence pass.</p><button className="secondary-action" disabled={busy}>Approve documented polish debt</button></form> : null}
     </article>
   );
 }
@@ -66,11 +71,13 @@ export function DriftView({
   busy,
   onAudit,
   executeHref,
+  onApproveDebt,
 }: {
   report?: DriftReport;
   busy: boolean;
   onAudit(): void;
   executeHref: string;
+  onApproveDebt?(key: string, rationale: string): Promise<void>;
 }) {
   return (
     <section className="drift-view" aria-labelledby="drift-audit-title">
@@ -113,6 +120,8 @@ export function DriftView({
                   key={`${finding.category}:${finding.scope}:${finding.expectedRule}`}
                   finding={finding}
                   executeHref={executeHref}
+                  busy={busy}
+                  onApproveDebt={onApproveDebt}
                 />
               ))}
             </div>

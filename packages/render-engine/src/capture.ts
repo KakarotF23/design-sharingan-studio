@@ -34,6 +34,9 @@ const UNVERSIONED_EXCLUDED_DIRECTORIES = new Set([
   "build",
   "coverage",
 ]);
+// Audit publication is an output of render verification, not an input to it.
+// The Genome and Design Decisions remain source inputs and still invalidate evidence.
+const GENERATED_AUDIT_OUTPUTS = new Set(["design-governance/DRIFT-REPORT.md", "design-governance/SCREEN-REGISTRY.md"]);
 
 export interface RenderViewport {
   name: string;
@@ -45,6 +48,7 @@ export interface PageHandle {
   goto(url: string): Promise<unknown>;
   url(): string;
   screenshot(): Promise<Uint8Array>;
+  evaluate?(fn: () => string | null): Promise<string | null>;
   close(): Promise<void>;
 }
 
@@ -70,6 +74,7 @@ export interface CaptureRenderOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   requiredSourcePaths?: readonly string[];
+  expectedState?: string;
 }
 
 export interface CaptureRenderResult {
@@ -476,6 +481,8 @@ const SOURCE_PATHSPECS = [
   ".",
   ":(exclude).design-sharingan",
   ":(exclude).design-sharingan/**",
+  ":(exclude)design-governance/DRIFT-REPORT.md",
+  ":(exclude)design-governance/SCREEN-REGISTRY.md",
 ] as const;
 const IGNORED_RENDER_INPUT_PATHSPECS = [
   ".env*",
@@ -586,6 +593,7 @@ async function unversionedSourcePaths(rootPath: string): Promise<string[]> {
         throw new Error("Unversioned source evidence contained an unsafe path");
       }
       const path = directory === "" ? entry.name : `${directory}/${entry.name}`;
+      if (GENERATED_AUDIT_OUTPUTS.has(path)) continue;
       safeEvidenceText(path, 1024, false);
       if (entry.isDirectory() && UNVERSIONED_EXCLUDED_DIRECTORIES.has(entry.name)) {
         continue;
@@ -762,7 +770,15 @@ export async function captureRender(options: CaptureRenderOptions): Promise<Capt
     ) {
       throw new Error("Captured page did not remain on the requested route");
     }
+    const assertCapturedState = async () => {
+      if (options.expectedState === undefined) return;
+      if (page?.evaluate === undefined) throw new Error("Captured state cannot be authenticated");
+      const state = await stage(page.evaluate(() => document.querySelector("[data-design-state]")?.getAttribute("data-design-state") ?? null), "rendered state");
+      if ((options.expectedState === "default" && state !== null && state !== "default") || (options.expectedState !== "default" && state !== options.expectedState)) throw new Error("Captured page does not attest the requested state");
+    };
+    await assertCapturedState();
     screenshot = await stage(page.screenshot(), "screenshot");
+    await assertCapturedState();
     assertPng(screenshot, options.viewport);
   } catch (error) {
     captureError = error;

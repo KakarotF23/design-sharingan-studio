@@ -431,6 +431,7 @@ function visualRound(value: unknown, session: MangekyoLoopSession): value is Vis
     "accessibility",
     "genomeIntegrity",
     ...(Object.hasOwn(value as object, "genomeEvidenceVersion") ? ["genomeEvidenceVersion"] : []),
+    ...(Object.hasOwn(value as object, "genomeEvidence") ? ["genomeEvidence"] : []),
     "status",
   ])) return false;
   return (
@@ -457,6 +458,7 @@ function visualRound(value: unknown, session: MangekyoLoopSession): value is Vis
     integrity(value.accessibility) &&
     integrity(value.genomeIntegrity) &&
     (value.genomeEvidenceVersion === undefined || text(value.genomeEvidenceVersion, 128)) &&
+    (value.genomeEvidence === undefined || (isGenomeEvidence(value.genomeEvidence) && value.genomeEvidence.version === value.genomeEvidenceVersion)) &&
     ((value.genomeIntegrity as { status?: unknown }).status === "NOT_VERIFIED"
       ? value.genomeEvidenceVersion === undefined
       : value.genomeEvidenceVersion !== undefined) &&
@@ -2176,3 +2178,4 @@ export async function loadMangekyoRenderImage(
     await handle.close();
   }
 }
+import { isGenomeEvidence } from "@design-sharingan/core";

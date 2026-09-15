@@ -16,7 +16,10 @@ export async function GET(
   } catch (error) {
     if (
       error instanceof Error &&
-      /session commit is still in progress; committed head remains authoritative/i.test(error.message)
+      (/session commit is still in progress; committed head remains authoritative/i.test(error.message) || [
+        "Mangekyo active-loop claim is missing, stale, or ambiguous",
+        "A live durable Mangekyo worker lease is not owned by this server process",
+      ].includes(error.message))
     ) {
       return Response.json(
         { error: "Mangekyō evidence is being committed; retry shortly." },

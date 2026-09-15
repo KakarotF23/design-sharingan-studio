@@ -79,6 +79,14 @@ class FixtureGitRunner implements GitRunner {
   }
 }
 
+// Production break caught: syntactically impossible Git refs allocate a checkout and reach clone before validation.
+it.each(["-option", "bad..ref", "bad@{ref", "bad ref", "bad//ref", "bad.lock", "bad~ref", "/main", "main/", ".hidden", "@"])("rejects invalid ref %s before filesystem allocation or Git", async (branch) => {
+  const parent = await cloneParent(); const gitRunner = new FixtureGitRunner();
+  await expect(new GitHubProjectAdapter({ gitRunner }).open({ repositoryUrl: "https://github.com/example/project", branch, destinationPath: join(parent, "checkout") })).rejects.toThrow(/branch|ref/);
+  expect(gitRunner.calls).toHaveLength(0);
+  expect(await readdir(parent)).toEqual([]);
+});
+
 async function runFixtureGit(cwd: string, args: readonly string[]): Promise<void> {
   await defaultGitRunner.run({ executable: "git", args, cwd });
 }

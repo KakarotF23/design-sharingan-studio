@@ -133,6 +133,9 @@ export function GovernWorkspace() {
   const [projection, setProjection] = useState<GovernanceProjection>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [notice, setNotice] = useState<string>();
+  const [auditScope, setAuditScope] = useState<"SELECTED_SCREENS" | "WHOLE_APP">("SELECTED_SCREENS");
+  const [selectedStates, setSelectedStates] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     const response = await fetch(
@@ -173,7 +176,7 @@ export function GovernWorkspace() {
   }, [load, setShellGenome]);
 
   async function action(
-    endpoint: "initialize" | "approve" | "audit" | "release",
+    endpoint: "initialize" | "approve" | "audit" | "release" | "capture",
     acceptedClaimId?: string,
   ) {
     setBusy(true);
@@ -186,7 +189,7 @@ export function GovernWorkspace() {
               expectedPayloadHash: projection.genome.payloadHash,
               ...(acceptedClaimId === undefined ? {} : { acceptedClaimId }),
             }
-          : {};
+          : endpoint === "capture" && projection?.initialized ? { requestedScope: auditScope, expectedScope: projection.screens.flatMap((screen) => { const states = auditScope === "WHOLE_APP" ? screen.requiredStates : screen.requiredStates.filter((state) => selectedStates.includes(`${screen.route}#${state}`)); return states.length === 0 ? [] : [{ screen: screen.route, states }]; }) } : {};
       const response = await fetch(
         `/projects/${encodeURIComponent(project.id)}/govern/${endpoint}`,
         {
@@ -226,8 +229,20 @@ export function GovernWorkspace() {
     }
   }
 
+  async function approveDebt(findingKey: string, rationale: string) {
+    setBusy(true); setError(undefined); setNotice(undefined);
+    try {
+      const response = await fetch(`/projects/${encodeURIComponent(project.id)}/govern/finding`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ findingKey, rationale }) });
+      const payload = await response.json(); if (!response.ok) throw new Error(payload.error);
+      setProjection(await load());
+      setNotice("Polish debt approved and recorded in Design Decisions. Recapture the affected scope before evaluating release.");
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "Debt approval failed closed."); }
+    finally { setBusy(false); }
+  }
+
   return (
     <div className="govern-workspace" aria-busy={busy}>
+      {notice ? <p role="status" aria-live="polite">{notice}</p> : null}
       <WorkspaceHeader
         eyebrow={`PRODUCT MEMORY / ${project.name.toUpperCase()}`}
         title="Govern"
@@ -267,11 +282,13 @@ export function GovernWorkspace() {
             onApprove={(acceptedClaimId) => action("approve", acceptedClaimId)}
           />
           <ScreenRegistry screens={projection.screens} />
+          <section className="genome-rule-group"><h2>Capture governed evidence</h2><p>Read-only browser smoke and visual rule checks. Unexercised interactive behavior and unavailable states cannot pass. Selected scope never becomes a whole-product claim.</p><label>Audit scope<select value={auditScope} onChange={(event) => setAuditScope(event.target.value as typeof auditScope)}><option value="SELECTED_SCREENS">Selected screens and states</option><option value="WHOLE_APP">Whole product — every registered state</option></select></label><fieldset disabled={auditScope === "WHOLE_APP" || busy}><legend>Screen states</legend>{projection.screens.flatMap((screen) => screen.requiredStates.map((state) => { const key = `${screen.route}#${state}`; return <label key={key}><input type="checkbox" checked={selectedStates.includes(key)} onChange={(event) => setSelectedStates((current) => event.target.checked ? [...current, key] : current.filter((value) => value !== key))} />{key}</label>; }))}</fieldset><button className="secondary-action" disabled={busy || projection.genome.status !== "APPROVED" || (auditScope === "SELECTED_SCREENS" && selectedStates.length === 0)} onClick={() => void action("capture")}>Capture and audit selected scope</button></section>
           <DriftView
             report={projection.drift}
             busy={busy}
             onAudit={() => action("audit")}
             executeHref={`/projects/${encodeURIComponent(project.id)}/execute`}
+            onApproveDebt={approveDebt}
           />
           <ReleaseGateView
             release={projection.release}

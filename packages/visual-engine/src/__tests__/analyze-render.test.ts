@@ -78,6 +78,18 @@ describe("analyzeRender", () => {
     };
   }
 
+  // Production break: Safe execution without an uploaded reference cannot inspect its fresh render against the approved direction.
+  it("allows direction-only render verification only through the explicit approved-direction contract", async () => {
+    const input = { projectId: "project-1", projectRoot, analysisWorkingDirectory, screen: "/", referenceImages: [], currentRender: artifact(), productContext: { name: "Product", approvedDirection: "Keep stable navigation", uxInvariants: ["Keep navigation"], designSystem: [] } };
+    const output = { ...wireOutput, verification: { ...wireOutput.verification, genomeIntegrity: { status: "NOT_VERIFIED" as const, evidence: ["No approved Genome"] } } };
+    let images: readonly string[] | undefined;
+    const dependencies = { createId: () => "finding-safe", agent: { async run<T>(request: CodexAgentRunInput) { images = request.images; return { threadId: "visual-safe", finalResponse: JSON.stringify(output), structured: output as T, items: [] }; } } };
+    await expect(analyzeRender(input, dependencies)).rejects.toThrow(/invalid/);
+    const result = await analyzeRender({ ...input, comparisonMode: "APPROVED_DIRECTION" }, dependencies);
+    expect(images).toHaveLength(1);
+    expect(result.verification.genomeIntegrity.status).toBe("NOT_VERIFIED");
+  });
+
   // Production break caught: replacing render inspection with source inspection or omitting actual images leaves visual findings unsupported by rendered evidence.
   it("sends the actual project-scoped reference and render images through a bounded structured analysis", async () => {
     let runInput: CodexAgentRunInput | undefined;

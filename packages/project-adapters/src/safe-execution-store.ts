@@ -1,5 +1,3 @@
-import { constants } from "node:fs";
-import { open, rm } from "node:fs/promises";
 import { isAbsolute, join, posix } from "node:path";
 import type {
   Approval,
@@ -9,6 +7,9 @@ import type {
   FeatureBrief,
   SafeMutationFailureEvidence,
   SafeExecutionStatus,
+  RenderArtifact,
+  VisualFinding,
+  VisualIntegrityVerification,
   UXImpact,
 } from "@design-sharingan/core";
 import { canTransitionSafeExecution } from "@design-sharingan/core";
@@ -20,6 +21,8 @@ import {
   listSessions,
   loadSession,
   saveSession,
+  assertRenderArtifactIntegrity,
+  withLearnTransitionClaim,
 } from "./workspace-store";
 import type {
   FeatureEvolveApprovedSession,
@@ -40,6 +43,7 @@ export interface SafeProposalHistoryEntry {
   proposalThreadId: string;
   proposedAt: string;
   decisionApproval?: Approval;
+  renderVerification?: { render: RenderArtifact; analysis: SafeRenderVerification };
 }
 
 export interface SafeExecutionPreparingSession extends SafeExecutionBase {
@@ -52,6 +56,7 @@ export interface SafeExecutionProposingSession extends SafeExecutionBase {
   previousProposal?: ChangeProposal;
   previousProposalThreadId?: string;
   proposalHistory?: SafeProposalHistoryEntry[];
+  verifiedMutation?: SafeExecutionVerificationSession;
 }
 
 export interface SafeExecutionWaitingSession extends SafeExecutionBase {
@@ -120,6 +125,18 @@ export interface SafeExecutionEditingSession extends SafeExecutionBase {
   proposalHistory: SafeProposalHistoryEntry[];
 }
 
+export interface SafeRenderVerification {
+  threadId: string;
+  findings: VisualFinding[];
+  verification: Record<"uxIntegrity" | "productConsistency" | "accessibility" | "genomeIntegrity", VisualIntegrityVerification>;
+}
+export interface SafeExecutionVerificationSession extends Omit<SafeExecutionEditingSession, "status"> {
+  status: "RUNNING" | "CAPTURING" | "VERIFYING" | "COMPLETE" | "FAILED";
+  render?: RenderArtifact;
+  analysis?: SafeRenderVerification;
+  error?: string;
+}
+
 export type SafeExecutionSession =
   | SafeExecutionDraftSession
   | SafeExecutionPreparingSession
@@ -127,7 +144,11 @@ export type SafeExecutionSession =
   | SafeExecutionWaitingSession
   | SafeExecutionDecisionSession
   | SafeExecutionApprovedSession
-  | SafeExecutionEditingSession;
+  | SafeExecutionEditingSession
+  | SafeExecutionVerificationSession;
+// A completed mutation continues through the same durable Safe session.
+export type SafeExecutionLifecycleSession = SafeExecutionSession | SafeExecutionVerificationSession;
+export type SafeExecutionAppliedSession = SafeExecutionEditingSession | SafeExecutionVerificationSession;
 
 type PrepareSource = SafeExecutionProposingSession;
 
@@ -421,6 +442,7 @@ function isProposalHistory(
       Object.hasOwn(entry, "decisionApproval")
         ? ["proposal", "proposalThreadId", "proposedAt", "decisionApproval"]
         : ["proposal", "proposalThreadId", "proposedAt"];
+    if (entry && typeof entry === "object" && Object.hasOwn(entry, "renderVerification")) keys.push("renderVerification");
     if (
       !exactKeys(entry, keys) ||
       !isChangeProposal(entry.proposal) ||
@@ -451,9 +473,16 @@ function isProposalHistory(
         !nonEmpty(entry.decisionApproval.comment, 2_000)) ||
       Date.parse(entry.decisionApproval.createdAt) < Date.parse(entry.proposedAt) ||
       (index < value.length - 1 &&
-        entry.decisionApproval.decision !== "REVISION_REQUESTED")
+        entry.decisionApproval.decision !== "REVISION_REQUESTED" &&
+        !(entry.decisionApproval.decision === "APPROVED" && entry.renderVerification !== undefined))
     ) {
       return false;
+    }
+    if (entry.renderVerification !== undefined) {
+      const proof = entry.renderVerification;
+      if (!exactKeys(proof, ["render", "analysis"]) || !proof.render || typeof proof.render !== "object") return false;
+      const render = proof.render as RenderArtifact;
+      if (render.sessionId !== sessionId || !isIsoTimestamp(render.capturedAt) || Date.parse(render.capturedAt) < Date.parse(entry.decisionApproval.createdAt) || !render.sourceRevision?.available || !isSafeRenderVerification(proof.analysis, render.route) || safeVerificationComplete(proof.analysis) || entry.decisionApproval.decision !== "APPROVED") return false;
     }
     approvalIds.add(entry.decisionApproval.id);
     priorDecisionAt = entry.decisionApproval.createdAt;
@@ -623,15 +652,38 @@ function isMutationEvidence(value: unknown): value is SafeMutationEvidence {
   );
 }
 
+export function isSafeRenderVerification(value: unknown, route?: string): value is SafeRenderVerification {
+  if (!exactKeys(value, ["threadId", "findings", "verification"]) || !nonEmpty(value.threadId, 256) || !Array.isArray(value.findings) || value.findings.length > 64 || !exactKeys(value.verification, ["uxIntegrity", "productConsistency", "accessibility", "genomeIntegrity"])) return false;
+  return Object.values(value.verification).every((check) => exactKeys(check, ["status", "evidence"]) && ["PASS", "REGRESSION", "CONFLICT", "NOT_VERIFIED"].includes(check.status as string) && stringArray(check.evidence, 16, 2000) && check.evidence.length > 0) && value.findings.every((finding) => exactKeys(finding, ["id", "severity", "category", "screen", "description", "evidence", "reason", "recommendedAction", "status"]) && safeIdentifier(finding.id) && ["CRITICAL", "IMPORTANT", "POLISH", "IGNORE"].includes(finding.severity as string) && finding.screen === route && nonEmpty(finding.category, 40) && nonEmpty(finding.description) && nonEmpty(finding.reason) && nonEmpty(finding.recommendedAction) && finding.status === "OPEN" && stringArray(finding.evidence, 16, 2000) && finding.evidence.length > 0);
+}
+function safeVerificationComplete(analysis: SafeRenderVerification): boolean {
+  return !analysis.findings.some((finding) => ["CRITICAL", "IMPORTANT"].includes(finding.severity)) && [analysis.verification.uxIntegrity, analysis.verification.productConsistency, analysis.verification.accessibility].every((check) => check.status === "PASS") && ["PASS", "NOT_VERIFIED"].includes(analysis.verification.genomeIntegrity.status);
+}
+
 export function isSafeExecutionSession(value: unknown): value is SafeExecutionSession {
   if (!isSafeBase(value)) return false;
   const session = value as Partial<SafeExecutionSession> & Record<string, unknown>;
+  if (["RUNNING", "CAPTURING", "VERIFYING", "COMPLETE", "FAILED"].includes(session.status as string)) {
+    const record = value as SafeExecutionVerificationSession;
+    const { render, analysis, error, ...editing } = record;
+    if (!isSafeExecutionSession({ ...editing, status: "EDITING", updatedAt: record.mutationEvidence?.completedAt }) || !exactKeys(value, [...baseKeys, "proposal", "proposalThreadId", "mutationApproval", "mutationEvidence", "proposalHistory", ...(render === undefined ? [] : ["render"]), ...(analysis === undefined ? [] : ["analysis"]), ...(error === undefined ? [] : ["error"])])) return false;
+    if (Date.parse(record.updatedAt) < Date.parse(record.mutationEvidence.completedAt)) return false;
+    if (render !== undefined && (render.sessionId !== record.id || !safeIdentifier(render.id) || !isIsoTimestamp(render.capturedAt) || Date.parse(render.capturedAt) < Date.parse(record.mutationEvidence.completedAt) || !render.sourceRevision.available || render.sourceRevision.truncated)) return false;
+    if (analysis !== undefined && !isSafeRenderVerification(analysis, render?.route)) return false;
+    if (record.status === "RUNNING" || record.status === "CAPTURING") return render === undefined && analysis === undefined && error === undefined;
+    if (record.status === "FAILED") return nonEmpty(error);
+    return render !== undefined && error === undefined && (record.status === "VERIFYING" || (analysis !== undefined && safeVerificationComplete(analysis)));
+  }
   switch (session.status) {
     case "IDLE":
       return isSafeExecutionDraftSession(value);
     case "PREPARING":
       return exactKeys(value, baseKeys);
     case "PROPOSING": {
+      if (Object.hasOwn(value, "verifiedMutation")) {
+        const prior = session.verifiedMutation as SafeExecutionVerificationSession;
+        return exactKeys(value, [...baseKeys, "revisionRequest", "previousProposal", "previousProposalThreadId", "proposalHistory", "verifiedMutation"]) && isSafeExecutionSession(prior) && prior.status === "VERIFYING" && prior.analysis !== undefined && !safeVerificationComplete(prior.analysis) && prior.id === session.id && prior.projectId === session.projectId && stableJson(prior.proposal) === stableJson(session.previousProposal) && prior.proposalThreadId === session.previousProposalThreadId && stableJson(prior.proposalHistory) === stableJson(session.proposalHistory) && nonEmpty(session.revisionRequest, 2000);
+      }
       const keys = [
         ...baseKeys,
         ...(Object.hasOwn(value, "revisionRequest") ? ["revisionRequest"] : []),
@@ -875,10 +927,11 @@ export async function loadSafeExecutionState(
 ): Promise<SafeExecutionSession> {
   try {
     const history = await loadSafeExecutionHistory(rootPath, projectId);
-    if (history.length !== 1) {
+    const active = history.filter((session) => !["COMPLETE", "FAILED", "REJECTED"].includes(session.status) && !(session.status === "APPROVED" && session.executionFailure !== undefined));
+    if (active.length > 1 || history.length === 0) {
       throw new Error("Safe execution state is missing, ambiguous, or invalid");
     }
-    return history[0]!;
+    return active[0] ?? [...history].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id))[0]!;
   } catch (error) {
     // A process can be interrupted after replacing the session record but
     // before its activity journal reaches disk. Recover only that explicit
@@ -904,11 +957,23 @@ export async function loadSafeExecutionState(
   }
 }
 
-/**
- * Authenticate every retained Safe execution. The active runtime still uses
- * the singleton loader above; Reports deliberately consume this history so a
- * project can retain more than one valid execution.
- */
+/** Retain the final capture and failed verification evidence across new proposals. */
+export function safeExecutionRenders(session: SafeExecutionSession): RenderArtifact[] {
+  return [
+    ...("render" in session && session.render !== undefined ? [session.render] : []),
+    ...("verifiedMutation" in session && session.verifiedMutation?.render !== undefined ? [session.verifiedMutation.render] : []),
+    ...("proposalHistory" in session ? (session.proposalHistory ?? []).flatMap((entry) => entry.renderVerification === undefined ? [] : [entry.renderVerification.render]) : []),
+  ];
+}
+
+async function authenticateRetainedSafeRenders(rootPath: string, session: SafeExecutionSession): Promise<void> {
+  for (const render of safeExecutionRenders(session)) {
+    if (render.sessionId !== session.id) throw new Error("Safe render belongs to another session");
+    await assertRenderArtifactIntegrity(rootPath, render);
+  }
+}
+
+/** Authenticate all retained Safe sessions; active selection separately rejects multiple unfinished directions. */
 export async function loadSafeExecutionHistory(
   rootPath: string,
   projectId: string,
@@ -925,6 +990,7 @@ export async function loadSafeExecutionHistory(
       throw new Error("Approved Feature EVOLVE source evidence is invalid");
     }
     assertSafeExecutionSourceRelation(projectId, record, source);
+    await authenticateRetainedSafeRenders(rootPath, record);
     authenticated.push(record);
   }
   return authenticated;
@@ -951,6 +1017,7 @@ export async function loadSafeExecutionHistoryForSessions(
       throw new Error("Approved Feature EVOLVE source evidence is invalid");
     }
     assertSafeExecutionSourceRelation(projectId, record, source);
+    await authenticateRetainedSafeRenders(rootPath, record);
     authenticated.push(record);
   }
   return authenticated;
@@ -970,42 +1037,8 @@ export async function loadSafeExecutionForSource(
     throw new Error("Linked Safe execution evidence is invalid");
   }
   assertSafeExecutionSourceRelation(projectId, record, source);
+  await authenticateRetainedSafeRenders(rootPath, record);
   return record;
-}
-
-async function acquireSessionClaim(
-  rootPath: string,
-  projectId: string,
-  sessionId: string,
-): Promise<{ handle: Awaited<ReturnType<typeof open>>; path: string }> {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(sessionId)) {
-    throw new Error("Safe execution session id is invalid");
-  }
-  // Validate the project/session locator before touching its runtime claim.
-  await loadSession(rootPath, projectId, sessionId);
-  const workspace = await ensureDesignWorkspace(rootPath);
-  const claimPath = assertPathInsideWorkspace(
-    workspace.sessionsPath,
-    join(workspace.sessionsPath, `.${sessionId}.safe-execution.claim`),
-  );
-  try {
-    const handle = await open(
-      claimPath,
-      constants.O_WRONLY |
-        constants.O_CREAT |
-        constants.O_EXCL |
-        constants.O_NOFOLLOW,
-      0o600,
-    );
-    await handle.writeFile(`${sessionId}\n`, "utf8");
-    await handle.sync();
-    return { handle, path: claimPath };
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-      throw new Error("Safe execution claim is already in progress");
-    }
-    throw error;
-  }
 }
 
 async function withSessionClaim<T>(
@@ -1014,13 +1047,8 @@ async function withSessionClaim<T>(
   sessionId: string,
   action: () => Promise<T>,
 ): Promise<T> {
-  const claim = await acquireSessionClaim(rootPath, projectId, sessionId);
-  try {
-    return await action();
-  } finally {
-    await claim.handle.close().catch(() => undefined);
-    await rm(claim.path, { force: true }).catch(() => undefined);
-  }
+  const source = await loadSession(rootPath, projectId, sessionId);
+  return withLearnTransitionClaim(rootPath, projectId, sessionId, source.status, action, "safe-execution");
 }
 
 function transitionedBase<TStatus extends SafeExecutionStatus>(
@@ -1057,7 +1085,7 @@ export async function prepareSafeExecutionProposal(
     const starting = await loadSafeExecutionState(rootPath, projectId);
     if (
       starting.id !== sessionId ||
-      (starting.status !== "IDLE" && starting.status !== "REVISING")
+      (starting.status !== "IDLE" && starting.status !== "REVISING" && !(starting.status === "PROPOSING" && starting.verifiedMutation !== undefined))
     ) {
       throw new Error("Safe execution is not ready to prepare a proposal");
     }
@@ -1067,6 +1095,8 @@ export async function prepareSafeExecutionProposal(
         const preparing = transitionedBase(starting, "PREPARING");
         await saveSafeExecutionSession(rootPath, preparing);
         proposing = transitionedBase(preparing, "PROPOSING");
+      } else if (starting.status === "PROPOSING") {
+        proposing = starting;
       } else {
         if (starting.proposalHistory.length >= 16) {
           throw new Error("Safe Mode proposal history is at its bounded limit");
@@ -1266,6 +1296,25 @@ async function persistReconciliationCheckpoint(
   );
 }
 
+/** A hard crash cannot run the executor's catch handler. Authenticate its abandoned APPLYING claim before publishing recovery-only state. */
+export async function recoverInterruptedSafeExecution(
+  rootPath: string,
+  projectId: string,
+  inspectClaim: () => Promise<{ claimId: string; proposalId: string; phase: "PREPARING" | "APPLYING"; ownerState: "ACTIVE" | "ABANDONED" } | undefined>,
+): Promise<SafeExecutionSession> {
+  const source = await loadSafeExecutionState(rootPath, projectId);
+  if (source.status !== "APPROVED" || source.executionFailure !== undefined) return source;
+  const claim = await inspectClaim();
+  if (claim === undefined || !/^[a-f0-9]{64}$/.test(claim.claimId) || claim.proposalId !== source.proposal.id || claim.phase !== "APPLYING" || claim.ownerState !== "ABANDONED") return source;
+  return withSessionClaim(rootPath, projectId, source.id, async () => {
+    const current = await loadSafeExecutionState(rootPath, projectId);
+    const currentClaim = await inspectClaim();
+    if (current.id !== source.id || current.status !== "APPROVED" || current.executionFailure !== undefined || stableJson(current) !== stableJson(source) || stableJson(currentClaim ?? null) !== stableJson(claim)) throw new Error("Interrupted mutation claim or approved checkpoint changed");
+    await persistReconciliationCheckpoint(rootPath, current, new Error("Authenticated abandoned target mutation requires explicit recovery"));
+    return loadSafeExecutionState(rootPath, projectId);
+  });
+}
+
 export async function approveAndExecuteSafeProposal(
   rootPath: string,
   projectId: string,
@@ -1346,5 +1395,49 @@ export async function approveAndExecuteSafeProposal(
       await persistReconciliationCheckpoint(rootPath, approved, error);
       throw error;
     }
+  });
+}
+
+/** Render/process callbacks live in their packages; this owns durable Safe transitions and evidence authority. */
+export async function verifySafeExecution(rootPath: string, projectId: string, sessionId: string, dependencies: {
+  run(): Promise<void>;
+  capture(session: SafeExecutionEditingSession): Promise<RenderArtifact>;
+  verify(render: RenderArtifact): Promise<SafeRenderVerification>;
+  currentSourceFingerprint(): Promise<string>;
+  stop(): Promise<void>;
+}): Promise<SafeExecutionVerificationSession | SafeExecutionProposingSession> {
+  return withSessionClaim(rootPath, projectId, sessionId, async () => {
+    const source = await loadSafeExecutionState(rootPath, projectId);
+    if (source.id !== sessionId || source.status !== "EDITING") throw new Error("Safe execution is not ready for fresh verification");
+    let session: SafeExecutionVerificationSession = { ...source, status: "RUNNING", updatedAt: new Date().toISOString() };
+    try {
+      await saveSafeExecutionSession(rootPath, session);
+      await dependencies.run();
+      session = { ...session, status: "CAPTURING", updatedAt: new Date().toISOString() };
+      await saveSafeExecutionSession(rootPath, session);
+      const render = await dependencies.capture(source);
+      await assertRenderArtifactIntegrity(rootPath, render);
+      if (render.sessionId !== session.id || Date.parse(render.capturedAt) < Date.parse(source.mutationEvidence.completedAt) || !render.sourceRevision.available || render.sourceRevision.truncated || render.sourceRevision.worktreeFingerprint !== await dependencies.currentSourceFingerprint()) throw new Error("Fresh render does not match the final approved mutation");
+      session = { ...session, status: "VERIFYING", render, updatedAt: new Date().toISOString() };
+      await saveSafeExecutionSession(rootPath, session);
+      const analysis = await dependencies.verify(render);
+      if (!isSafeRenderVerification(analysis, render.route) || render.sourceRevision.worktreeFingerprint !== await dependencies.currentSourceFingerprint()) throw new Error("Verification evidence is invalid or source changed after capture");
+      session = { ...session, analysis, updatedAt: new Date().toISOString() };
+      await saveSafeExecutionSession(rootPath, session);
+      if (safeVerificationComplete(analysis)) {
+        session = { ...session, status: "COMPLETE", updatedAt: new Date().toISOString() };
+        await saveSafeExecutionSession(rootPath, session);
+        return session;
+      }
+      session = { ...session, proposalHistory: session.proposalHistory.map((entry, index) => index === session.proposalHistory.length - 1 ? { ...entry, renderVerification: { render, analysis } } : entry) };
+      await saveSafeExecutionSession(rootPath, session);
+      const proposing: SafeExecutionProposingSession = { ...transitionedBase(session, "PROPOSING"), revisionRequest: "Fresh render verification requires another bounded proposal. Preserve all UX and product invariants and request a new human approval before any mutation.", previousProposal: session.proposal, previousProposalThreadId: session.proposalThreadId, proposalHistory: session.proposalHistory, verifiedMutation: session };
+      await saveSafeExecutionSession(rootPath, proposing);
+      return proposing;
+    } catch {
+      const failed: SafeExecutionVerificationSession = { ...session, status: "FAILED", error: "Fresh render verification did not complete. Applied mutation is preserved; automatic replay is blocked.", updatedAt: new Date().toISOString() };
+      await saveSafeExecutionSession(rootPath, failed);
+      return failed;
+    } finally { await dependencies.stop(); }
   });
 }

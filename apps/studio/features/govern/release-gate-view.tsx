@@ -32,6 +32,7 @@ export function ReleaseGateView({
         <>
           <div className="release-gate-view__summary">
             <span>Release status</span>
+            <span className="utility-label">Release {release.status}</span>
             <strong className={`govern-status govern-status--${release.status.toLowerCase()}`}>{release.status}</strong>
             <p>{release.scope.replaceAll("_", " ")}</p>
           </div>

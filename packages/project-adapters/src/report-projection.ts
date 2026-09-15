@@ -19,10 +19,13 @@ import {
   listSessionPage,
 } from "./workspace-store";
 import { isMangekyoLoopSession, loadMangekyoLoopSession } from "./mangekyo-loop-store";
+import { isReadonlyLearnSession } from "./readonly-learn-store";
+import { isGovernanceCaptureSession, loadGovernanceCaptureSession } from "./governance-capture-store";
 import {
   isSafeExecutionSession,
   loadSafeExecutionForSource,
   loadSafeExecutionHistoryForSessions,
+  safeExecutionRenders,
 } from "./safe-execution-store";
 
 const MAX_PAGE_SIZE = 50;
@@ -165,7 +168,7 @@ function resultFor(session: DesignSession): ReportSessionResult {
   if (session.type === "SAFE_EXECUTION" && Object.hasOwn(record, "executionFailure")) {
     return "FAILED";
   }
-  if (session.type === "ASSIMILATION") return "NOT_VERIFIED";
+  if ((session.type === "ASSIMILATION" || session.type === "DESIGN_VERIFY") && !isReadonlyLearnSession(session)) return "NOT_VERIFIED";
   const status = session.status;
   if (["DRAFT", "IDLE", "PREPARING", "PROPOSING", "POLICY_CHECK", "FIXING"].includes(status)) return "PENDING";
   if (["ANALYZING", "EDITING", "RUNNING", "CAPTURING", "COMPARING", "DECIDING", "REVISING"].includes(status)) return "IN_PROGRESS";
@@ -233,6 +236,11 @@ function reportForSession(
   governanceEvidence: "AUTHENTICATED" | "UNAVAILABLE" = "AUTHENTICATED",
 ): ReportSession {
   const report = baseReport(session);
+  if (session.type === "GOVERNANCE_CAPTURE") {
+    if (!isGovernanceCaptureSession(session)) throw new Error("Governance capture report evidence is invalid");
+    report.evidence = boundedEvidence([...report.evidence, { kind: "RENDER", id: session.render.id, label: `${session.render.route}#${session.state} browser checks` }]);
+    return report;
+  }
   if (isReferenceScanPendingSession(session) || isReferenceScanResultSession(session)) {
     report.evidence = boundedEvidence([
       ...report.evidence,
@@ -259,7 +267,10 @@ function reportForSession(
     }
     return report;
   }
-  if (session.type === "ASSIMILATION") return report;
+  if (session.type === "ASSIMILATION" || session.type === "DESIGN_VERIFY") {
+    if (isReadonlyLearnSession(session)) report.evidence = boundedEvidence([...report.evidence, ...session.referenceIds.map((id) => ({ kind: "REFERENCE" as const, id, label: "Readonly design evidence" }))]);
+    return report;
+  }
   if (isSafeExecutionSession(session)) {
     const proposal = "proposal" in session ? session.proposal : undefined;
     const mutation = "mutationEvidence" in session ? session.mutationEvidence : undefined;
@@ -282,6 +293,7 @@ function reportForSession(
       ...(proposal === undefined ? [] : [{ kind: "APPROVAL" as const, id: proposal.id, label: "Change proposal" }]),
       ...report.approvals.map((approval) => ({ kind: "APPROVAL" as const, id: approval.id, label: "Human decision" })),
       ...(mutation === undefined ? [] : [{ kind: "GIT" as const, id: mutation.proposalId, label: "Mutation evidence" }]),
+      ...safeExecutionRenders(session).map((render) => ({ kind: "RENDER" as const, id: render.id, label: `${render.viewport} ${render.route}`.slice(0, 160) })),
     ]);
     if (mutation !== undefined) {
       report.git = {
@@ -448,6 +460,7 @@ async function assertAuthenticatedSessions(
     }
     await assertReferenceEvidence(rootPath, projectId, session);
   }
+  for (const session of sessions.filter(({ type }) => type === "GOVERNANCE_CAPTURE")) await loadGovernanceCaptureSession(rootPath, projectId, session.id);
   for (const session of sessions) {
     reportForSession(
       session,

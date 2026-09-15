@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { expect, test } from "@playwright/test";
 import type { DesignSession } from "@design-sharingan/core";
-import { saveSession } from "@design-sharingan/project-adapters";
+import { isSafeExecutionSession, saveSession } from "@design-sharingan/project-adapters";
 
 const execFile = promisify(execFileCallback);
 let sandboxPath: string;
@@ -84,7 +84,8 @@ test.afterAll(async () => {
   await rm(sandboxPath, { force: true, recursive: true });
 });
 
-test("keeps the target unchanged until proposal approval, then applies one bounded Safe Mode mutation with evidence", async ({
+// Production break caught: Safe's new render lifecycle must fail honestly for this intentionally non-runnable intake fixture, while retaining the exact applied mutation and blocking any invented completion.
+test("keeps the target unchanged until approval, then retains one bounded mutation and fails closed without a render runtime", async ({
   page,
 }) => {
   await page.goto("/projects?source=local");
@@ -294,10 +295,11 @@ test("keeps the target unchanged until proposal approval, then applies one bound
   await page.getByRole("button", { name: "Approve & Execute" }).click();
   // Delay polling past the deliberately short fake mutation so this E2E proves
   // the final response and durable reload without requiring observation of the
-  // transient APPROVED window. The adapter test directly proves APPROVED is
-  // persisted before its mutation callback runs.
+  // transient APPROVED window. This fixture has no installed Next runtime;
+  // the full-loop fixture separately proves a real render-backed COMPLETE.
   await expect(page.locator(".safe-activity")).toContainText(
-    "Approved mutation applied; render verification is next",
+    "Render verification failed; applied files are preserved",
+    { timeout: 20_000 },
   );
   await expect(page.locator(".execute-workspace")).toHaveAttribute(
     "aria-busy",
@@ -357,7 +359,8 @@ test("keeps the target unchanged until proposal approval, then applies one bound
     )
   ).find((record) => record.type === "SAFE_EXECUTION");
   expect(safeRecord).toMatchObject({
-    status: "EDITING",
+    status: "FAILED",
+    error: "Fresh render verification did not complete. Applied mutation is preserved; automatic replay is blocked.",
     proposal: {
       sessionId: safeRecord?.id,
       filesToModify: ["package.json"],
@@ -423,6 +426,8 @@ test("keeps the target unchanged until proposal approval, then applies one bound
     occurredAt,
   };
   delete reconciliationRecord.mutationEvidence;
+  delete reconciliationRecord.error;
+  expect(isSafeExecutionSession(reconciliationRecord)).toBe(true);
   await saveSession(projectPath, reconciliationRecord);
   let dataRequests = 0;
   page.on("request", (request) => {

@@ -22,7 +22,7 @@ import {
   renderGenome,
   renderScreenRegistry,
 } from "@design-sharingan/governance";
-import { listReferences } from "@design-sharingan/project-adapters";
+import { listReferences, listSessions } from "@design-sharingan/project-adapters";
 
 let sandboxPath: string;
 let projectPath: string;
@@ -103,6 +103,7 @@ test.afterAll(async () => {
   await rm(sandboxPath, { force: true, recursive: true });
 });
 
+// Production break caught: enabling the Mangekyō handoff at Safe EDITING races the still-running Safe renderer and loses the start request.
 test("initializes a non-authoritative Genome, registers evidence-backed screens, and records local approval", async ({
   page,
 }) => {
@@ -146,6 +147,8 @@ test("initializes a non-authoritative Genome, registers evidence-backed screens,
   await page.getByRole("button", { name: "Approve & Execute" }).click();
   await expect(page.getByRole("heading", { name: "Approved mutation applied" })).toBeVisible();
   await page.getByRole("button", { name: "Mangekyō" }).click();
+  const safe = (await listSessions(projectPath, projectId)).find((session) => session.type === "SAFE_EXECUTION");
+  expect(safe?.status).toBe("COMPLETE");
   await page.getByRole("button", { name: "Start Mangekyō loop" }).click();
   await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible({
     timeout: 90_000,

@@ -40,6 +40,7 @@ export interface DriftObservation {
 
 export interface DriftAuditEvidenceInput extends DriftAuditEvidence {
   observations?: DriftObservation[];
+  verifiedCategories?: { category: DriftAuditCategory; evidence: string[] }[];
 }
 
 export interface RunDriftAuditInput {
@@ -68,13 +69,12 @@ export function driftObservationFromAuthenticatedVisualFinding(
   expectedRule: string,
 ): DriftObservation | undefined {
   if (
-    finding.category !== "HIERARCHY" ||
-    finding.severity !== "IMPORTANT" ||
+    !["CRITICAL", "IMPORTANT", "POLISH"].includes(finding.severity) ||
     finding.evidence.length === 0
   ) return undefined;
   return {
-    category: "HIERARCHY",
-    severity: "IMPORTANT",
+    category: finding.category === "HIERARCHY" ? "HIERARCHY" : finding.category === "ACCESSIBILITY" ? "ACCESSIBILITY_REQUIRED_STATES" : finding.category === "MOTION" ? "MOTION" : finding.category === "GENOME" ? "PRODUCT_IDENTITY_SCREEN_FAMILY" : "COMPONENTS_TOKENS",
+    severity: finding.severity as DriftSeverity,
     expectedRule: text(expectedRule, "Expected rule"),
     observedEvidence: [...finding.evidence],
     whyItMatters: finding.reason,
@@ -92,7 +92,7 @@ function canonicalScreen(value: string, label: string): string {
   return screen.startsWith("/") ? normalizeGovernanceRoute(screen) : screen;
 }
 
-function approvedRules(genome: DesignGenome | undefined, category: DriftAuditCategory): string[] {
+export function approvedRules(genome: DesignGenome | undefined, category: DriftAuditCategory): string[] {
   if (genome === undefined) return [];
   switch (category) {
     case "UX_NAVIGATION": return genome.uxInvariants;
@@ -103,6 +103,19 @@ function approvedRules(genome: DesignGenome | undefined, category: DriftAuditCat
     case "MOTION": return genome.motionRules;
     case "POLISH": return genome.visualInvariants;
   }
+}
+
+export function observationsForApprovedGenome(findings: readonly VisualFinding[], genome: DesignGenome): DriftObservation[] {
+  return findings.flatMap((finding) => {
+    const observation = driftObservationFromAuthenticatedVisualFinding(finding, "Unconfirmed visual observation");
+    if (!observation) return [];
+    const rules = approvedRules(genome, observation.category);
+    const evidence = [finding.description, finding.reason, ...finding.evidence].join("\n");
+    const exact = rules.filter((rule) => evidence.includes(rule));
+    const matched = exact.length > 0 ? exact : rules.length === 1 ? rules : [];
+    if (matched.length === 0) return [{ ...observation, requiresDesignDecision: true }];
+    return matched.map((expectedRule) => ({ ...observation, expectedRule }));
+  });
 }
 
 function genomeRuleId(category: DriftAuditCategory, rule: string): string {
@@ -172,6 +185,7 @@ function findingsFromEvidence(
         recommendedFix: text(observation.recommendedFix, "Drift fix"),
         requiresDesignDecision,
         status: repeated.length > 0 ? "DECIDE" : (observation.status ?? "OPEN"),
+        handoffKey: createHash("sha256").update(`${entry.screen}#${entry.state ?? "default"}\0${genomeRuleId(observation.category, expectedRule)}`).digest("hex"),
       });
     }
   }
@@ -180,13 +194,14 @@ function findingsFromEvidence(
   );
 }
 
-function overallStatus(input: {
+export function auditResultStatus(input: {
   unverifiedScope: readonly string[];
-  findings: readonly DriftFinding[];
+  findings: readonly Pick<DriftFinding, "severity">[];
 }): DriftReport["overallStatus"] {
   if (input.unverifiedScope.length > 0) return "NOT_VERIFIED";
   if (input.findings.some(({ severity }) => severity === "CRITICAL")) return "BLOCKED";
-  if (input.findings.some(({ severity }) => severity === "IMPORTANT" || severity === "POLISH")) {
+  if (input.findings.some(({ severity }) => severity === "IMPORTANT")) return "NOT_VERIFIED";
+  if (input.findings.some(({ severity }) => severity === "POLISH")) {
     return "PASS_WITH_DEBT";
   }
   return "PASS";
@@ -279,11 +294,16 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
     ) unverifiedScope.unshift("Whole-product inspected screens do not exactly match the explicit expected screen set.");
   }
 
-  for (const category of AUDIT_ORDER) {
-    if (!evidence.some((entry) => (entry.observations ?? []).some((observation) => observation.category === category))) {
-      unverifiedScope.push(`${category}: Deterministic analysis is unavailable.`);
+  for (const entry of evidence.filter(({ status }) => status === "INSPECTED")) {
+    const checks = entry.verifiedCategories ?? [];
+    if (checks.length > AUDIT_ORDER.length || new Set(checks.map(({ category }) => category)).size !== checks.length || checks.some((check) => !AUDIT_ORDER.includes(check.category) || check.evidence.length === 0 || check.evidence.length > 16 || check.evidence.some((detail) => !detail.trim() || detail.length > 2000))) throw new Error("Drift category verification evidence is invalid");
+    for (const category of AUDIT_ORDER) {
+      if (!(entry.observations ?? []).some((observation) => observation.category === category) && !checks.some((check) => check.category === category)) {
+        unverifiedScope.push(`${category}: Deterministic analysis is unavailable for ${entry.screen}#${entry.state ?? "default"}.`);
+      }
     }
   }
+  if (!evidence.some(({ status }) => status === "INSPECTED")) unverifiedScope.push("Deterministic analysis is unavailable.");
   const findings = findingsFromEvidence(evidence, authoritativeGenome, unverifiedScope);
   const evidenceIds = [...new Set(evidence.flatMap(({ evidenceIds }) => evidenceIds ?? []))];
   return {
@@ -294,6 +314,6 @@ export async function runDriftAudit(input: RunDriftAuditInput): Promise<DriftRep
     unverifiedScope,
     evidenceIds,
     findings,
-    overallStatus: overallStatus({ unverifiedScope, findings }),
+    overallStatus: auditResultStatus({ unverifiedScope, findings }),
   };
 }

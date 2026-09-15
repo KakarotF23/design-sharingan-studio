@@ -122,6 +122,15 @@ importers:
       '@design-sharingan/governance':
         specifier: workspace:*
         version: link:../governance
+      '@design-sharingan/project-adapters':
+        specifier: workspace:*
+        version: link:../project-adapters
+      '@design-sharingan/render-engine':
+        specifier: workspace:*
+        version: link:../render-engine
+      '@design-sharingan/visual-engine':
+        specifier: workspace:*
+        version: link:../visual-engine
     devDependencies:
       '@types/node':
         specifier: latest

@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
+import { accessSync, constants, statSync } from "node:fs";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { ProjectWorkspace } from "@design-sharingan/project-adapters";
+import type { DevRuntimeBinary, ProjectWorkspace } from "@design-sharingan/project-adapters";
+import { bindDevLaunch, resolveDevLaunch } from "@design-sharingan/project-adapters";
 import { assertLoopbackBaseUrl, probeReadiness, waitForReadiness } from "./readiness";
 
 const MAX_OUTPUT_BYTES = 65_536;
@@ -14,6 +16,7 @@ export interface ProcessCommand {
   cwd: string;
   env: NodeJS.ProcessEnv;
   shell: false;
+  requiredLocalBinary?: DevRuntimeBinary;
 }
 
 export interface DevProcess {
@@ -44,19 +47,6 @@ export interface StartDevServerOptions {
   env?: Readonly<Record<string, string>>;
 }
 
-function commandFor(workspace: ProjectWorkspace): Pick<ProcessCommand, "executable" | "args"> {
-  const supported: Record<string, Pick<ProcessCommand, "executable" | "args">> = {
-    "pnpm dev": { executable: "pnpm", args: ["run", "dev"] },
-    "yarn dev": { executable: "yarn", args: ["run", "dev"] },
-    "npm run dev": { executable: "npm", args: ["run", "dev"] },
-    "npm start": { executable: "npm", args: ["run", "start"] },
-  };
-  const command = workspace.devCommand === undefined ? undefined : supported[workspace.devCommand];
-  if (command === undefined) {
-    throw new Error("Project does not have a supported detected dev command");
-  }
-  return command;
-}
 
 function redact(value: string, extraSecrets: readonly string[]): string {
   let result = value;
@@ -178,6 +168,16 @@ function projectEnvironment(
 
 export const defaultProcessRunner: ProcessRunner = {
   start(command): DevProcess {
+    if (command.requiredLocalBinary !== undefined) {
+      // Never invoke a manager shim to discover/install missing dependencies.
+      // This preflight belongs to the real process boundary; fake runners do not spawn commands.
+      if (!["next", "vite", "react-scripts"].includes(command.requiredLocalBinary)) throw new Error("Invalid local framework runtime");
+      const runtimePath = join(command.cwd, "node_modules", ".bin", command.requiredLocalBinary);
+      try {
+        accessSync(runtimePath, constants.X_OK);
+        if (!statSync(runtimePath).isFile()) throw new Error("Not an installed executable");
+      } catch { throw new Error("Required local framework runtime is unavailable. Install dependencies explicitly before rendering; automatic installation is disabled."); }
+    }
     const child = spawn(command.executable, command.args, {
       cwd: command.cwd,
       env: command.env,
@@ -280,7 +280,7 @@ export async function startDevServer(options: StartDevServerOptions): Promise<De
   if (canonicalRoot !== options.workspace.rootPath) {
     throw new Error("Active project root must be canonical");
   }
-  const parsed = commandFor(options.workspace);
+  const parsed = bindDevLaunch(resolveDevLaunch(options.workspace.devCommand, options.workspace.framework), new URL(options.baseUrl));
   const preflightAbort = new AbortController();
   let preflightTimer: ReturnType<typeof setTimeout> | undefined;
   const preflightDeadline = new Promise<never>((_resolve, reject) => {
@@ -304,7 +304,7 @@ export async function startDevServer(options: StartDevServerOptions): Promise<De
     if (preflightTimer !== undefined) clearTimeout(preflightTimer);
   }
   const isolatedHome = await mkdtemp(join(tmpdir(), "design-sharingan-render-home-"));
-  const environment = projectEnvironment(options.env, isolatedHome);
+  const environment = projectEnvironment({ ...options.env, ...parsed.env }, isolatedHome);
   const explicitSecrets = Object.values(options.env ?? {}).filter((value) => value.length >= 8);
   let child: DevProcess;
   try {

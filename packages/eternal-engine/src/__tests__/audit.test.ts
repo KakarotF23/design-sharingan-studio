@@ -4,6 +4,8 @@ import {
   AUDIT_ORDER,
   driftObservationFromAuthenticatedVisualFinding,
   runDriftAudit,
+  observationsForApprovedGenome,
+  auditResultStatus,
 } from "../audit";
 
 function approvedGenome(): DesignGenome {
@@ -43,6 +45,32 @@ function completeIntentionalObservations() {
 }
 
 describe("Drift audit", () => {
+  // Production break caught: a fully observed Important finding is mislabeled PASS_WITH_DEBT, although only polish may use that path.
+  it("keeps Important drift unresolved and reserves debt status for polish", () => {
+    expect(auditResultStatus({ unverifiedScope: [], findings: [{ severity: "IMPORTANT" }] })).toBe("NOT_VERIFIED");
+    expect(auditResultStatus({ unverifiedScope: [], findings: [{ severity: "POLISH" }] })).toBe("PASS_WITH_DEBT");
+  });
+  // Production break caught: governed capture substitutes the first category rule or drops an unmatched Critical finding instead of preserving uncertainty.
+  it("binds exact approved rule observations and retains unmatched critical evidence as a human decision", () => {
+    const genome = { ...approvedGenome(), visualInvariants: ["Use restrained contrast.", "Preserve the primary heading."] };
+    const finding: VisualFinding = { id: "finding-second-rule", screen: "/", category: "HIERARCHY", severity: "IMPORTANT", description: "Heading priority changed", evidence: ["Approved rule: Preserve the primary heading."], reason: "Primary task is unclear", recommendedAction: "Restore the heading", status: "OPEN" };
+    expect(observationsForApprovedGenome([finding], genome)[0]?.expectedRule).toBe("Preserve the primary heading.");
+    const unmatched = observationsForApprovedGenome([{ ...finding, severity: "CRITICAL", category: "MOTION", evidence: ["Rapid flashing harms readability"] }], { ...genome, motionRules: [] });
+    expect(unmatched).toHaveLength(1);
+    expect(unmatched[0]).toMatchObject({ severity: "CRITICAL", requiresDesignDecision: true });
+  });
+  // Production break: verified clean categories must invent INTENTIONAL findings because absence of drift is always treated as missing analysis.
+  it("records explicit clean category checks without inventing drift findings", async () => {
+    const report = await runDriftAudit({ requestedScope: "SELECTED_SCREENS", expectedScope: [{ screen: "/", states: ["default"] }], evidence: [{ screen: "/", state: "default", status: "INSPECTED", evidenceIds: ["ev_clean"], verifiedCategories: AUDIT_ORDER.map((category) => ({ category, evidence: ["Authenticated rendered rule inspection found no deviation."] })) }] });
+    expect(report.findings).toEqual([]);
+    expect(report.unverifiedScope.some((reason) => reason.includes("Deterministic analysis"))).toBe(false);
+    expect(report.overallStatus).toBe("NOT_VERIFIED"); // Raw clean checks still cannot replace approved Genome authority.
+  });
+  // Production break: non-hierarchy findings and Critical/Polish severities disappear at the audit boundary.
+  it("preserves supported visual categories and severity instead of only the fixture hierarchy Important case", () => {
+    const observation = driftObservationFromAuthenticatedVisualFinding({ category: "ACCESSIBILITY", severity: "CRITICAL", evidence: ["Primary control is unreadable"], reason: "Primary task inaccessible", recommendedAction: "Restore contrast", status: "OPEN" }, "Maintain visible focus.");
+    expect(observation).toMatchObject({ category: "ACCESSIBILITY_REQUIRED_STATES", severity: "CRITICAL" });
+  });
   it("maps an authenticated important hierarchy result into a catalog-bound audit observation", () => {
     const finding: Pick<VisualFinding, "category" | "severity" | "evidence" | "reason" | "recommendedAction" | "status"> = {
       category: "HIERARCHY",
@@ -68,7 +96,7 @@ describe("Drift audit", () => {
     expect(driftObservationFromAuthenticatedVisualFinding({
       ...finding,
       category: "SPACING",
-    }, "Preserve the established product hierarchy and component language.")).toBeUndefined();
+    }, "Preserve the established product hierarchy and component language.")).toMatchObject({ category: "COMPONENTS_TOKENS", severity: "IMPORTANT" });
   });
 
   it("cannot call a one-screen audit a whole-app audit", async () => {
@@ -105,7 +133,7 @@ describe("Drift audit", () => {
     expect(report.overallStatus).toBe("NOT_VERIFIED");
     expect(report.unverifiedScope).toEqual(expect.arrayContaining([
       "/overview#default: Authenticated rendered evidence is missing.",
-      "UX_NAVIGATION: Deterministic analysis is unavailable.",
+      "UX_NAVIGATION: Deterministic analysis is unavailable for /overview#default.",
     ]));
   });
 

@@ -1,5 +1,5 @@
-import { WorkspacePlaceholder } from "../../../../features/projects/workspace-placeholder";
+import { OverviewWorkspace } from "../../../../features/projects/overview-workspace";
 
 export default function OverviewPage() {
-  return <WorkspacePlaceholder workspace="overview" />;
+  return <OverviewWorkspace />;
 }

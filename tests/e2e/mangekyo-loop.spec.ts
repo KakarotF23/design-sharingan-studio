@@ -1,9 +1,14 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { expect, test } from "@playwright/test";
+import {
+  loadMangekyoLoopSession,
+  loadMangekyoWorkerLease,
+  requestMangekyoStop,
+} from "@design-sharingan/project-adapters";
 
 const execFile = promisify(execFileCallback);
 let sandboxPath: string;
@@ -88,6 +93,7 @@ test.afterAll(async () => {
   });
 });
 
+// Production break caught: Stop persisted as a worker leaves HUMAN_GATE can be stranded forever if reads never recover that pending Stop.
 test("allows a style round then enters a durable HUMAN_GATE before a navigation mutation", async ({
   page,
 }) => {
@@ -126,6 +132,8 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
   await expect(page.getByRole("heading", { name: "Safe Mode change proposal" })).toBeVisible();
   await page.getByRole("button", { name: "Approve & Execute" }).click();
   await expect(page.getByRole("heading", { name: "Approved mutation applied" })).toBeVisible();
+  // The unversioned-loop fixture transition must happen after Safe's own final-source capture, not while that capture is still in progress.
+  await expect(page.locator(".safe-activity")).toContainText("Fresh scoped render verified", { timeout: 30_000 });
 
   const sourceBeforeLoop = await readFile(join(projectPath, "server.mjs"), "utf8");
   const stylesBeforeLoop = await readFile(join(projectPath, "styles.css"), "utf8");
@@ -331,7 +339,24 @@ test("allows a style round then enters a durable HUMAN_GATE before a navigation 
     "data-mangekyo-navigation=\"approved\"",
   );
   await expect(page.getByRole("button", { name: "Stop visual loop" })).toBeVisible();
-  await page.getByRole("button", { name: "Stop visual loop" }).click();
+  // Reproduce interruption after Stop publication but before a replacement worker is scheduled.
+  // The earlier UI Stop remains covered; this uses the real durable adapter rather than a forged session.
+  const projectId = (loopRecord as { projectId: string }).projectId;
+  const canonicalRoot = await realpath(projectPath);
+  await expect.poll(() => loadMangekyoWorkerLease(canonicalRoot, projectId), {
+    timeout: 30_000,
+  }).toBeUndefined();
+  const stoppedAtGate = await loadMangekyoLoopSession(canonicalRoot, projectId, acceptedStart.session?.id as string);
+  expect(stoppedAtGate.status).toBe("HUMAN_GATE");
+  await requestMangekyoStop(canonicalRoot, projectId, {
+    id: "stop-after-worker-release",
+    loopSessionId: stoppedAtGate.id,
+    sessionVersion: stoppedAtGate.updatedAt,
+    requestedAt: new Date().toISOString(),
+    requestedBy: "local-user",
+  });
+  await page.reload();
+  await page.getByRole("button", { name: "Mangekyō" }).click();
   await expect(page.getByText("BLOCKED", { exact: true })).toBeVisible({
     timeout: 20_000,
   });

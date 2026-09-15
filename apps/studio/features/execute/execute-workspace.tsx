@@ -15,6 +15,7 @@ import {
 import { ApprovalActions } from "./approval-actions";
 import { ChangeProposalView } from "./change-proposal-view";
 import { MangekyoWorkspace } from "./mangekyo-workspace";
+import { MutationRecovery } from "./mutation-recovery";
 
 interface GitEvidence {
   available: boolean;
@@ -44,7 +45,9 @@ interface ExecuteSession {
     | "REVISING"
     | "REJECTED"
     | "APPROVED"
-    | "EDITING";
+    | "EDITING" | "RUNNING" | "CAPTURING" | "VERIFYING" | "COMPLETE" | "FAILED";
+  verifiedMutation?: unknown;
+  error?: string;
   sourceSessionId: string;
   approvedApproachId: string;
   approvalId: string;
@@ -77,8 +80,8 @@ type SafeAction =
   | "REJECT_PROPOSAL"
   | "APPROVE_PROPOSAL";
 
-function activityFor(
-  session: ExecuteSession | undefined,
+export function activityFor(
+  session: Pick<ExecuteSession, "status" | "executionFailure"> | undefined,
   busy: boolean,
   action: SafeAction | undefined,
 ): string {
@@ -87,6 +90,14 @@ function activityFor(
   }
   if (session?.status === "APPROVED") {
     return "Approval persisted; controlled mutation is running";
+  }
+  switch (session?.status) {
+    case "EDITING": return "Approved mutation applied; render verification is next";
+    case "RUNNING": return "Starting the project for fresh render verification";
+    case "CAPTURING": return "Capturing the final approved source";
+    case "VERIFYING": return "Verifying the fresh scoped render";
+    case "COMPLETE": return "Fresh scoped render verified";
+    case "FAILED": return "Render verification failed; applied files are preserved";
   }
   if (busy) {
     switch (action) {
@@ -115,8 +126,6 @@ function activityFor(
       return "Revision requested; target source remains unchanged";
     case "REJECTED":
       return "Proposal rejected; no mutation was authorized";
-    case "EDITING":
-      return "Approved mutation applied; render verification is next";
     default:
       return "Loading approved execution evidence";
   }
@@ -162,7 +171,8 @@ export function ExecuteWorkspace() {
   useEffect(() => {
     const durableWorkInProgress =
       session?.status === "PREPARING" ||
-      session?.status === "PROPOSING" ||
+      (session?.status === "PROPOSING" && session.verifiedMutation === undefined) ||
+      ["EDITING", "RUNNING", "CAPTURING", "VERIFYING"].includes(session?.status ?? "") ||
       (session?.status === "APPROVED" &&
         session.executionFailure === undefined);
     if (!busy && !durableWorkInProgress) return;
@@ -235,10 +245,11 @@ export function ExecuteWorkspace() {
 
   const preparing = session?.status === "PREPARING" || session?.status === "PROPOSING";
   const approvedExecutionActive =
-    session?.status === "APPROVED" && session.executionFailure === undefined;
+    (session?.status === "APPROVED" && session.executionFailure === undefined) ||
+    ["EDITING", "RUNNING", "CAPTURING", "VERIFYING"].includes(session?.status ?? "");
   const git = session?.mutationEvidence?.git;
 
-  if (mode === "MANGEKYO" && session?.status === "EDITING") {
+  if (mode === "MANGEKYO" && session?.status === "COMPLETE") {
     return <MangekyoWorkspace safeSessionId={session.id} onModeChange={setMode} />;
   }
 
@@ -255,7 +266,7 @@ export function ExecuteWorkspace() {
           <ModeSwitcher
             mode="SAFE"
             onChange={setMode}
-            mangekyoDisabled={session?.status !== "EDITING"}
+            mangekyoDisabled={session?.status !== "COMPLETE"}
           />
         }
       />
@@ -301,7 +312,7 @@ export function ExecuteWorkspace() {
         </section>
       ) : null}
 
-      {session?.status === "IDLE" || session?.status === "REVISING" ? (
+      {session?.status === "IDLE" || session?.status === "REVISING" || (session?.status === "PROPOSING" && session.verifiedMutation !== undefined) ? (
         <section className="proposal-start" aria-labelledby="proposal-start-title">
           <div>
             <p className="utility-label">READ-ONLY PREPARATION</p>
@@ -339,9 +350,9 @@ export function ExecuteWorkspace() {
 
       {preparing || approvedExecutionActive ? (
         <p className="analysis-status" role="status">
-          {session.status === "APPROVED"
-            ? "Approval persisted. Applying only the exact approved delta…"
-            : "Preparing a structured Change Proposal in read-only analysis space…"}
+          {preparing
+            ? "Preparing a structured Change Proposal in read-only analysis space…"
+            : activityFor(session, busy, activeAction)}
         </p>
       ) : null}
 
@@ -359,6 +370,7 @@ export function ExecuteWorkspace() {
             The target outcome is indeterminate. Inspect these exact paths before
             any further execution: {session.executionFailure.affectedPaths.join(", ")}.
           </p>
+          <MutationRecovery projectId={project.id} />
         </section>
       ) : null}
 
@@ -406,14 +418,14 @@ export function ExecuteWorkspace() {
         </section>
       ) : null}
 
-      {session?.status === "EDITING" && session.mutationEvidence ? (
+      {session?.mutationEvidence ? (
         <section className="mutation-evidence" aria-labelledby="mutation-evidence-title">
           <header>
             <div>
               <p className="utility-label">ACTIVITY / GIT EVIDENCE</p>
               <h2 id="mutation-evidence-title">Approved mutation applied</h2>
             </div>
-            <strong>EDITING</strong>
+            <strong>{session.status}</strong>
           </header>
           <dl>
             <div><dt>Proposal</dt><dd>{session.mutationEvidence.proposalId}</dd></div>
@@ -436,7 +448,8 @@ export function ExecuteWorkspace() {
             ) : null}
           </div>
           <p>No auto-commit was created.</p>
-          <p>Fresh render and verification continue in Task 10; this session remains truthfully at EDITING.</p>
+          <p role="status">{session.status === "COMPLETE" ? "Fresh scoped render verified" : session.status === "FAILED" ? session.error : `Render verification: ${session.status}`}</p>
+          <p>This is scoped execution evidence, not a whole-product release PASS. Any further mutation requires a new proposal and explicit approval.</p>
         </section>
       ) : null}
     </div>

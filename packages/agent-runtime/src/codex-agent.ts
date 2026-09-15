@@ -1,5 +1,6 @@
 import {
   Codex,
+  type CodexOptions,
   type Input as SdkInput,
   type ThreadItem,
   type ThreadOptions as SdkThreadOptions,
@@ -11,6 +12,7 @@ import type {
   CodexAgentRunInput,
   JsonSchema,
 } from "./types";
+import { isDisabledCapabilityNotice, restrictedCodexRuntime } from "./capability-runtime";
 
 export interface CodexProviderThreadOptions {
   workingDirectory: string;
@@ -49,10 +51,14 @@ export interface CodexProvider {
 
 export interface CodexAgentConstructorOptions extends CodexAgentOptions {
   provider?: CodexProvider;
+  createClient?(options: CodexOptions): Pick<Codex, "startThread" | "resumeThread"> | {
+    startThread(options: SdkThreadOptions): { id: string | null; run(input: SdkInput, options: SdkTurnOptions): Promise<CodexProviderRunResult> };
+    resumeThread(id: string, options: SdkThreadOptions): { id: string | null; run(input: SdkInput, options: SdkTurnOptions): Promise<CodexProviderRunResult> };
+  };
 }
 
 class OfficialCodexProvider implements CodexProvider {
-  constructor(private readonly client: Codex) {}
+  constructor(private readonly client: NonNullable<ReturnType<NonNullable<CodexAgentConstructorOptions["createClient"]>>>, private readonly runtime: ReturnType<typeof restrictedCodexRuntime>) {}
 
   startThread(options: CodexProviderThreadOptions): CodexProviderThread {
     return this.wrapThread(this.client.startThread(this.threadOptions(options)));
@@ -62,6 +68,7 @@ class OfficialCodexProvider implements CodexProvider {
     threadId: string,
     options: CodexProviderThreadOptions,
   ): CodexProviderThread {
+    this.runtime.requireOwnedThread(threadId);
     return this.wrapThread(
       this.client.resumeThread(threadId, this.threadOptions(options)),
     );
@@ -71,12 +78,18 @@ class OfficialCodexProvider implements CodexProvider {
     return {
       workingDirectory: options.workingDirectory,
       skipGitRepoCheck: options.skipGitRepoCheck,
+      sandboxMode: "read-only",
+      approvalPolicy: "never",
+      networkAccessEnabled: false,
+      webSearchMode: "disabled",
+      additionalDirectories: [],
     };
   }
 
   private wrapThread(
-    thread: ReturnType<Codex["startThread"]>,
+    thread: ReturnType<OfficialCodexProvider["client"]["startThread"]>,
   ): CodexProviderThread {
+    const runtime = this.runtime;
     return {
       get id() {
         return thread.id;
@@ -94,7 +107,14 @@ class OfficialCodexProvider implements CodexProvider {
             ? {}
             : { outputSchema: options.outputSchema }),
         };
-        return thread.run(sdkInput, turnOptions);
+        const result = await thread.run(sdkInput, turnOptions);
+        const items = result.items.filter((item) => !isDisabledCapabilityNotice(item));
+        const runtimeError = items.find((item) => item.type === "error");
+        if (runtimeError?.type === "error") throw new Error(`Agent runtime rejected analysis: ${runtimeError.message}`);
+        const forbidden = items.filter(({ type }) => !["agent_message", "reasoning", "todo_list"].includes(type));
+        if (forbidden.length > 0) throw new Error(`Agent capability profile rejected a forbidden tool event (${forbidden.slice(0, 5).map(({ type }) => String(type).slice(0, 40)).join(", ")})`);
+        if (thread.id) runtime.rememberThread(thread.id);
+        return { ...result, items };
       },
     };
   }
@@ -105,10 +125,12 @@ export class CodexAgent {
   private readonly redact: (value: string) => string;
 
   constructor(options: CodexAgentConstructorOptions = {}) {
-    this.provider = options.provider ?? new OfficialCodexProvider(new Codex());
+    const environment = options.environment ?? process.env;
+    const runtime = options.provider === undefined ? restrictedCodexRuntime(environment) : undefined;
+    this.provider = options.provider ?? new OfficialCodexProvider(options.createClient?.(runtime!.options) ?? new Codex(runtime!.options), runtime!);
     this.redact = createSecretRedactor(
       options.environment ?? process.env,
-      options.secretEnvironmentKeys ?? [],
+      options.secretEnvironmentKeys ?? Object.keys(environment).filter((key) => /TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL/i.test(key)),
     );
   }
 

@@ -76,6 +76,47 @@ class FakeProcess extends EventEmitter implements DevProcess {
   }
 }
 
+// Production break caught: a package-manager shim can auto-install absent framework dependencies before a render attempt, mutating unapproved target files.
+it("refuses a missing local framework runtime before launching the real package-manager process", async () => {
+  const active = await workspace("npm run dev");
+  const bin = join(active.rootPath, "fixture-manager");
+  const marker = join(active.rootPath, "launcher-attempted");
+  const previousPath = process.env.PATH;
+  await mkdir(bin);
+  await writeFile(join(bin, "npm"), `#!/bin/sh\nprintf attempted > ${JSON.stringify(marker)}\nexit 1\n`, { mode: 0o755 });
+  process.env.PATH = bin;
+  try {
+    await expect(startDevServer({ workspace: active, baseUrl: "http://127.0.0.1:4310", readinessProbe: async () => false, timeoutMs: 500 })).rejects.toThrow(/local.*runtime.*unavailable|installed.*runtime/i);
+    await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(active.rootPath, "node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally { if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; await rm(active.rootPath, { recursive: true, force: true }); }
+});
+
+// Production break caught: detected React start commands are rejected and Vite/Next can bind a different port than the readiness/capture URL.
+it.each([
+  ["vite", "pnpm", "pnpm dev", ["run", "dev", "--host", "127.0.0.1", "--port", "4310", "--strictPort"]],
+  ["vite", "yarn", "yarn dev", ["run", "dev", "--host", "127.0.0.1", "--port", "4310", "--strictPort"]],
+  ["vite", "npm", "npm run dev", ["run", "dev", "--", "--host", "127.0.0.1", "--port", "4310", "--strictPort"]],
+  ["nextjs", "pnpm", "pnpm dev", ["run", "dev", "--hostname", "127.0.0.1", "--port", "4310"]],
+  ["nextjs", "yarn", "yarn dev", ["run", "dev", "--hostname", "127.0.0.1", "--port", "4310"]],
+  ["nextjs", "npm", "npm run dev", ["run", "dev", "--", "--hostname", "127.0.0.1", "--port", "4310"]],
+  ["react", "pnpm", "pnpm start", ["run", "start"]],
+  ["react", "yarn", "yarn start", ["run", "start"]],
+  ["react", "npm", "npm start", ["run", "start"]],
+] as const)("launches %s with %s on the capture endpoint", async (framework, packageManager, devCommand, args) => {
+  const active = { ...await workspace(devCommand), framework, packageManager };
+  let command: Parameters<ProcessRunner["start"]>[0] | undefined;
+  let probes = 0;
+  const server = await startDevServer({ workspace: active, baseUrl: "http://127.0.0.1:4310", processRunner: {
+    start(input) { command = input; return new FakeProcess(); },
+  }, readinessProbe: async () => ++probes > 1 });
+  expect(command?.executable).toBe(packageManager);
+  expect(command?.args).toEqual(args);
+  expect(command?.env.PORT).toBe("4310");
+  expect(command?.env.HOST).toBe("127.0.0.1");
+  await server.stop();
+});
+
 // Production break caught: launching through a shell or from Studio's cwd can execute a different project/script than the active workspace.
 it("starts the detected dev command in the canonical project root and owns cleanup", async () => {
   const active = await workspace();
@@ -101,7 +142,7 @@ it("starts the detected dev command in the canonical project root and owns clean
   expect(starts).toEqual([
     expect.objectContaining({
       executable: "pnpm",
-      args: ["run", "dev"],
+      args: ["run", "dev", "--hostname", "127.0.0.1", "--port", "4310"],
       cwd: active.rootPath,
       shell: false,
     }),
@@ -534,6 +575,12 @@ function fakeBrowser(
   return { launcher: { async launch() { return browser; } }, browser, calls };
 }
 
+// Production break caught: checking a state on one page then capturing a different page can attach loading/error evidence to an ordinary default screenshot.
+it("requires the exact captured page to attest the selected state", async () => {
+  const active = await workspace();
+  await expect(captureRender({ workspace: active, baseUrl: "http://127.0.0.1:4310", route: "/", expectedState: "loading", viewport: { name: "desktop", width: 1440, height: 800 }, sessionId: "capture-state", roundId: "round-state", browserLauncher: fakeBrowser("http://127.0.0.1:4310/").launcher })).rejects.toThrow(/state/);
+});
+
 // Production break caught: a Local Folder render without a complete source fingerprint cannot be proven fresh after mutation.
 it("captures a PNG and atomically persists exact session, round, viewport, route, and authenticated unversioned source evidence", async () => {
   const active = await workspace();
@@ -880,6 +927,16 @@ it("includes design-governance documents in Git status and source fingerprints",
   });
   expect(second.kind === "GIT" && first.kind === "GIT" && second.worktreeFingerprint)
     .not.toBe(first.kind === "GIT" ? first.worktreeFingerprint : undefined);
+});
+
+// Production break: publishing DRIFT-REPORT/SCREEN-REGISTRY after a real capture invalidates that capture and makes a release PASS impossible.
+it("excludes generated audit outputs while retaining Genome as a render input", async () => {
+  const active = await workspace();
+  const before = await captureWorkspaceSourceRevision(active);
+  await mkdir(join(active.rootPath, "design-governance"));
+  await writeFile(join(active.rootPath, "design-governance", "DRIFT-REPORT.md"), "# Audit output\n");
+  await writeFile(join(active.rootPath, "design-governance", "SCREEN-REGISTRY.md"), "# Registry output\n");
+  expect(await captureWorkspaceSourceRevision(active)).toEqual(before);
 });
 
 it.each(["dist/styles.css", "build/client.js"])(

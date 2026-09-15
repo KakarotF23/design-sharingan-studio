@@ -98,7 +98,7 @@ export function createMangekyoMutationAgent(): MutationAgent {
   return new CodexAgent();
 }
 
-export function createMangekyoVisualAgent(): VisualAnalysisAgent {
+export function createMangekyoVisualAgent(hasApprovedGenome = false): VisualAnalysisAgent {
   if (process.env.DESIGN_SHARINGAN_FAKE_AGENT === "1") {
     return {
       async run<TStructured>(input: CodexAgentRunInput) {
@@ -122,8 +122,8 @@ export function createMangekyoVisualAgent(): VisualAnalysisAgent {
                 evidence: ["No observable accessibility regression is present in this render."],
               },
               genomeIntegrity: {
-                status: "NOT_VERIFIED",
-                evidence: ["No authenticated approved Genome evidence was supplied to this analysis."],
+                status: hasApprovedGenome ? "PASS" : "NOT_VERIFIED",
+                evidence: [hasApprovedGenome ? "The rendered screen preserves the supplied approved Genome rules." : "No authenticated approved Genome evidence was supplied to this analysis."],
               },
             },
             findings: [
@@ -154,7 +154,7 @@ export function createMangekyoVisualAgent(): VisualAnalysisAgent {
                 reason: "Users must infer the intended reading order.",
                 recommendedAction: "Clarify the visual sequence without changing behavior.",
               },
-            ],
+            ].slice(0, hasApprovedGenome ? 1 : 3),
           } as TStructured,
         };
       },

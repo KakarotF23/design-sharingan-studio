@@ -154,7 +154,8 @@ function evidenceFor(
     if (
       entry === undefined || entry.projectId !== input.projectId ||
       canonicalRoute === undefined || !expectedRoutes.has(canonicalRoute) || !exactIso(entry.capturedAt) ||
-      entry.capturedAt !== supplied?.lastVerified
+      !validVerifiedAt || entry.capturedAt > supplied!.lastVerified! ||
+      entry.sourceRevisionFingerprint !== input.currentSourceRevisionFingerprint
     ) return false;
     if (name === "requiredStates" || name === "freshRenders") {
       return entry.kind === "RENDER" &&
@@ -171,7 +172,7 @@ function evidenceFor(
         if (
           entry === undefined || key === undefined || renderedPairs.has(key) ||
           entry.kind !== "RENDER" || entry.projectId !== input.projectId ||
-          !exactIso(entry.capturedAt) || entry.capturedAt !== supplied?.lastVerified ||
+          !exactIso(entry.capturedAt) || !validVerifiedAt || entry.capturedAt > supplied!.lastVerified! ||
           entry.sourceRevisionFingerprint !== input.currentSourceRevisionFingerprint
         ) return false;
         renderedPairs.add(key);

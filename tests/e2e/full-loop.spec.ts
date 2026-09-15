@@ -203,6 +203,7 @@ test.afterAll(async () => {
   await rm(sandboxPath, { force: true, recursive: true, maxRetries: 5, retryDelay: 50 });
 });
 
+// Production breaks caught: Safe lacks its own terminal render, approved Genome is lost at execution, and scoped Govern/Overview evidence is disconnected.
 test("completes the evidence-backed reference-to-governance loop with authenticated durable relations", async ({
   page,
 }) => {
@@ -264,6 +265,9 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   expect(await snapshotProductTree(projectPath)).toEqual(beforeV1);
   await page.getByRole("button", { name: "Approve & Execute" }).click();
   await expect(page.getByRole("heading", { name: "Approved mutation applied" })).toBeVisible();
+  // Production break: Safe execution never reaches a fresh render-backed verification checkpoint after EDITING.
+  await expect.poll(async () => (await listSessions(projectPath, projectId)).find((session) => session.type === "SAFE_EXECUTION")?.status, { timeout: 90_000 }).toBe("COMPLETE");
+  await expect(page.locator(".safe-activity")).toHaveText("Fresh scoped render verified");
   const afterSafeMode = await snapshotProductTree(projectPath);
   expect(changedProductPaths(beforeV1, afterSafeMode)).toEqual(["package.json"]);
 
@@ -298,7 +302,8 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible();
   await page.getByRole("button", { name: "Approve Once" }).click();
   await expect(page.getByText("Round 02", { exact: true })).toBeVisible({ timeout: 90_000 });
-  await expect(page.getByRole("heading", { name: "Human decision required" })).toBeVisible({ timeout: 90_000 });
+  // Production break caught: approved Genome evidence never reaches the visual boundary, so even verified rounds can never finish.
+  await expect.poll(async () => (await listSessions(projectPath, projectId)).find((session) => session.type === "MANGEKYO_LOOP")?.status, { timeout: 90_000 }).toBe("COMPLETE");
 
   await page.goto((studioPath as string).replace(/\/overview$/, "/govern"));
   const auditResponse = page.waitForResponse((response) =>
@@ -386,7 +391,7 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   });
 
   expect(mangekyoSession).toMatchObject({
-    status: "HUMAN_GATE",
+    status: "COMPLETE",
     sourceExecutionSessionId: safeSession.id,
     sourceDesignSessionId: evolveSession.id,
     approvedApproachId: evolveSession.approvedApproachId,
@@ -419,6 +424,7 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     readEvidenceCatalog(projectPath, projectId),
   ]);
   expect(genome.value.status).toBe("APPROVED");
+  expect(mangekyoSession.rounds.at(-1)?.round).toMatchObject({ genomeEvidence: { entityId: genome.metadata.entityId, version: genome.value.version, revision: genome.metadata.revision, payloadHash: genome.payloadHash } });
   expect(genome.authority).toBe("AUTHORITATIVE");
   expect(genome.value.visualInvariants).toContain(
     "Preserve the established product hierarchy and component language.",
@@ -492,20 +498,20 @@ test("completes the evidence-backed reference-to-governance loop with authentica
   ]);
   expect(drift.value.unverifiedScope).toEqual(expect.arrayContaining([
     "Whole-product scope requires more than one distinct canonical screen.",
-    "UX_NAVIGATION: Deterministic analysis is unavailable.",
-    "ACCESSIBILITY_REQUIRED_STATES: Deterministic analysis is unavailable.",
-    "PRODUCT_IDENTITY_SCREEN_FAMILY: Deterministic analysis is unavailable.",
-    "COMPONENTS_TOKENS: Deterministic analysis is unavailable.",
-    "MOTION: Deterministic analysis is unavailable.",
-    "POLISH: Deterministic analysis is unavailable.",
+    "UX_NAVIGATION: Deterministic analysis is unavailable for /#default.",
+    "ACCESSIBILITY_REQUIRED_STATES: Deterministic analysis is unavailable for /#default.",
+    "PRODUCT_IDENTITY_SCREEN_FAMILY: Deterministic analysis is unavailable for /#default.",
+    "COMPONENTS_TOKENS: Deterministic analysis is unavailable for /#default.",
+    "MOTION: Deterministic analysis is unavailable for /#default.",
+    "POLISH: Deterministic analysis is unavailable for /#default.",
   ]));
   expect(drift.value.unverifiedScope.slice(-6)).toEqual([
-    "UX_NAVIGATION: Deterministic analysis is unavailable.",
-    "ACCESSIBILITY_REQUIRED_STATES: Deterministic analysis is unavailable.",
-    "PRODUCT_IDENTITY_SCREEN_FAMILY: Deterministic analysis is unavailable.",
-    "COMPONENTS_TOKENS: Deterministic analysis is unavailable.",
-    "MOTION: Deterministic analysis is unavailable.",
-    "POLISH: Deterministic analysis is unavailable.",
+    "UX_NAVIGATION: Deterministic analysis is unavailable for /#default.",
+    "ACCESSIBILITY_REQUIRED_STATES: Deterministic analysis is unavailable for /#default.",
+    "PRODUCT_IDENTITY_SCREEN_FAMILY: Deterministic analysis is unavailable for /#default.",
+    "COMPONENTS_TOKENS: Deterministic analysis is unavailable for /#default.",
+    "MOTION: Deterministic analysis is unavailable for /#default.",
+    "POLISH: Deterministic analysis is unavailable for /#default.",
   ]);
   expect(drift.value.evidenceIds.length).toBeGreaterThan(0);
   expect(drift.value.evidenceIds.every((id) => catalog.some((entry) => entry.id === id))).toBe(true);
@@ -604,4 +610,56 @@ test("completes the evidence-backed reference-to-governance loop with authentica
     status: "NOT_VERIFIED",
     result: "NOT_VERIFIED",
   }));
+  // Production break caught: EVOLVE ignores the current approved Genome and leaves its saved recommendation without the authority identity it used.
+  const genomeEvolve = await page.evaluate(async ({ path, brief }) => {
+    const response = await fetch(`${path}/learn/evolve`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ featureBrief: brief, referenceIds: [] }) });
+    return { status: response.status, payload: await response.json() };
+  }, { path: projectBasePath, brief: evolveSession.featureBrief });
+  expect(genomeEvolve.status).toBe(200);
+  expect(genomeEvolve.payload.session).toMatchObject({ genomeEvidence: { entityId: genome.metadata.entityId, version: genome.value.version, revision: genome.metadata.revision, payloadHash: genome.payloadHash } });
+  // Production break: Govern offers no bounded live capture/check path that can produce a legitimate scoped release PASS.
+  await page.goto(`${projectBasePath}/govern`);
+  // Production break: finding handoff discards the authenticated finding and opens a generic Execute page.
+  const findingLink = page.getByRole("link", { name: "Send to Execute" }).first();
+  expect(await findingLink.getAttribute("href")).toMatch(/\/execute\?finding=[a-f0-9]{64}$/);
+  await findingLink.click();
+  await expect(page.getByRole("heading", { name: "Finding-linked execution" })).toBeVisible();
+  const findingEvolveResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith("/learn/evolve"),
+  );
+  await page.getByRole("button", { name: "Run EVOLVE" }).click();
+  const findingEvolved = await findingEvolveResponse;
+  expect({ status: findingEvolved.status(), payload: await findingEvolved.json() }).toMatchObject({
+    status: 200,
+    payload: { session: { sourceFinding: { reportEntityId: drift.metadata.entityId, reportRevision: drift.metadata.revision } } },
+  });
+  await expect(page.getByRole("button", { name: "Approve Guided evidence queue" })).toBeVisible();
+  const linkedFindingSession = (await listSessions(projectPath, projectId)).filter((session) => session.type === "FEATURE_EVOLVE").find((session) => "sourceFinding" in session);
+  expect(linkedFindingSession).toMatchObject({ sourceFinding: { reportEntityId: drift.metadata.entityId, reportRevision: drift.metadata.revision } });
+  await page.goto(`${projectBasePath}/govern`);
+  await expect(page.getByRole("button", { name: "Capture and audit selected scope" })).toBeVisible();
+  await page.getByLabel("Audit scope").selectOption("SELECTED_SCREENS");
+  await page.getByLabel("/#default", { exact: true }).check();
+  await page.getByRole("button", { name: "Capture and audit selected scope" }).click();
+  await expect(page.getByText("SELECTED SCREENS", { exact: true }).first()).toBeVisible({ timeout: 90_000 });
+  const scoped = await readDriftReport(projectPath, projectId);
+  expect(scoped.value).toMatchObject({ requestedScope: "SELECTED_SCREENS", expectedScope: [{ screen: "/", states: ["default"] }], overallStatus: "PASS" });
+  await page.getByRole("button", { name: "Evaluate release gate" }).click();
+  await expect(page.getByText("Release PASS", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Evaluate release gate" })).toBeEnabled();
+  await page.screenshot({ path: test.info().outputPath("final-govern-scoped-pass.png"), fullPage: true });
+  // Production break caught: Overview still advertises empty state after authenticated sessions, a Genome, renders and a scoped release exist.
+  // The older release checkpoint must remain explicitly unavailable, not deny all recent rows or inherit the new PASS.
+  const currentReports = await page.request.get(`${projectBasePath}/reports/data`);
+  expect(currentReports.status()).toBe(200);
+  expect((await currentReports.json()).sessions).toContainEqual(expect.objectContaining({ id: releaseSession.id, result: "NOT_VERIFIED" }));
+  await page.goto(`${projectBasePath}/overview`);
+  await expect(page.getByRole("heading", { name: "Recent evidence" })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("Saved sessions", { exact: true })).toBeVisible();
+  await expect(page.getByText(`Approved · v${genome.value.version}`, { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Analyze Reference" })).toHaveAttribute("href", `${projectBasePath}/learn`);
+  await expect(page.getByRole("link", { name: "Improve Screen" })).toHaveAttribute("href", `${projectBasePath}/execute`);
+  await expect(page.getByRole("link", { name: "Audit Product" })).toHaveAttribute("href", `${projectBasePath}/govern`);
+  await expect(page.getByText("Release gate: PASS · SELECTED SCREENS", { exact: true })).toBeVisible();
+  await page.screenshot({ path: test.info().outputPath("final-overview-evidence.png"), fullPage: true });
 });

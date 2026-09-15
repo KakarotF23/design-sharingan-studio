@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { execFileSync, spawn } from "node:child_process";
 import { constants } from "node:fs";
 import {
   lstat,
@@ -12,6 +12,7 @@ import {
   rename,
   rm,
   rmdir,
+  unlink,
 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import {
@@ -1387,10 +1388,34 @@ function renderApprovedFileDiff(delta: DeltaRecord): string {
   ].join("\n");
 }
 
-async function acquireExecutionClaim(
-  rootPath: string,
-  proposalId: string,
-): Promise<{ handle: Awaited<ReturnType<typeof open>>; path: string }> {
+interface ExecutionClaimRecord {
+  version: 1;
+  rootPath: string;
+  proposalId: string;
+  ownerId: string;
+  pid: number;
+  processStartedAt?: string;
+  phase: "PREPARING" | "APPLYING";
+}
+const activeExecutionOwners = new Set<string>();
+
+function processStartedAt(pid: number): string | undefined {
+  try { return execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined; }
+  catch { return undefined; }
+}
+
+function executionOwnerAlive(record: ExecutionClaimRecord): boolean {
+  if (activeExecutionOwners.has(record.ownerId)) return true;
+  if (record.pid === process.pid) return false;
+  try { process.kill(record.pid, 0); }
+  catch (error) { return !(error instanceof Error && "code" in error && error.code === "ESRCH"); }
+  const current = processStartedAt(record.pid);
+  // A missing process identity is uncertain, not proof of abandonment.
+  return !record.processStartedAt || current === undefined || current === record.processStartedAt;
+}
+
+async function executionClaimContext(rootPath: string) {
+  if (await realpath(rootPath) !== rootPath) throw new Error("Mutation recovery requires the canonical workspace root");
   const claimRoot = join(
     await realpath(tmpdir()),
     "design-sharingan-safe-mode-claims",
@@ -1413,8 +1438,84 @@ async function acquireExecutionClaim(
     .update(rootPath)
     .digest("hex");
   const path = join(claimRoot, `${digest}.claim`);
+  const keyPath = join(claimRoot, "authentication.key");
   try {
-    const handle = await open(
+    const key = await open(keyPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try { await key.writeFile(randomBytes(32)); await key.sync(); } finally { await key.close(); }
+  } catch (error) { if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error; }
+  const keyEntry = await lstat(keyPath);
+  if (!keyEntry.isFile() || keyEntry.isSymbolicLink() || keyEntry.nlink !== 1 || (keyEntry.mode & 0o077) !== 0 || keyEntry.size !== 32) throw new Error("Mutation claim authentication is unavailable");
+  const key = (await securelyReadRegularFile(keyPath)).contents;
+  const encode = (record: ExecutionClaimRecord) => stableJson({ record, signature: createHmac("sha256", key).update(stableJson(record)).digest("hex") });
+  const recoveryPath = (proposalId: string) => join(claimRoot, `${digest}.recovered-${createHash("sha256").update(proposalId).digest("hex")}.json`);
+  const signRecovery = (record: unknown) => stableJson({ record, signature: createHmac("sha256", key).update(stableJson(record)).digest("hex") });
+  return { path, encode, recoveryPath, signRecovery };
+}
+
+async function readAuthenticatedExecutionClaim(rootPath: string, context: Awaited<ReturnType<typeof executionClaimContext>>) {
+  const entry = await lstat(context.path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (entry === undefined) return undefined;
+  if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1 || entry.size > 4000 || (entry.mode & 0o077) !== 0) throw new Error("Invalid mutation claim; explicit recovery required");
+  const contents = Buffer.from((await securelyReadRegularFile(context.path)).contents).toString("utf8");
+  let prior: { record: ExecutionClaimRecord; signature: string };
+  try { prior = JSON.parse(contents); } catch { throw new Error("Unauthenticated mutation claim; explicit recovery required"); }
+  if (!prior.record || !exactObject(prior.record, ["version", "rootPath", "proposalId", "ownerId", "pid", "phase", ...(Object.hasOwn(prior.record, "processStartedAt") ? ["processStartedAt"] : [])]) ||
+      prior.record.version !== 1 || prior.record.rootPath !== rootPath || !safeIdentifier(prior.record.proposalId) || !safeIdentifier(prior.record.ownerId) ||
+      !Number.isSafeInteger(prior.record.pid) || prior.record.pid <= 0 || (prior.record.processStartedAt !== undefined && (typeof prior.record.processStartedAt !== "string" || prior.record.processStartedAt.length > 80)) || !["PREPARING", "APPLYING"].includes(prior.record.phase) || context.encode(prior.record) !== stableJson(prior)) throw new Error("Unauthenticated mutation claim; explicit recovery required");
+  return { entry, contents, record: prior.record, claimId: createHash("sha256").update(contents).digest("hex") };
+}
+
+export async function inspectMutationRecovery(rootPath: string) {
+  const claim = await readAuthenticatedExecutionClaim(rootPath, await executionClaimContext(rootPath));
+  return claim === undefined ? undefined : { claimId: claim.claimId, proposalId: claim.record.proposalId, phase: claim.record.phase, ownerState: executionOwnerAlive(claim.record) ? "ACTIVE" as const : "ABANDONED" as const };
+}
+
+/** Explicitly reconcile bookkeeping only. No target bytes are changed and the old approval is permanently spent. */
+export async function reconcileMutationRecovery(rootPath: string, decision: { claimId: string; proposalId: string; confirmation: "KEEP_CURRENT_FILES"; expectedSourceFingerprint: string }, readSourceFingerprint: () => Promise<string>): Promise<void> {
+  if (decision.confirmation !== "KEEP_CURRENT_FILES" || !/^[a-f0-9]{64}$/.test(decision.claimId) || !/^[a-f0-9]{64}$/.test(decision.expectedSourceFingerprint) || !safeIdentifier(decision.proposalId)) throw new Error("Explicit reviewed recovery confirmation is required");
+  const context = await executionClaimContext(rootPath);
+  const claim = await readAuthenticatedExecutionClaim(rootPath, context);
+  if (claim === undefined || claim.claimId !== decision.claimId || claim.record.proposalId !== decision.proposalId || claim.record.phase !== "APPLYING" || executionOwnerAlive(claim.record)) throw new Error("Recovery claim is unavailable, changed or actively owned");
+  if (await readSourceFingerprint() !== decision.expectedSourceFingerprint) throw new Error("Reviewed target files changed; inspect again before recovery");
+  const recovery = { version: 1, rootPath, proposalId: decision.proposalId, claimId: claim.claimId, sourceFingerprint: decision.expectedSourceFingerprint, decision: decision.confirmation, reconciledAt: new Date().toISOString() };
+  const recordPath = context.recoveryPath(decision.proposalId);
+  try {
+    const handle = await open(recordPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try { await handle.writeFile(context.signRecovery(recovery)); await handle.sync(); } finally { await handle.close(); }
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+    const prior = JSON.parse(Buffer.from((await securelyReadRegularFile(recordPath)).contents).toString("utf8"));
+    if (context.signRecovery(prior.record) !== stableJson(prior) || prior.record.claimId !== claim.claimId || prior.record.sourceFingerprint !== decision.expectedSourceFingerprint) throw new Error("Recovery record is ambiguous");
+  }
+  const current = await readAuthenticatedExecutionClaim(rootPath, context);
+  if (await readSourceFingerprint() !== decision.expectedSourceFingerprint || !current || current.claimId !== claim.claimId || current.entry.dev !== claim.entry.dev || current.entry.ino !== claim.entry.ino) throw new Error("Recovery ownership or target files changed; explicit review is still required");
+  await unlink(context.path);
+}
+
+async function acquireExecutionClaim(
+  rootPath: string,
+  proposalId: string,
+): Promise<{ beginTargetMutation(): Promise<void>; release(preserve: boolean): Promise<void> }> {
+  const context = await executionClaimContext(rootPath);
+  const { path, encode } = context;
+  // A recovery marker never grants fresh authority, even if malformed.
+  if (await lstat(context.recoveryPath(proposalId)).then(() => true, (error: unknown) => { if (error instanceof Error && "code" in error && error.code === "ENOENT") return false; throw error; })) throw new Error("A recovered proposal cannot be replayed; approve a new proposal");
+  const startedAt = processStartedAt(process.pid);
+  if (!startedAt) throw new Error("Mutation owner process identity is unavailable");
+  let record: ExecutionClaimRecord = { version: 1, rootPath, proposalId, ownerId: randomUUID(), pid: process.pid, processStartedAt: startedAt, phase: "PREPARING" };
+  let identity: { dev: number; ino: number };
+  let contents = encode(record);
+  const removeOwned = async () => {
+    const entry = await lstat(path);
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1 || entry.dev !== identity.dev || entry.ino !== identity.ino || await readFile(path, "utf8") !== contents) throw new Error("Mutation claim owner changed; explicit recovery required");
+    await unlink(path);
+  };
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const handle = await open(
       path,
       constants.O_WRONLY |
         constants.O_CREAT |
@@ -1422,23 +1523,77 @@ async function acquireExecutionClaim(
         constants.O_NOFOLLOW,
       0o600,
     );
-    await handle.writeFile(`${proposalId}\n`, "utf8");
-    await handle.sync();
-    return { handle, path };
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-      throw new Error("This approved proposal is already being executed");
+      try { await handle.writeFile(contents, "utf8"); await handle.sync(); identity = await handle.stat(); } finally { await handle.close(); }
+      activeExecutionOwners.add(record.ownerId);
+      break;
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+      if (attempt > 0) throw new Error("This approved proposal is already being executed");
+      const prior = await readAuthenticatedExecutionClaim(rootPath, context);
+      if (!prior) continue;
+      const priorEntry = prior.entry;
+      if (executionOwnerAlive(prior.record)) throw new Error("This approved proposal is already being executed");
+      if (prior.record.phase !== "PREPARING") throw new Error("Ambiguous target mutation: reconciliation required through explicit recovery");
+      const after = await lstat(path);
+      if (after.dev !== priorEntry.dev || after.ino !== priorEntry.ino || await readFile(path, "utf8") !== encode(prior.record)) throw new Error("Mutation claim changed; explicit recovery required");
+      await unlink(path);
     }
-    throw error;
+  }
+  return {
+    async beginTargetMutation() {
+      // Atomic publication precedes every target write. A crash from this point
+      // cannot be mistaken for an abandoned read-only preparation.
+      const entry = await lstat(path);
+      if (entry.dev !== identity.dev || entry.ino !== identity.ino || await readFile(path, "utf8") !== contents) throw new Error("Mutation claim ownership lost");
+      record = { ...record, phase: "APPLYING" };
+      contents = encode(record);
+      await defaultMutationDriver.write(path, Buffer.from(contents), 0o600);
+      identity = await lstat(path);
+    },
+    async release(preserve) {
+      activeExecutionOwners.delete(record.ownerId);
+      if (!preserve) await removeOwned();
+    },
+  };
+}
+
+const MUTATION_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["files"],
+  properties: { files: { type: "array", maxItems: MAX_APPROVED_PATHS, items: {
+    type: "object", additionalProperties: false, required: ["path", "contents"],
+    properties: { path: { type: "string" }, contents: { type: ["string", "null"] } },
+  } } },
+} as const;
+
+async function materializeStructuredMirror(root: string, records: TargetRecord[], value: unknown) {
+  if (!exactObject(value, ["files"]) || !Array.isArray((value as { files: unknown }).files)) throw new Error("Invalid structured mutation delta");
+  const files = (value as { files: { path: string; contents: string | null }[] }).files;
+  if (files.length !== records.length || new Set(files.map(({ path }) => path)).size !== files.length) throw new Error("Structured mutation scope mismatch");
+  let total = 0;
+  for (const file of files) {
+    const record = records.find(({ relativePath }) => relativePath === file.path);
+    if (!exactObject(file, ["path", "contents"]) || !record ||
+        (record.operation === "delete" ? file.contents !== null : typeof file.contents !== "string")) throw new Error("Structured mutation includes an unapproved operation");
+    if (file.contents !== null) {
+      const bytes = Buffer.byteLength(file.contents);
+      total += bytes;
+      if (bytes > MAX_FILE_BYTES || total > MAX_DELTA_BYTES) throw new Error("Structured mutation exceeds byte bounds");
+    }
+  }
+  for (const file of files) {
+    if (file.contents === null) await defaultMutationDriver.remove(join(root, file.path));
+    else await defaultMutationDriver.write(join(root, file.path), Buffer.from(file.contents), 0o600);
   }
 }
 
-function mutationPrompt(proposal: ChangeProposal): string {
+function mutationPrompt(proposal: ChangeProposal, records: TargetRecord[]): string {
   return [
     "Continue the exact approved Safe Mode proposal thread and implement the approved delta in this executor-owned mutation mirror.",
     "Mutate only the exact create/modify/delete paths listed below. Do not touch any other path, install dependencies, run project commands, commit Git changes, or access another workspace.",
     "The executor will reject any missing operation, extra operation, symlink, protected path, oversized output, or scope mismatch before applying anything to the active target.",
     `Approved proposal:\n${JSON.stringify(proposal, null, 2)}`,
+    "Return only structured files with the exact approved relative path and complete UTF-8 contents (null for an approved deletion). Do not use tools. The executor, not the agent, materializes the checked mirror delta.",
+    `Approved source contents: ${JSON.stringify(records.map((record) => ({ path: record.relativePath, operation: record.operation, contents: record.originalContents === undefined ? null : new TextDecoder("utf-8", { fatal: true }).decode(record.originalContents) })))}`,
   ].join("\n\n");
 }
 
@@ -1477,10 +1632,11 @@ export class MutationExecutor {
     validateAuthorization: () => void,
   ): Promise<MutationResult> {
     let claim:
-      | { handle: Awaited<ReturnType<typeof open>>; path: string }
+      | Awaited<ReturnType<typeof acquireExecutionClaim>>
       | undefined;
     let mirrorRoot: string | undefined;
     let targetMutationApplied = false;
+    let preserveClaim = false;
     try {
       validateAuthorization();
       if (
@@ -1507,13 +1663,16 @@ export class MutationExecutor {
       }
       await seedMirror(canonicalMirror, targetRecords);
       const result = await this.options.agent.run({
+        capabilityProfile: "MUTATION_MIRROR",
         workingDirectory: canonicalMirror,
-        prompt: mutationPrompt(proposal),
+        prompt: mutationPrompt(proposal, targetRecords),
         threadId: this.options.proposalThreadId,
+        outputSchema: MUTATION_OUTPUT_SCHEMA,
       });
       if (result.threadId !== this.options.proposalThreadId) {
         throw new Error("Mutation turn did not continue the same proposal thread");
       }
+      if (result.structured !== null) await materializeStructuredMirror(canonicalMirror, targetRecords, result.structured);
       const mirrorAfter = await snapshotMirror(canonicalMirror);
       const deltas = validateMirrorDelta(targetRecords, mirrorAfter);
       await this.options.assertWorkerOwnership?.();
@@ -1523,6 +1682,7 @@ export class MutationExecutor {
         await assertSafeAncestors(rootPath, record.relativePath);
         await assertTargetStillMatches(record);
       }
+      await claim.beginTargetMutation();
       await applyTransaction(
         rootPath,
         deltas,
@@ -1570,6 +1730,7 @@ export class MutationExecutor {
           : targetMutationApplied
             ? "RECONCILIATION_REQUIRED"
             : "NO_TARGET_CHANGE";
+      preserveClaim = targetDisposition === "RECONCILIATION_REQUIRED";
       throw new SafeMutationExecutionError(
         targetDisposition,
         [
@@ -1583,10 +1744,7 @@ export class MutationExecutor {
       if (mirrorRoot !== undefined) {
         await rm(mirrorRoot, { force: true, recursive: true }).catch(() => undefined);
       }
-      await claim?.handle.close().catch(() => undefined);
-      if (claim !== undefined) {
-        await rm(claim.path, { force: true }).catch(() => undefined);
-      }
+      await claim?.release(preserveClaim);
     }
   }
 }

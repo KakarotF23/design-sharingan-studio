@@ -26,9 +26,11 @@ import {
   loadSession,
   saveProjectMetadata,
   saveSession,
+  saveRenderArtifact,
   setSessionCommitFaultForTest,
 } from "../workspace-store";
 import { loadProjectReport } from "../report-projection";
+import * as safeStore from "../safe-execution-store";
 import type {
   FeatureEvolveApprovedSession,
   SafeExecutionDraftSession,
@@ -245,6 +247,54 @@ async function awaitingProposal(): Promise<{
 }
 
 describe("Safe execution proposal lifecycle", () => {
+  // Production break caught: a hard process death leaves APPROVED without the catch handler's failure checkpoint, so the signed abandoned APPLYING claim cannot reach the existing recovery UI.
+  it("publishes recovery-required evidence for an exact abandoned applying claim without replaying or changing product files", async () => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const approval = mutationApproval();
+    const interrupted = { ...waiting, status: "APPROVED" as const, updatedAt: approval.createdAt, mutationApproval: approval, proposalHistory: waiting.proposalHistory.map((entry) => ({ ...entry, decisionApproval: approval })) };
+    expect(safeStore.isSafeExecutionSession(interrupted)).toBe(true);
+    await saveSession(rootPath, interrupted);
+    const marker = join(rootPath, "retained-product.txt");
+    await writeFile(marker, "partially applied bytes must remain untouched");
+    const claim = { claimId: "a".repeat(64), proposalId: waiting.proposal.id, phase: "APPLYING" as const, ownerState: "ABANDONED" as const };
+    let inspections = 0;
+    const recovered = await safeStore.recoverInterruptedSafeExecution(rootPath, project.id, async () => { inspections++; return claim; });
+    expect(inspections).toBe(2);
+    expect(recovered).toMatchObject({ status: "APPROVED", mutationApproval: approval, executionFailure: { targetDisposition: "RECONCILIATION_REQUIRED", affectedPaths: ["src/reference-card.tsx"] } });
+    expect(await loadSafeExecutionState(rootPath, project.id)).toEqual(recovered);
+    expect(await readFile(marker, "utf8")).toBe("partially applied bytes must remain untouched");
+    await expect(approveAndExecuteSafeProposal(rootPath, project.id, waiting.id, approval, async () => { throw new Error("must not execute"); })).rejects.toThrow(/not waiting/);
+  });
+
+  // Production break caught: a reader could manufacture interrupted-mutation evidence from an active, missing, mismatched, or changing claim and displace the real owner.
+  it.each(["active", "missing", "wrong-proposal", "preparing", "changed"] as const)("does not recover an %s claim as an abandoned target mutation", async (condition) => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const approval = mutationApproval();
+    const interrupted = { ...waiting, status: "APPROVED" as const, updatedAt: approval.createdAt, mutationApproval: approval, proposalHistory: waiting.proposalHistory.map((entry) => ({ ...entry, decisionApproval: approval })) };
+    expect(safeStore.isSafeExecutionSession(interrupted)).toBe(true);
+    await saveSession(rootPath, interrupted);
+    const claim = { claimId: "a".repeat(64), proposalId: condition === "wrong-proposal" ? "other-proposal" : waiting.proposal.id, phase: condition === "preparing" ? "PREPARING" as const : "APPLYING" as const, ownerState: condition === "active" ? "ACTIVE" as const : "ABANDONED" as const };
+    let inspections = 0;
+    const inspect = async () => { inspections++; return condition === "missing" ? undefined : condition === "changed" && inspections > 1 ? { ...claim, claimId: "b".repeat(64) } : claim; };
+    const result = safeStore.recoverInterruptedSafeExecution(rootPath, project.id, inspect);
+    if (condition === "changed") await expect(result).rejects.toThrow(/claim.*changed/i);
+    else expect(await result).toEqual(interrupted);
+    expect(await loadSafeExecutionState(rootPath, project.id)).toEqual(interrupted);
+  });
+
+  // Production break caught: the outer Safe session lock is an ownerless file; an interrupted preparation permanently wedges a recovered journal session.
+  it("reconciles only an abandoned owner-bound Safe session claim", async () => {
+    const { rootPath, project, execute } = await initializedExecution();
+    const path = join(rootPath, ".design-sharingan/sessions", `.${execute.id}.safe-execution.claim`);
+    let residue = "";
+    await expect(prepareSafeExecutionProposal(rootPath, project.id, execute.id, async () => {
+      residue = await readFile(path, "utf8");
+      throw new Error("preparation interrupted");
+    })).rejects.toThrow("preparation interrupted");
+    expect(JSON.parse(residue)).toMatchObject({ kind: "DESIGN_SHARINGAN_LEARN_CLAIM", projectId: project.id, sessionId: execute.id, expectedStatus: "IDLE" });
+    await writeFile(path, residue, { mode: 0o600 });
+    await expect(prepareSafeExecutionProposal(rootPath, project.id, execute.id, async () => ({ proposal: proposal(), threadId: "proposal-thread" }))).resolves.toMatchObject({ status: "WAITING_APPROVAL" });
+  });
   it.each([
     ["after-journal-before-session", "IDLE", 1],
     ["after-session-before-commit", "PREPARING", 2],
@@ -564,6 +614,33 @@ describe("Safe execution proposal lifecycle", () => {
 });
 
 describe("Safe execution human decisions", () => {
+  async function verifiedSafeFixture() {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const editing = await approveAndExecuteSafeProposal(rootPath, project.id, waiting.id, mutationApproval(), async () => ({ proposalId: waiting.proposal.id, threadId: waiting.proposalThreadId, filesChanged: ["src/reference-card.tsx"], git: { available: false, statusBefore: "", statusAfter: "", diffAfter: "", truncation: gitTruncation() } }));
+    const render = { id: "safe-complete-render", sessionId: editing.id, roundId: "safe-verify", route: "/", viewport: "desktop", viewportWidth: 240, viewportHeight: 240, imagePath: join(rootPath, `.design-sharingan/renders/${editing.id}/safe-verify/desktop.png`), capturedAt: new Date().toISOString(), sourceRevision: { kind: "UNVERSIONED" as const, available: true as const, truncated: false as const, worktreeFingerprint: "a".repeat(64), fileCount: 1, requiredPathEvidence: [] } };
+    const png = Buffer.alloc(24); png.set([137, 80, 78, 71, 13, 10, 26, 10]); png.set([73, 72, 68, 82], 12); png.writeUInt32BE(240, 16); png.writeUInt32BE(240, 20);
+    await saveRenderArtifact(rootPath, render, png);
+    const pass = { status: "PASS" as const, evidence: ["Verified current scoped render"] };
+    const completed = await safeStore.verifySafeExecution(rootPath, project.id, editing.id, { async run() {}, async capture() { return render; }, async currentSourceFingerprint() { return "a".repeat(64); }, async stop() {}, async verify() { return { threadId: "safe-visual", findings: [], verification: { uxIntegrity: pass, productConsistency: pass, accessibility: pass, genomeIntegrity: { status: "NOT_VERIFIED" as const, evidence: ["No approved Genome"] } } }; } });
+    expect(completed.status).toBe("COMPLETE");
+    return { rootPath, project, completed, render };
+  }
+
+  // Production break caught: a completed Safe session omits its own fresh render from Reports, so Overview cannot surface the evidence of completion.
+  it("projects a completed Safe session's own authenticated render evidence", async () => {
+    const { rootPath, project, completed, render } = await verifiedSafeFixture();
+    const report = await loadProjectReport(rootPath, project.id, { offset: 0, limit: 10 });
+    expect(report.sessions.find(({ id }) => id === completed.id)?.evidence).toContainEqual({ kind: "RENDER", id: render.id, label: "desktop /" });
+  });
+
+  // Production break caught: retained COMPLETE metadata remains trusted after the underlying Safe render bytes have been replaced.
+  it("rejects retained Safe completion when its rendered artifact no longer authenticates", async () => {
+    const { rootPath, project, render } = await verifiedSafeFixture();
+    await writeFile(render.imagePath, "replaced rendered bytes", "utf8");
+    await expect(loadSafeExecutionHistory(rootPath, project.id)).rejects.toThrow(/render|integrity/i);
+    await expect(loadProjectReport(rootPath, project.id, { offset: 0, limit: 10 })).rejects.toThrow(/render|integrity/i);
+  });
+
   it.each([
     ["REVISION_REQUESTED", "REVISING"],
     ["REJECTED", "REJECTED"],
@@ -584,6 +661,45 @@ describe("Safe execution human decisions", () => {
       decisionApproval: approval,
       proposal: waiting.proposal,
     });
+  });
+
+  // Production break: a Safe session cannot run or fail closed after a successfully applied mutation.
+  // Production break caught: a failed visual check cannot produce a new proposal because the previous APPROVED history entry is treated as an invalid revision.
+  it("requires a new exact approval after fresh Safe verification finds another issue", async () => {
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const editing = await approveAndExecuteSafeProposal(rootPath, project.id, waiting.id, mutationApproval(), async () => ({ proposalId: waiting.proposal.id, threadId: waiting.proposalThreadId, filesChanged: ["src/reference-card.tsx"], git: { available: false, statusBefore: "", statusAfter: "", diffAfter: "", truncation: gitTruncation() } }));
+    const at = new Date().toISOString();
+    const render = { id: "safe-followup-render", sessionId: editing.id, roundId: "safe-verify", route: "/", viewport: "desktop", viewportWidth: 240, viewportHeight: 240, imagePath: join(rootPath, `.design-sharingan/renders/${editing.id}/safe-verify/desktop.png`), capturedAt: at, sourceRevision: { kind: "UNVERSIONED" as const, available: true as const, truncated: false as const, worktreeFingerprint: "a".repeat(64), fileCount: 1, requiredPathEvidence: [] } };
+    const png = Buffer.alloc(24); png.set([137, 80, 78, 71, 13, 10, 26, 10]); png.set([73, 72, 68, 82], 12); png.writeUInt32BE(240, 16); png.writeUInt32BE(240, 20);
+    await saveRenderArtifact(rootPath, render, png);
+    const pass = { status: "PASS" as const, evidence: ["Verified current scoped render"] };
+    const result = await safeStore.verifySafeExecution(rootPath, project.id, editing.id, { async run() {}, async capture() { return render; }, async currentSourceFingerprint() { return "a".repeat(64); }, async stop() {}, async verify() { return { threadId: "safe-visual", findings: [], verification: { uxIntegrity: pass, productConsistency: { status: "REGRESSION" as const, evidence: ["Hierarchy requires another change"] }, accessibility: pass, genomeIntegrity: { status: "NOT_VERIFIED" as const, evidence: ["No approved Genome"] } } }; } });
+    expect(result.status).toBe("PROPOSING");
+    const next = await prepareSafeExecutionProposal(rootPath, project.id, result.id, async () => ({ proposal: proposal({ id: "proposal-safe-2" }), threadId: waiting.proposalThreadId }));
+    expect(next.status).toBe("WAITING_APPROVAL");
+    await expect(approveAndExecuteSafeProposal(rootPath, project.id, next.id, mutationApproval(), async () => { throw new Error("Must not reuse old approval"); })).rejects.toThrow(/proposal/);
+    const second = await approveAndExecuteSafeProposal(rootPath, project.id, next.id, mutationApproval({ id: "approval-mutation-2", proposalId: "proposal-safe-2" }), async () => ({ proposalId: "proposal-safe-2", threadId: waiting.proposalThreadId, filesChanged: ["src/reference-card.tsx"], git: { available: false, statusBefore: "", statusAfter: "", diffAfter: "", truncation: gitTruncation() } }));
+    expect(second.status).toBe("EDITING");
+    expect(second.proposalHistory).toHaveLength(2);
+  });
+
+  it("persists rendering stages and FAILED instead of completing with missing fresh render evidence", async () => {
+    expect(safeStore).toHaveProperty("verifySafeExecution");
+    const { rootPath, project, waiting } = await awaitingProposal();
+    const editing = await approveAndExecuteSafeProposal(rootPath, project.id, waiting.id, mutationApproval(), async () => ({ proposalId: waiting.proposal.id, threadId: waiting.proposalThreadId, filesChanged: ["src/reference-card.tsx"], git: { available: false, statusBefore: "", statusAfter: "", diffAfter: "", truncation: gitTruncation() } }));
+    const stages: string[] = [];
+    let stopped = false;
+    const session = await safeStore.verifySafeExecution(rootPath, project.id, editing.id, {
+      async run() { stages.push((await loadSession(rootPath, project.id, editing.id)).status); },
+      async capture() { stages.push((await loadSession(rootPath, project.id, editing.id)).status); throw new Error("No fresh render"); },
+      async verify() { throw new Error("Must not analyze missing render"); },
+      async currentSourceFingerprint() { return "a".repeat(64); },
+      async stop() { stopped = true; },
+    });
+    expect(stages).toEqual(["RUNNING", "CAPTURING"]);
+    expect(session.status).toBe("FAILED");
+    expect(stopped).toBe(true);
+    await expect(approveAndExecuteSafeProposal(rootPath, project.id, editing.id, mutationApproval(), async () => { throw new Error("Must never replay"); })).rejects.toThrow(/waiting/);
   });
 
   it("persists APPROVED before execution and finishes truthfully at EDITING with exact mutation/Git evidence", async () => {
@@ -825,6 +941,13 @@ describe("Safe execution human decisions", () => {
     await expect(loadSafeExecutionState(rootPath, project.id)).rejects.toThrow(/ambiguous/i);
     const report = await loadProjectReport(rootPath, project.id, { offset: 0, limit: 25 });
     expect(report.sessions.filter(({ type }) => type === "SAFE_EXECUTION")).toHaveLength(2);
+    // Production break caught: a previous finished/rejected Safe session makes a newly approved finding-linked execution permanently ambiguous.
+    const firstWaiting = { ...execute, status: "WAITING_APPROVAL" as const, updatedAt: new Date().toISOString(), proposal: proposal(), proposalThreadId: "thread-history", proposalHistory: [{ proposal: proposal(), proposalThreadId: "thread-history", proposedAt: new Date().toISOString() }] };
+    await saveSession(rootPath, firstWaiting);
+    const rejectedApproval = mutationApproval({ decision: "REJECTED", comment: "Finished this direction." });
+    const rejected = { ...firstWaiting, status: "REJECTED", updatedAt: rejectedApproval.createdAt, decisionApproval: rejectedApproval, proposalHistory: [{ ...firstWaiting.proposalHistory[0], decisionApproval: rejectedApproval }] };
+    await saveSession(rootPath, rejected);
+    await expect(loadSafeExecutionState(rootPath, project.id)).resolves.toMatchObject({ id: "safe-session-2", status: "IDLE" });
   });
 
   it("persists bounded classified reconciliation evidence without discarding approval", async () => {

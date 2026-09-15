@@ -125,6 +125,14 @@ describe("scanReference", () => {
   });
 
   it.each([
+    // Production break caught: an entirely empty KRAI result can be persisted as analyzed design intelligence.
+    ["no KRAI decisions", { ...wireOutput, keep: [], reject: [], adapt: [], invent: [] }],
+    ["unknown authority field", { ...wireOutput, approved: true }],
+    ["blank scalar", { ...wireOutput, layout: "   " }],
+    ["scalar array", { ...wireOutput, layout: ["layout"] }],
+    ["non-string decision", { ...wireOutput, keep: [false] }],
+    ["blank decision", { ...wireOutput, keep: [" "] }],
+    ["overlong decision", { ...wireOutput, keep: ["x".repeat(1001)] }],
     ["an oversized analysis field", { ...wireOutput, hierarchy: "x".repeat(2_001) }],
     [
       "too many KRAI decisions",

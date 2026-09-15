@@ -658,7 +658,7 @@ function parseDriftFinding(value: unknown): DriftFinding {
   exactKeys(
     finding,
     ["category", "severity", "scope", "evidenceIds", "genomeRuleId", "expectedRule", "observedEvidence", "whyItMatters", "recommendedFix", "requiresDesignDecision", "status"],
-    [],
+    ["handoffKey"],
     "Drift finding",
   );
   const categories = new Set([
@@ -698,6 +698,7 @@ function parseDriftFinding(value: unknown): DriftFinding {
     recommendedFix: boundedString(finding.recommendedFix, "Drift recommendation"),
     requiresDesignDecision: finding.requiresDesignDecision,
     status: boundedString(finding.status, "Drift finding status", MAX_SHORT_TEXT_LENGTH),
+    ...(finding.handoffKey === undefined ? {} : { handoffKey: hash(finding.handoffKey, "Finding handoff identity") }),
   };
 }
 
@@ -706,7 +707,7 @@ function parseDriftReport(value: unknown): DriftReport {
   exactKeys(
     report,
     ["requestedScope", "expectedScope", "inspectedScope", "unavailableScope", "unverifiedScope", "evidenceIds", "findings", "overallStatus"],
-    [],
+    ["verificationSessionIds"],
     "Drift report",
   );
   if (report.requestedScope !== "WHOLE_APP" && report.requestedScope !== "SELECTED_SCREENS") {
@@ -744,6 +745,7 @@ function parseDriftReport(value: unknown): DriftReport {
     evidenceIds,
     findings: report.findings.map(parseDriftFinding),
     overallStatus: overallStatus as DriftReport["overallStatus"],
+    ...(report.verificationSessionIds === undefined ? {} : { verificationSessionIds: list(report.verificationSessionIds, "Verification sessions") }),
   };
 }
 

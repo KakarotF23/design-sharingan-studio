@@ -7,6 +7,8 @@ import type {
   ScreenRecord,
 } from "@design-sharingan/core";
 import { normalizeGovernanceRoute } from "@design-sharingan/core";
+import type { GovernanceCaptureSession } from "@design-sharingan/project-adapters";
+import { authenticateCaptureProofs, captureFullyVerified } from "./capture-proof";
 import {
   DRIFT_REPORT_FILE,
   commitAuditGenerationUnderLock,
@@ -117,6 +119,9 @@ function scopeKey(route: string, state: string): string {
 }
 
 function reportScopeMatchesRegistry(report: DriftReport, records: readonly ScreenRecord[]): boolean {
+  if (report.requestedScope === "SELECTED_SCREENS") {
+    return report.expectedScope.length > 0 && new Set(report.expectedScope.map(({ screen }) => screen)).size === report.expectedScope.length && report.expectedScope.every((scope) => scope.states.length > 0 && new Set(scope.states).size === scope.states.length && records.some((record) => record.route === scope.screen && scope.states.every((state) => record.requiredStates.includes(state))));
+  }
   if (report.expectedScope.length !== records.length) return false;
   const expected = new Map(report.expectedScope.map((entry) => [entry.screen, entry.states]));
   return records.every((record) => {
@@ -163,6 +168,7 @@ function validateIntrinsicReportTruth(
   records: readonly ScreenRecord[],
   catalog: readonly GovernanceEvidenceCatalogEntry[],
   genome: import("@design-sharingan/core").DesignGenome,
+  proofs: readonly GovernanceCaptureSession[] = [],
 ): void {
   if (!reportScopeMatchesRegistry(report, records)) {
     throw new Error("Drift Report scope no longer exactly matches the current Screen Registry");
@@ -174,8 +180,9 @@ function validateIntrinsicReportTruth(
     throw new Error("Drift Report inspected scope contains a state outside the current Screen Registry");
   }
   const unavailable = new Set([...report.unavailableScope, ...report.unverifiedScope]);
-  for (const record of records) {
-    for (const state of record.requiredStates) {
+  for (const scope of report.expectedScope) {
+    const record = records.find((entry) => entry.route === scope.screen)!;
+    for (const state of scope.states) {
       const key = scopeKey(record.route, state);
       if (!inspected.has(key)) {
         if (![...unavailable].some((value) => value.startsWith(`${key}:`))) {
@@ -215,7 +222,8 @@ function validateIntrinsicReportTruth(
     ) throw new Error("Drift finding is not bound to authenticated evidence and an approved Genome rule");
   }
   if (report.overallStatus === "PASS" || report.overallStatus === "PASS_WITH_DEBT") {
-    throw new Error("Drift Report cannot self-authenticate deterministic analysis or release readiness");
+    const unresolved = report.findings.filter(({ status }) => status !== "RESOLVED" && status !== "INTENTIONAL");
+    if (report.unverifiedScope.length > 0 || report.unavailableScope.length > 0 || report.expectedScope.some((scope) => scope.states.some((state) => !proofs.some((proof) => proof.render.route === scope.screen && proof.state === state && captureFullyVerified(proof)))) || (report.requestedScope === "WHOLE_APP" && report.expectedScope.length < 2) || unresolved.some(({ severity }) => severity === "CRITICAL" || severity === "IMPORTANT") || (report.overallStatus === "PASS" && unresolved.some(({ severity }) => severity === "POLISH"))) throw new Error("Drift Report cannot self-authenticate deterministic analysis or release readiness without complete capture proofs");
   }
 }
 
@@ -223,6 +231,7 @@ function registryWithVerification(
   records: readonly ScreenRecord[],
   verified: readonly VerifiedRegistryEntry[],
   catalog: readonly GovernanceEvidenceCatalogEntry[],
+  proofs: readonly GovernanceCaptureSession[] = [],
 ): ScreenRecord[] {
   const verifiedByRoute = new Map(verified.map((entry) => [entry.screen, entry]));
   if (verifiedByRoute.size !== verified.length) throw new Error("Screen verification cannot duplicate a route");
@@ -235,7 +244,7 @@ function registryWithVerification(
       verification.states.some((state) => !record.requiredStates.includes(state))) {
       throw new Error("Registry verification must cover every required screen state");
     }
-    if (verification.status === "PASS") {
+    if (verification.status === "PASS" && !record.requiredStates.every((state) => proofs.some((proof) => proof.render.route === record.route && proof.state === state && captureFullyVerified(proof)))) {
       throw new Error("Registry PASS cannot be inferred from absent drift observations");
     }
     if (verification.evidenceIds.length === 0 || verification.evidenceIds.some((id) => !validRenderIds.has(id))) {
@@ -283,7 +292,8 @@ export async function readDriftReport(
     metadata.evidenceIds.some((id) => !catalogIds.has(id)) ||
     metadata.value.evidenceIds.some((id) => !catalogIds.has(id))
   ) throw new Error("Drift Report evidence is not authenticated by the durable evidence catalog");
-  validateIntrinsicReportTruth(metadata.value, registry.records, catalog, genome.value);
+  const proofs = await authenticateCaptureProofs(rootPath, projectId, metadata.value, genome, catalog);
+  validateIntrinsicReportTruth(metadata.value, registry.records, catalog, genome.value, proofs);
   return document(metadata);
 }
 
@@ -318,9 +328,9 @@ export async function saveDriftReport(input: SaveDriftReportInput): Promise<Drif
     }
     const catalog = mergeCatalog(currentCatalog, input.evidenceCatalog);
     const reportEvidenceIds = [...new Set([
-      ...(existingReport?.kind === "DRIFT_REPORT" ? existingReport.value.evidenceIds : []),
+      ...(input.report.verificationSessionIds === undefined && existingReport?.kind === "DRIFT_REPORT" ? existingReport.value.evidenceIds : []),
       ...input.report.evidenceIds,
-      ...input.evidenceCatalog.map(({ id }) => id),
+      ...(input.report.verificationSessionIds === undefined ? input.evidenceCatalog.map(({ id }) => id) : []),
       ...(input.verifiedRegistry ?? []).flatMap(({ evidenceIds }) => evidenceIds),
     ])];
     if (reportEvidenceIds.some((id) => !catalog.some((entry) => entry.id === id))) {
@@ -334,12 +344,14 @@ export async function saveDriftReport(input: SaveDriftReportInput): Promise<Drif
       ),
       evidenceIds: reportEvidenceIds,
     };
-    validateIntrinsicReportTruth(report, registry.records, catalog, genome.value);
+    const proofs = await authenticateCaptureProofs(input.rootPath, input.projectId, report, genome, catalog);
+    validateIntrinsicReportTruth(report, registry.records, catalog, genome.value, proofs);
 
     const records = registryWithVerification(
       registry.records,
       input.verifiedRegistry ?? [],
       catalog,
+      proofs,
     );
     const registryMetadata: ScreenRegistryMetadata = {
       ...registry.metadata,

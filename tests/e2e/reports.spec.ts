@@ -25,6 +25,7 @@ test.afterAll(async () => {
   await rm(sandboxPath, { force: true, recursive: true });
 });
 
+// Production break caught: Reports can appear to pass by observing only intermediate execution, rather than the fixture's honest terminal render failure and retained mutation evidence.
 test("projects fake SCAN and Safe Mode evidence without inventing a verified result", async ({ page }) => {
   await page.goto("/projects?source=local");
   await page.getByLabel("Project folder path").fill(projectPath);
@@ -57,14 +58,22 @@ test("projects fake SCAN and Safe Mode evidence without inventing a verified res
   await expect(page).toHaveURL(/\/execute$/);
   await page.getByRole("button", { name: "Prepare change proposal" }).click();
   await expect(page.getByRole("heading", { name: "Safe Mode change proposal" })).toBeVisible();
+  const executionResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith("/execute/proposal/approve"),
+  );
   await page.getByRole("button", { name: "Approve & Execute" }).click();
+  const executed = await executionResponse;
+  expect({ status: executed.status(), payload: await executed.json() }).toMatchObject({
+    status: 200,
+    payload: { session: { status: "FAILED" } },
+  });
   await expect(page.getByRole("heading", { name: "Approved mutation applied" })).toBeVisible();
 
   await page.goto((studioPath as string).replace(/\/overview$/, "/reports"));
   await expect(page.getByRole("heading", { name: "Reports" })).toBeVisible();
   await expect(page.getByText("REFERENCE_SCAN", { exact: true })).toBeVisible();
   await expect(page.getByText("SAFE_EXECUTION", { exact: true })).toBeVisible();
-  await expect(page.getByText("IN_PROGRESS", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("FAILED", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("link", { name: "Change proposal" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Authenticated captures" })).toBeVisible();
   await expect(page.getByText("Render evidence is unavailable for this session.")).toBeVisible();

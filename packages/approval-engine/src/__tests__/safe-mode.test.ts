@@ -33,6 +33,8 @@ import {
   executeApproveOnceMutation,
   executePolicyAuthorizedMutation,
   MutationExecutor,
+  inspectMutationRecovery,
+  reconcileMutationRecovery,
   type AutonomousMutationAuthorization,
 } from "../mutation-executor";
 
@@ -141,6 +143,73 @@ const wireOutput = {
 };
 
 describe("structured Safe Mode proposals", () => {
+  // Production break caught: an authenticated interrupted target mutation has no explicit, non-replaying recovery path and permanently blocks every future proposal.
+  it("explicitly preserves reviewed target bytes, archives the claim, and permanently forbids replay of the old approval", async () => {
+    const root = await temporaryWorkspace();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/reference-card.tsx"), "before\n");
+    const options = { workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run<T>() { return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "after\n" }] } as T }; },
+    } };
+    await expect(new MutationExecutor({ ...options, async captureSourceRevision() { throw new Error("interrupted completion"); } }).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toThrow();
+    const recovery = await inspectMutationRecovery(root);
+    expect(recovery).toMatchObject({ proposalId: "proposal-safe-1", phase: "APPLYING", ownerState: "ABANDONED" });
+    const fingerprint = createHash("sha256").update("after\n").digest("hex");
+    await expect(reconcileMutationRecovery(root, { claimId: recovery!.claimId, proposalId: recovery!.proposalId, confirmation: "KEEP_CURRENT_FILES", expectedSourceFingerprint: fingerprint }, async () => "0".repeat(64))).rejects.toThrow(/changed/);
+    expect(await inspectMutationRecovery(root)).toBeDefined();
+    await reconcileMutationRecovery(root, { claimId: recovery!.claimId, proposalId: recovery!.proposalId, confirmation: "KEEP_CURRENT_FILES", expectedSourceFingerprint: fingerprint }, async () => fingerprint);
+    expect(await inspectMutationRecovery(root)).toBeUndefined();
+    expect(await readFile(join(root, "src/reference-card.tsx"), "utf8")).toBe("after\n");
+    await expect(new MutationExecutor(options).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toThrow(/recovered proposal cannot be replayed/i);
+    const nextProposal = proposalFixture({ id: "proposal-safe-new", status: "PROPOSED" });
+    await expect(new MutationExecutor({ ...options, agent: { async run<T>() { return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "newly approved\n" }] } as T }; } } }).apply({ proposal: nextProposal, approval: { ...approvalFixture(), id: "approval-safe-new", proposalId: nextProposal.id } })).resolves.toMatchObject({ filesChanged: ["src/reference-card.tsx"] });
+  });
+  // Production break caught: deleting a claim after target bytes changed lets a crash retry silently replay an ambiguous mutation.
+  it("retains authenticated recovery evidence after an ambiguous target mutation", async () => {
+    const root = await temporaryWorkspace();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/reference-card.tsx"), "before\n");
+    const options = { workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run<T>() { return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "after\n" }] } as T }; },
+    } };
+    await expect(new MutationExecutor({ ...options, async captureSourceRevision() { throw new Error("lost completion evidence"); } }).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toMatchObject({ failure: { targetDisposition: "RECONCILIATION_REQUIRED" } });
+    await expect(new MutationExecutor(options).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toThrow(/explicit recovery|reconciliation required/i);
+    expect(await readFile(join(root, "src/reference-card.tsx"), "utf8")).toBe("after\n");
+  });
+  // Production break caught: a crashed mutation owner leaves a permanent workspace claim even though no target write began.
+  it("reconciles an authenticated abandoned preparation claim without replaying another owner", async () => {
+    const root = await temporaryWorkspace();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/reference-card.tsx"), "before\n");
+    const claimPath = join(await realpath(tmpdir()), "design-sharingan-safe-mode-claims", `${createHash("sha256").update(root).digest("hex")}.claim`);
+    let residue = "";
+    await expect(new MutationExecutor({ workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run() { residue = await readFile(claimPath, "utf8"); throw new Error("owner interrupted"); },
+    } }).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toThrow("owner interrupted");
+    await writeFile(claimPath, residue, { mode: 0o600 });
+    const result = await new MutationExecutor({ workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run<T>() { return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "after\n" }] } as T }; },
+    } }).apply({ proposal: proposalFixture(), approval: approvalFixture() });
+    expect(result.filesChanged).toEqual(["src/reference-card.tsx"]);
+    expect(await readFile(join(root, "src/reference-card.tsx"), "utf8")).toBe("after\n");
+  });
+  // Production break caught: a live read-only agent cannot safely materialize an approved change unless the executor accepts and scope-checks its structured mirror delta.
+  it("materializes an exact structured mutation delta without granting the agent write tools", async () => {
+    const root = await temporaryWorkspace();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/reference-card.tsx"), "before\n");
+    let observed: CodexAgentRunInput | undefined;
+    const result = await new MutationExecutor({ workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run<T>(input: CodexAgentRunInput) {
+        observed = input;
+        return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "after\n" }] } as T };
+      },
+    } }).apply({ proposal: proposalFixture(), approval: approvalFixture() });
+    expect(observed?.capabilityProfile).toBe("MUTATION_MIRROR");
+    expect(observed?.prompt).toContain("before\\n");
+    expect(result.filesChanged).toEqual(["src/reference-card.tsx"]);
+    expect(await readFile(join(root, "src/reference-card.tsx"), "utf8")).toBe("after\n");
+  });
   it("uses the exact bounded proposal schema and returns risk, UX, visual, and file evidence without mutation", async () => {
     const analysisRoot = await temporaryWorkspace();
     const sentinelPath = join(analysisRoot, "sentinel.txt");

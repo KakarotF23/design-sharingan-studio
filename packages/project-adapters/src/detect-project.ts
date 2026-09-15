@@ -8,6 +8,7 @@ import {
 } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
 import { assertPathInsideWorkspace } from "./path-policy";
+import { devCommandFor } from "./dev-launch";
 import type {
   ProjectDetection,
   SupportedFramework,
@@ -244,10 +245,7 @@ function commandForScript(
   packageManager: SupportedPackageManager,
   scriptName: "dev" | "start",
 ): string {
-  if (packageManager === "npm") {
-    return scriptName === "start" ? "npm start" : "npm run dev";
-  }
-  return `${packageManager} ${scriptName}`;
+  return devCommandFor({ executable: packageManager, script: scriptName });
 }
 
 function detectDevCommand(

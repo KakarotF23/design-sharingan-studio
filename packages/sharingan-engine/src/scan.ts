@@ -122,7 +122,7 @@ function assertScanWireOutput(value: unknown): ScanWireOutput {
             entry.trim().length > 0 &&
             entry.length <= 1_000,
         ),
-    )
+    ) || decisionFields.every((field) => Array.isArray(output[field]) && (output[field] as unknown[]).length === 0)
   ) {
     throw new Error("Codex SCAN returned invalid structured output");
   }

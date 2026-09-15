@@ -77,6 +77,8 @@ export type ReleaseCheckStatus = "PASS" | "PASS_WITH_DEBT" | "FAIL" | "NOT_VERIF
 export type DesignSessionType =
   | "REFERENCE_SCAN"
   | "ASSIMILATION"
+  | "DESIGN_VERIFY"
+  | "GOVERNANCE_CAPTURE"
   | "FEATURE_EVOLVE"
   | "SAFE_EXECUTION"
   | "MANGEKYO_LOOP"
@@ -140,6 +142,8 @@ const CANONICAL_SESSION_IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
 const DESIGN_SESSION_TYPES = [
   "REFERENCE_SCAN",
   "ASSIMILATION",
+  "DESIGN_VERIFY",
+  "GOVERNANCE_CAPTURE",
   "FEATURE_EVOLVE",
   "SAFE_EXECUTION",
   "MANGEKYO_LOOP",
@@ -385,6 +389,7 @@ export interface VisualRound {
   accessibility: VisualIntegrityVerification;
   genomeIntegrity: VisualIntegrityVerification;
   genomeEvidenceVersion?: string;
+  genomeEvidence?: GenomeEvidence;
   status: MangekyoStatus;
 }
 
@@ -514,6 +519,22 @@ export interface MangekyoLoopSession extends DesignSession {
   stopReason?: string;
 }
 
+export interface GenomeEvidence {
+  entityId: string;
+  version: string;
+  revision: number;
+  payloadHash: string;
+}
+
+export function isGenomeEvidence(value: unknown): value is GenomeEvidence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as GenomeEvidence;
+  return Object.keys(item).sort().join(",") === "entityId,payloadHash,revision,version" &&
+    typeof item.entityId === "string" && /^[a-zA-Z0-9._-]{1,128}$/.test(item.entityId) &&
+    typeof item.version === "string" && item.version.length > 0 && item.version.length <= 128 &&
+    Number.isSafeInteger(item.revision) && item.revision > 0 && typeof item.payloadHash === "string" && /^[a-f0-9]{64}$/.test(item.payloadHash);
+}
+
 export interface DesignGenome {
   version: string;
   status: "DRAFT" | "APPROVED";
@@ -613,6 +634,7 @@ export interface DesignDecision {
 }
 
 export interface DriftFinding {
+  handoffKey?: string;
   category: DriftAuditCategory;
   severity: DriftSeverity;
   scope: string;
@@ -624,6 +646,18 @@ export interface DriftFinding {
   recommendedFix: string;
   requiresDesignDecision: boolean;
   status: string;
+}
+export interface GovernanceFindingSource {
+  reportEntityId: string;
+  reportRevision: number;
+  findingKey: string;
+  scope: string;
+  evidenceIds: string[];
+}
+export function isGovernanceFindingSource(value: unknown): value is GovernanceFindingSource {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const source = value as GovernanceFindingSource;
+  return Object.keys(value).sort().join() === ["reportEntityId", "reportRevision", "findingKey", "scope", "evidenceIds"].sort().join() && isCanonicalIdentifier(source.reportEntityId) && Number.isSafeInteger(source.reportRevision) && source.reportRevision > 0 && /^[a-f0-9]{64}$/.test(source.findingKey) && typeof source.scope === "string" && source.scope.length > 0 && source.scope.length < 512 && Array.isArray(source.evidenceIds) && source.evidenceIds.length > 0 && source.evidenceIds.length <= 32 && source.evidenceIds.every(isCanonicalIdentifier);
 }
 
 export type DriftAuditCategory =
@@ -660,6 +694,7 @@ export interface DriftReport {
   evidenceIds: string[];
   findings: DriftFinding[];
   overallStatus: ReleaseGateStatus;
+  verificationSessionIds?: string[];
 }
 
 export type ReleaseGateCheckName =

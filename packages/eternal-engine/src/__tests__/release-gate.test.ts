@@ -88,6 +88,15 @@ function checkedInput() {
 }
 
 describe("Release gate", () => {
+  // Production break: sequential real captures can never pass because every render is required to have an identical timestamp.
+  it("accepts independently captured fresh states at the exact latest verification timestamp", () => {
+    const input = checkedInput();
+    input.authenticatedEvidence[0]!.capturedAt = "2026-08-31T11:59:58.000Z";
+    input.authenticatedEvidence.find((entry) => entry.id === "ev_render_01")!.capturedAt = "2026-08-31T11:59:59.000Z";
+    expect(evaluateReleaseGate(input).status).toBe("PASS");
+    input.authenticatedEvidence[0]!.capturedAt = "2026-08-31T12:00:01.000Z";
+    expect(evaluateReleaseGate(input).status).toBe("NOT_VERIFIED");
+  });
   it("blocks PASS when final render evidence is stale", () => {
     const result = evaluateReleaseGate({
       navigation: "PASS",

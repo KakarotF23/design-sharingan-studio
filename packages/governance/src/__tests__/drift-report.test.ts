@@ -17,6 +17,8 @@ import {
   setAuditTransactionFaultForTest,
 } from "../index";
 import { parseGovernanceMetadata, renderDriftReport, renderScreenRegistry } from "../templates";
+import { saveGovernanceCaptureSession, saveProjectMetadata, saveRenderArtifact } from "@design-sharingan/project-adapters";
+import * as governance from "../index";
 
 const roots: string[] = [];
 
@@ -133,6 +135,39 @@ describe("Drift Report governance store", () => {
       evidenceCatalog: [],
       report: unavailableReport(),
     })).rejects.toThrow(/authoritative.*Genome|approved.*Genome/i);
+  });
+
+  // Production break: even an exact authenticated render/check/Genome proof is unconditionally refused as a clean scoped audit.
+  // Production break: there is no authenticated human decision writer for permitted non-blocking polish debt.
+  it("records a signed non-Genome-changing human decision and rejects consequential changes", async () => {
+    expect(governance).toHaveProperty("recordApprovedNonConsequentialDecision");
+    const root = await realpath(await mkdtemp(join(tmpdir(), "polish-decision-"))); roots.push(root); await initialize(root);
+    const at = new Date().toISOString();
+    const decision = { id: "debt-polish-1", date: at, status: "APPROVED" as const, scope: "/overview#default", decision: "Accept polish debt: /overview#default: Refine spacing", reason: "Release can proceed while spacing is tracked.", alternatives: ["Fix now"], affectedScreens: ["/overview"], affectedComponents: [], migrationRequired: false, genomeChanges: [], approvedBy: "local-user" as const };
+    await governance.recordApprovedNonConsequentialDecision(root, "project-a", decision, 1);
+    expect((await governance.readDesignDecisions(root, "project-a")).decisions).toContainEqual(decision);
+    await expect(governance.recordApprovedNonConsequentialDecision(root, "project-a", { ...decision, id: "debt-polish-2", genomeChanges: ["Rewrite Genome"] }, 2)).rejects.toThrow(/consequential/);
+  });
+
+  it("persists a clean scoped PASS only with a matching durable capture proof", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "drift-proof-"))); roots.push(root); await initialize(root);
+    const at = new Date().toISOString();
+    await saveProjectMetadata({ id: "project-a", rootPath: root, name: "Proof", sourceType: "LOCAL", status: "READY", createdAt: at, updatedAt: at });
+    const approved = await readGenome(root, "project-a");
+    const render = { id: "render-proof", sessionId: "capture-proof", roundId: "capture", route: "/overview", viewport: "desktop", viewportWidth: 240, viewportHeight: 240, imagePath: join(root, ".design-sharingan/renders/capture-proof/capture/desktop.png"), capturedAt: at, sourceRevision: { kind: "UNVERSIONED" as const, available: true as const, truncated: false as const, worktreeFingerprint: "a".repeat(64), fileCount: 1, requiredPathEvidence: [] } };
+    const png = Buffer.alloc(24); png.set([137, 80, 78, 71, 13, 10, 26, 10]); png.set([73, 72, 68, 82], 12); png.writeUInt32BE(240, 16); png.writeUInt32BE(240, 20);
+    await saveRenderArtifact(root, render, png);
+    const pass = { status: "PASS" as const, evidence: ["Observed approved rule in the actual render."] };
+    const categories = ["UX_NAVIGATION", "ACCESSIBILITY_REQUIRED_STATES", "PRODUCT_IDENTITY_SCREEN_FAMILY", "COMPONENTS_TOKENS", "HIERARCHY", "MOTION", "POLISH"] as const;
+    await saveGovernanceCaptureSession(root, { id: render.sessionId, projectId: "project-a", type: "GOVERNANCE_CAPTURE", status: "COMPLETE", createdAt: at, updatedAt: at, state: "default", render, genomeEvidence: { entityId: approved.metadata.entityId, version: approved.value.version, revision: approved.metadata.revision, payloadHash: approved.payloadHash }, browserChecks: { navigation: "PASS", accessibility: "PASS", functionalVerification: "PASS", evidence: ["Real bounded browser smoke passed."] }, analysis: { threadId: "thread-proof", findings: [], verification: { uxIntegrity: pass, productConsistency: pass, accessibility: pass, genomeIntegrity: pass } }, verifiedCategories: categories.map((category) => ({ category, evidence: pass.evidence })) });
+    const expectedRule = "Keep human decisions explicit.";
+    const input: Parameters<typeof saveDriftReport>[0] = { rootPath: root, projectId: "project-a", expectedRevision: 1, evidenceCatalog: [{ id: "ev_proof_0001", kind: "RENDER", route: "/overview", excerpt: "Exact checked render", authenticatedRenderId: render.id, renderState: "default", renderCapturedAt: at, renderSourceRevisionFingerprint: "a".repeat(64), verifiedClaims: [{ claimType: "RULE", category: "UX_INVARIANT", statement: expectedRule, scope: { routes: ["/overview"] } }] }], report: { ...unavailableReport(), inspectedScope: ["/overview#default"], unavailableScope: [], unverifiedScope: [], overallStatus: "PASS", evidenceIds: ["ev_proof_0001"], verificationSessionIds: [render.sessionId] } };
+    await saveDriftReport(input);
+    expect((await readDriftReport(root, "project-a")).value.overallStatus).toBe("PASS");
+    // Production break caught: an independently submitted Important finding can borrow otherwise clean capture labels and be signed as PASS_WITH_DEBT.
+    const important = { category: "UX_NAVIGATION" as const, severity: "IMPORTANT" as const, scope: "/overview#default", evidenceIds: ["ev_proof_0001"], genomeRuleId: `genome-rule-${createHash("sha256").update(`UX_NAVIGATION\0${expectedRule}`).digest("hex").slice(0, 24)}`, expectedRule, observedEvidence: ["An explicit human decision is bypassed."], whyItMatters: "The approved workflow must retain its gate.", recommendedFix: "Restore the gate.", requiresDesignDecision: false, status: "OPEN" };
+    await expect(saveDriftReport({ ...input, expectedRevision: 2, evidenceCatalog: [], report: { ...input.report, overallStatus: "PASS_WITH_DEBT", findings: [important] } })).rejects.toThrow(/cannot self-authenticate|blocking/i);
+    expect((await readDriftReport(root, "project-a")).value.overallStatus).toBe("PASS");
   });
 
   it("publishes authenticated catalog/report state as a complete generation without inferring Registry PASS", async () => {

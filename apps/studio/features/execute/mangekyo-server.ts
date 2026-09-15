@@ -3,6 +3,7 @@ import { createServer } from "node:net";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { loadApprovedGenomeContext } from "@design-sharingan/governance";
 import {
   executeApproveOnceMutation,
   executePolicyAuthorizedMutation,
@@ -45,7 +46,7 @@ import {
   saveMangekyoAuthorization,
   saveMangekyoLoopSession,
   type ProjectWorkspace,
-  type SafeExecutionEditingSession,
+  type SafeExecutionAppliedSession as SafeExecutionEditingSession,
   type MangekyoWorkerLeaseOwner,
 } from "@design-sharingan/project-adapters";
 import {
@@ -191,7 +192,7 @@ export async function loadMangekyoContext(project: Project): Promise<{
   if (
     session !== undefined &&
     !isTerminalStatus(session.status) &&
-    session.status !== "HUMAN_GATE"
+    (session.status !== "HUMAN_GATE" || stopRequest !== undefined)
   ) {
     await recoverMangekyoLoop(project, references, session);
   }
@@ -441,6 +442,7 @@ async function loopDependencies(input: {
       })).artifact;
     },
     async analyze({ session, render }) {
+      const genomeContext = await loadApprovedGenomeContext(input.project.rootPath, input.project.id);
       const visual = await analyzeRender(
         {
           projectId: input.project.id,
@@ -452,6 +454,7 @@ async function loopDependencies(input: {
             imagePath: reference.imagePath as string,
           })),
           currentRender: render,
+          genome: genomeContext?.genome,
           productContext: {
             name: input.project.name,
             approvedDirection: session.approvedDirection,
@@ -465,12 +468,15 @@ async function loopDependencies(input: {
             ],
           },
         },
-        { agent: createMangekyoVisualAgent(), createId: randomUUID },
+        { agent: createMangekyoVisualAgent(genomeContext !== undefined), createId: randomUUID },
       );
+      const currentGenome = await loadApprovedGenomeContext(input.project.rootPath, input.project.id);
+      if (!isDeepStrictEqual(genomeContext?.evidence, currentGenome?.evidence)) throw new Error("Genome authority changed during visual analysis");
       return {
         threadId: visual.threadId,
         findings: visual.findings,
         verification: visual.verification,
+        ...(genomeContext === undefined ? {} : { genomeEvidence: genomeContext.evidence }),
         ...(visual.genomeEvidenceVersion === undefined
           ? {}
           : { genomeEvidenceVersion: visual.genomeEvidenceVersion }),
@@ -619,7 +625,7 @@ async function recoverMangekyoLoop(
   if (mangekyoWorkers.has(key)) return;
   await requireActiveClaim(project, session);
   const safe = await loadSafeExecutionState(project.rootPath, project.id);
-  if (safe.id !== session.sourceExecutionSessionId || safe.status !== "EDITING") {
+  if (safe.id !== session.sourceExecutionSessionId || (safe.status !== "EDITING" && safe.status !== "COMPLETE")) {
     throw new Error("Mangekyo recovery source execution evidence is stale");
   }
   const references = allReferences.filter(({ id }) => session.referenceIds.includes(id));
@@ -646,7 +652,7 @@ export async function startMangekyoLoop(
     throw new Error("Another durable Mangekyo loop already owns this project");
   }
   const safe = await loadSafeExecutionState(project.rootPath, project.id);
-  if (safe.id !== safeSessionId || safe.status !== "EDITING") {
+  if (safe.id !== safeSessionId || (safe.status !== "EDITING" && safe.status !== "COMPLETE")) {
     throw new Error("Mangekyo requires the exact approved Safe Execution source");
   }
   const allReferences = await listReferences(project.rootPath, project.id);
@@ -728,7 +734,7 @@ export async function decideMangekyoGate(
   }
   await requireActiveClaim(project, session);
   const safe = await loadSafeExecutionState(project.rootPath, project.id);
-  if (safe.id !== session.sourceExecutionSessionId || safe.status !== "EDITING") {
+  if (safe.id !== session.sourceExecutionSessionId || (safe.status !== "EDITING" && safe.status !== "COMPLETE")) {
     throw new Error("Mangekyo source execution evidence is stale");
   }
   const allReferences = await listReferences(project.rootPath, project.id);
@@ -851,7 +857,7 @@ export async function stopMangekyoLoop(
   }
   await requireActiveClaim(project, session);
   const safe = await loadSafeExecutionState(project.rootPath, project.id);
-  if (safe.id !== session.sourceExecutionSessionId || safe.status !== "EDITING") {
+  if (safe.id !== session.sourceExecutionSessionId || (safe.status !== "EDITING" && safe.status !== "COMPLETE")) {
     throw new Error("Mangekyo source execution evidence is stale");
   }
   const allReferences = await listReferences(project.rootPath, project.id);

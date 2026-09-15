@@ -114,10 +114,14 @@ test("uploads a visual reference, runs SCAN, and saves a report", async ({
       return session.status;
     }, { intervals: [10], timeout: 5_000 })
     .toBe("ANALYZING");
+  // Production break caught: SCAN's visible busy/completion state is not exposed to assistive technology and focus never reaches the new result.
+  await expect(page.locator(".learn-workspace")).toHaveAttribute("aria-busy", "true");
 
   for (const decision of ["KEEP", "REJECT", "ADAPT", "INVENT"]) {
     await expect(page.getByRole("heading", { name: decision })).toBeVisible();
   }
+  await expect(page.getByRole("region", { name: "SCAN results" })).toBeFocused();
+  await expect(page.getByRole("status").filter({ hasText: "SCAN complete" })).toBeVisible();
   await expect(page.getByText("Clear hierarchy", { exact: true })).toBeVisible();
   await expect(
     page.getByText("Add an explicit product-fit decision trail", {
@@ -129,6 +133,35 @@ test("uploads a visual reference, runs SCAN, and saves a report", async ({
   await expect(page.getByText("REFERENCE_SCAN", { exact: true })).toBeVisible();
   await expect(page.getByText("Editorial control room", { exact: true })).toBeVisible();
   await expect(page.getByText("COMPLETE", { exact: true }).first()).toBeVisible();
+
+  // Production break: ASSIMILATE and VERIFY are disabled and cannot leave authenticated, inspectable reports.
+  await page.goto((studioPath as string).replace(/\/overview$/, "/references"));
+  await page.getByLabel("Reference image").setInputFiles(referenceImagePath);
+  await page.getByLabel("Reference title").fill("Second direction");
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await expect(page.getByRole("heading", { name: "Second direction" })).toBeVisible();
+  await page.goto((studioPath as string).replace(/\/overview$/, "/learn"));
+  await page.getByLabel("Reference to analyze").selectOption({ label: "Second direction" });
+  await page.getByRole("button", { name: "Analyze", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "KEEP", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "ASSIMILATE", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "ASSIMILATE", exact: true }).click();
+  await page.getByLabel("Editorial control room").check();
+  await page.getByLabel("Second direction").check();
+  await page.getByRole("button", { name: "Assimilate references" }).click();
+  await expect(page.getByRole("heading", { name: "Proposed direction" })).toBeVisible();
+  await page.getByRole("button", { name: "VERIFY", exact: true }).click();
+  await page.getByLabel("Intended design logic").fill("Preserve stable navigation and clear hierarchy.");
+  await page.getByLabel("Current direction or result").fill("The proposal introduces a new primary navigation route.");
+  await page.getByRole("button", { name: "Verify direction" }).click();
+  await expect(page.getByText("DESIGN_DIRECTION_ONLY", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Design direction review" })).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "VERIFY", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Design direction review" })).toBeVisible();
+  await page.goto((studioPath as string).replace(/\/overview$/, "/reports"));
+  await expect(page.getByText("ASSIMILATION", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("DESIGN_VERIFY", { exact: true }).first()).toBeVisible();
 });
 
 test("project-scoped mutation envelopes stay same-origin, typed, and bounded", async () => {

@@ -1,7 +1,7 @@
 "use client";
 
 import type { DesignDNA } from "@design-sharingan/core";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { WorkspaceHeader } from "@design-sharingan/ui";
 import { useStudioProject } from "../projects/project-shell";
 import type { ReferenceView } from "../references/reference-types";
@@ -23,6 +23,8 @@ export function ScanWorkspace() {
   const [designDNA, setDesignDNA] = useState<DesignDNA>();
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const resultRef = useRef<HTMLElement>(null);
+  useEffect(() => { if (designDNA) resultRef.current?.focus(); }, [designDNA]);
 
   useEffect(() => {
     fetch(`/projects/${encodeURIComponent(project.id)}/references/data`, {
@@ -72,7 +74,7 @@ export function ScanWorkspace() {
   }
 
   return (
-    <div className="learn-workspace">
+    <div className="learn-workspace" aria-busy={busy}>
       <WorkspaceHeader
         eyebrow={`DESIGN INTELLIGENCE / ${project.name.toUpperCase()}`}
         title="Learn"
@@ -117,7 +119,8 @@ export function ScanWorkspace() {
           </button>
         </div>
       </form>
-      {designDNA ? <DesignDNAView designDNA={designDNA} /> : null}
+      <p role="status" aria-live="polite">{busy ? "SCAN is analyzing the reference." : designDNA ? "SCAN complete. Review KEEP, REJECT, ADAPT and INVENT." : ""}</p>
+      {designDNA ? <section aria-label="SCAN results" tabIndex={-1} ref={resultRef}><DesignDNAView designDNA={designDNA} /></section> : null}
     </div>
   );
 }

@@ -6,6 +6,7 @@ import {
   loadSafeExecutionState,
 } from "@design-sharingan/project-adapters";
 import { createSafeMutationAgent } from "../../../../../../features/execute/safe-mode-agent";
+import { verifyApprovedSafeMutation } from "../../../../../../features/execute/safe-verification-server";
 import { resolveProjectRequest } from "../../../../../../features/projects/project-access";
 import { readProjectJson } from "../../../../../../features/projects/project-request";
 
@@ -66,7 +67,7 @@ export async function POST(
           agent: createSafeMutationAgent(),
         }).apply({ proposal: approved.proposal, approval }),
     );
-    return Response.json({ session });
+    return Response.json({ session: await verifyApprovedSafeMutation(project, session.id) });
   } catch {
     return Response.json(
       { error: "The approved mutation could not be applied safely." },

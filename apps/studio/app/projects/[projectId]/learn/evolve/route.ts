@@ -14,6 +14,8 @@ import type {
   FeatureEvolveResultSession,
 } from "@design-sharingan/project-adapters";
 import { evolveFeature } from "@design-sharingan/sharingan-engine";
+import { loadApprovedGenomeContext } from "@design-sharingan/governance";
+import { resolveGovernanceFinding } from "@design-sharingan/eternal-engine";
 import { createEvolveAgent } from "../../../../../features/learn/evolve-agent";
 import { parseFeatureBrief } from "../../../../../features/learn/feature-brief";
 import { resolveProjectRequest } from "../../../../../features/projects/project-access";
@@ -64,6 +66,8 @@ export async function POST(
   let resultPersisted = false;
   try {
     const project = await resolveProjectRequest(projectId);
+    const approvedGenome = await loadApprovedGenomeContext(project.rootPath, project.id);
+    const linkedFinding = typeof parsed.body.findingKey === "string" ? await resolveGovernanceFinding(project, parsed.body.findingKey) : undefined;
     activeProjectRoot = project.rootPath;
     const [detection, analyses] = await Promise.all([
       detectProject(project.rootPath),
@@ -118,6 +122,8 @@ export async function POST(
       updatedAt: createdAt,
       featureBrief,
       referenceIds: selectedReferenceIds,
+      ...(approvedGenome === undefined ? {} : { genomeEvidence: approvedGenome.evidence }),
+      ...(linkedFinding === undefined ? {} : { sourceFinding: linkedFinding.sourceFinding }),
     };
     await saveSession(project.rootPath, draftSession);
     analyzingSession = {
@@ -133,9 +139,18 @@ export async function POST(
         referenceAnalyses: analyses,
         analysisWorkingDirectory: analysisPath,
         projectContext,
+        ...(approvedGenome === undefined ? {} : { approvedGenome: approvedGenome.genome }),
       },
       { agent: createEvolveAgent() },
     );
+    const currentGenome = await loadApprovedGenomeContext(project.rootPath, project.id);
+    if (linkedFinding !== undefined) {
+      const currentFinding = await resolveGovernanceFinding(project, linkedFinding.sourceFinding.findingKey);
+      if (JSON.stringify(currentFinding.sourceFinding) !== JSON.stringify(linkedFinding.sourceFinding)) throw new Error("Finding changed during EVOLVE");
+    }
+    if (JSON.stringify(currentGenome?.evidence) !== JSON.stringify(approvedGenome?.evidence)) {
+      throw new Error("Approved Genome changed during EVOLVE analysis");
+    }
     const resultSession: FeatureEvolveResultSession = {
       ...draftSession,
       status: "RESULT_READY",

@@ -103,20 +103,9 @@ describe("deny-by-default Eternal Codex provider", () => {
       },
     });
 
-    expect(clientOptions).toEqual({
-      env: {
-        HOME: "/Users/local",
-        CODEX_HOME: "/Users/local/.codex",
-        PATH: "/usr/bin",
-        TMPDIR: "/tmp",
-        LANG: "en_US.UTF-8",
-        LC_ALL: "en_US.UTF-8",
-        CODEX_API_KEY: "codex-key",
-        OPENAI_API_KEY: "openai-key",
-        SSL_CERT_FILE: "/etc/cert.pem",
-        SSL_CERT_DIR: "/etc/certs",
-      },
-    });
+    expect(clientOptions?.env?.CODEX_HOME).not.toBe("/Users/local/.codex");
+    expect(clientOptions?.env?.GITHUB_TOKEN).toBeUndefined();
+    expect(clientOptions).toMatchObject({ config: { features: { shell_tool: false, plugins: false, hooks: false } } });
   });
 
   // Production break caught: merely using a read-only sandbox still permits commands and tools to inspect data beyond the bounded evidence prompt.
