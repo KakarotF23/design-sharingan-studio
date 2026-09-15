@@ -1,0 +1,20 @@
+{
+  "name": "@design-sharingan/agent-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit --project tsconfig.json"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "0.153.4"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "vitest": "latest"
+  }
+}

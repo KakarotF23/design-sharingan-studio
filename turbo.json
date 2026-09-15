@@ -1,0 +1,10 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "dangerouslyDisablePackageManagerCheck": true,
+  "tasks": {
+    "dev": { "cache": false, "persistent": true },
+    "build": { "dependsOn": ["^build"], "outputs": [".next/**", "dist/**"] },
+    "test": { "dependsOn": ["^test"] },
+    "typecheck": { "dependsOn": ["^typecheck"] }
+  }
+}

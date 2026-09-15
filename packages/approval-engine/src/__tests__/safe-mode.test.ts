@@ -1,0 +1,2222 @@
+import { execFile as execFileCallback } from "node:child_process";
+import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import {
+  chmod,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { promisify } from "node:util";
+import { afterEach, describe, expect, it } from "vitest";
+import type {
+  Approval,
+  ChangeProposal,
+  DesignApproach,
+  FeatureBrief,
+} from "@design-sharingan/core";
+import { DEFAULT_AUTONOMY_POLICY } from "@design-sharingan/core";
+import type { CodexAgentRunInput } from "@design-sharingan/agent-runtime";
+import {
+  CHANGE_PROPOSAL_OUTPUT_SCHEMA,
+  generateChangeProposal,
+} from "../change-proposal";
+import {
+  executeApproveOnceMutation,
+  executePolicyAuthorizedMutation,
+  MutationExecutor,
+  inspectMutationRecovery,
+  reconcileMutationRecovery,
+  type AutonomousMutationAuthorization,
+} from "../mutation-executor";
+
+const execFile = promisify(execFileCallback);
+
+const temporaryDirectories: string[] = [];
+
+async function temporaryWorkspace(): Promise<string> {
+  const path = await mkdtemp(join(tmpdir(), "design-sharingan-safe-mode-test-"));
+  temporaryDirectories.push(path);
+  return realpath(path);
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) =>
+      rm(path, { force: true, recursive: true }),
+    ),
+  );
+});
+
+const designApproach: DesignApproach = {
+  id: "approach-guided-queue",
+  title: "Guided evidence queue",
+  summary: "Create a bounded evidence queue inside the existing workspace.",
+  recommended: true,
+  pros: ["Preserves navigation"],
+  cons: ["Adds one review state"],
+  uxImpact: [
+    {
+      area: "Reference review",
+      severity: "IMPORTANT",
+      reason: "Review priority becomes explicit.",
+      affectedRoutes: ["/references"],
+      affectedComponents: ["ReferenceCard"],
+      decisionRequired: true,
+    },
+  ],
+  estimatedComplexity: "MEDIUM",
+  genomeFit: "Fits the evidence-first direction.",
+  likelyFiles: ["src/reference-card.tsx"],
+  status: "PROPOSED",
+};
+
+const featureBrief: FeatureBrief = {
+  name: "Evidence inbox",
+  goal: "Help reviewers triage unresolved evidence.",
+  description: "Add a bounded evidence inbox.",
+  constraints: ["Use existing navigation"],
+  mustKeep: ["Reports remain durable"],
+  mustNotChange: ["Do not add routes"],
+  successCriteria: ["One item can be triaged in under a minute"],
+};
+
+function proposalFixture(
+  overrides: Partial<ChangeProposal> = {},
+): ChangeProposal {
+  return {
+    id: "proposal-safe-1",
+    sessionId: "safe-session-1",
+    summary: "Add a bounded review marker.",
+    reason: "Make unresolved evidence visible without changing navigation.",
+    filesToCreate: [],
+    filesToModify: ["src/reference-card.tsx"],
+    filesToDelete: [],
+    componentsAffected: ["ReferenceCard"],
+    screensAffected: ["/references"],
+    uxImpact: designApproach.uxImpact,
+    visualImpact: "Adds one quiet status marker.",
+    riskLevel: "LOW",
+    requiresHumanApproval: true,
+    policyViolations: [],
+    status: "PROPOSED",
+    ...overrides,
+  };
+}
+
+function approvalFixture(
+  overrides: Partial<Approval> = {},
+): Approval {
+  return {
+    id: "approval-safe-1",
+    proposalId: "proposal-safe-1",
+    decision: "APPROVED",
+    scope: "CHANGE_PROPOSAL",
+    approvedBy: "local-user",
+    createdAt: "2026-08-25T01:00:00.000Z",
+    ...overrides,
+  };
+}
+
+const wireOutput = {
+  summary: "Add a bounded review marker.",
+  reason: "Make unresolved evidence visible without changing navigation.",
+  filesToCreate: [] as string[],
+  filesToModify: ["src/reference-card.tsx"],
+  filesToDelete: [] as string[],
+  componentsAffected: ["ReferenceCard"],
+  screensAffected: ["/references"],
+  uxImpact: designApproach.uxImpact,
+  visualImpact: "Adds one quiet status marker.",
+  riskLevel: "LOW" as const,
+  requiresHumanApproval: true as const,
+  policyViolations: [] as string[],
+  status: "PROPOSED" as const,
+};
+
+describe("structured Safe Mode proposals", () => {
+  // Production break caught: an authenticated interrupted target mutation has no explicit, non-replaying recovery path and permanently blocks every future proposal.
+  it("explicitly preserves reviewed target bytes, archives the claim, and permanently forbids replay of the old approval", async () => {
+    const root = await temporaryWorkspace();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/reference-card.tsx"), "before\n");
+    const options = { workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run<T>() { return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "after\n" }] } as T }; },
+    } };
+    await expect(new MutationExecutor({ ...options, async captureSourceRevision() { throw new Error("interrupted completion"); } }).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toThrow();
+    const recovery = await inspectMutationRecovery(root);
+    expect(recovery).toMatchObject({ proposalId: "proposal-safe-1", phase: "APPLYING", ownerState: "ABANDONED" });
+    const fingerprint = createHash("sha256").update("after\n").digest("hex");
+    await expect(reconcileMutationRecovery(root, { claimId: recovery!.claimId, proposalId: recovery!.proposalId, confirmation: "KEEP_CURRENT_FILES", expectedSourceFingerprint: fingerprint }, async () => "0".repeat(64))).rejects.toThrow(/changed/);
+    expect(await inspectMutationRecovery(root)).toBeDefined();
+    await reconcileMutationRecovery(root, { claimId: recovery!.claimId, proposalId: recovery!.proposalId, confirmation: "KEEP_CURRENT_FILES", expectedSourceFingerprint: fingerprint }, async () => fingerprint);
+    expect(await inspectMutationRecovery(root)).toBeUndefined();
+    expect(await readFile(join(root, "src/reference-card.tsx"), "utf8")).toBe("after\n");
+    await expect(new MutationExecutor(options).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toThrow(/recovered proposal cannot be replayed/i);
+    const nextProposal = proposalFixture({ id: "proposal-safe-new", status: "PROPOSED" });
+    await expect(new MutationExecutor({ ...options, agent: { async run<T>() { return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "newly approved\n" }] } as T }; } } }).apply({ proposal: nextProposal, approval: { ...approvalFixture(), id: "approval-safe-new", proposalId: nextProposal.id } })).resolves.toMatchObject({ filesChanged: ["src/reference-card.tsx"] });
+  });
+  // Production break caught: deleting a claim after target bytes changed lets a crash retry silently replay an ambiguous mutation.
+  it("retains authenticated recovery evidence after an ambiguous target mutation", async () => {
+    const root = await temporaryWorkspace();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/reference-card.tsx"), "before\n");
+    const options = { workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run<T>() { return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "after\n" }] } as T }; },
+    } };
+    await expect(new MutationExecutor({ ...options, async captureSourceRevision() { throw new Error("lost completion evidence"); } }).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toMatchObject({ failure: { targetDisposition: "RECONCILIATION_REQUIRED" } });
+    await expect(new MutationExecutor(options).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toThrow(/explicit recovery|reconciliation required/i);
+    expect(await readFile(join(root, "src/reference-card.tsx"), "utf8")).toBe("after\n");
+  });
+  // Production break caught: a crashed mutation owner leaves a permanent workspace claim even though no target write began.
+  it("reconciles an authenticated abandoned preparation claim without replaying another owner", async () => {
+    const root = await temporaryWorkspace();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/reference-card.tsx"), "before\n");
+    const claimPath = join(await realpath(tmpdir()), "design-sharingan-safe-mode-claims", `${createHash("sha256").update(root).digest("hex")}.claim`);
+    let residue = "";
+    await expect(new MutationExecutor({ workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run() { residue = await readFile(claimPath, "utf8"); throw new Error("owner interrupted"); },
+    } }).apply({ proposal: proposalFixture(), approval: approvalFixture() })).rejects.toThrow("owner interrupted");
+    await writeFile(claimPath, residue, { mode: 0o600 });
+    const result = await new MutationExecutor({ workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run<T>() { return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "after\n" }] } as T }; },
+    } }).apply({ proposal: proposalFixture(), approval: approvalFixture() });
+    expect(result.filesChanged).toEqual(["src/reference-card.tsx"]);
+    expect(await readFile(join(root, "src/reference-card.tsx"), "utf8")).toBe("after\n");
+  });
+  // Production break caught: a live read-only agent cannot safely materialize an approved change unless the executor accepts and scope-checks its structured mirror delta.
+  it("materializes an exact structured mutation delta without granting the agent write tools", async () => {
+    const root = await temporaryWorkspace();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/reference-card.tsx"), "before\n");
+    let observed: CodexAgentRunInput | undefined;
+    const result = await new MutationExecutor({ workspaceRoot: root, proposalThreadId: "owned-proposal", agent: {
+      async run<T>(input: CodexAgentRunInput) {
+        observed = input;
+        return { threadId: "owned-proposal", structured: { files: [{ path: "src/reference-card.tsx", contents: "after\n" }] } as T };
+      },
+    } }).apply({ proposal: proposalFixture(), approval: approvalFixture() });
+    expect(observed?.capabilityProfile).toBe("MUTATION_MIRROR");
+    expect(observed?.prompt).toContain("before\\n");
+    expect(result.filesChanged).toEqual(["src/reference-card.tsx"]);
+    expect(await readFile(join(root, "src/reference-card.tsx"), "utf8")).toBe("after\n");
+  });
+  it("uses the exact bounded proposal schema and returns risk, UX, visual, and file evidence without mutation", async () => {
+    const analysisRoot = await temporaryWorkspace();
+    const sentinelPath = join(analysisRoot, "sentinel.txt");
+    await writeFile(sentinelPath, "unchanged\n", "utf8");
+    let runInput: CodexAgentRunInput | undefined;
+
+    const result = await generateChangeProposal(
+      {
+        sessionId: "safe-session-1",
+        designApproach,
+        featureBrief,
+        analysisWorkingDirectory: analysisRoot,
+        projectContext: {
+          name: "Fixture",
+          framework: "nextjs",
+          routes: ["/references"],
+          componentDirectories: ["src"],
+        },
+      },
+      {
+        createId: () => "proposal-safe-1",
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            runInput = input;
+            return {
+              threadId: "thread-proposal-1",
+              structured: wireOutput as TStructured,
+            };
+          },
+        },
+      },
+    );
+
+    expect(runInput).toEqual({
+      workingDirectory: analysisRoot,
+      prompt: expect.stringContaining("Do not write, edit, create, delete"),
+      outputSchema: CHANGE_PROPOSAL_OUTPUT_SCHEMA,
+    });
+    expect(Object.keys(CHANGE_PROPOSAL_OUTPUT_SCHEMA.properties)).toEqual([
+      "summary",
+      "reason",
+      "filesToCreate",
+      "filesToModify",
+      "filesToDelete",
+      "componentsAffected",
+      "screensAffected",
+      "uxImpact",
+      "visualImpact",
+      "riskLevel",
+      "requiresHumanApproval",
+      "policyViolations",
+      "status",
+    ]);
+    expect(CHANGE_PROPOSAL_OUTPUT_SCHEMA.additionalProperties).toBe(false);
+    expect(result).toEqual({
+      proposal: proposalFixture(),
+      threadId: "thread-proposal-1",
+    });
+    expect(result.proposal).toMatchObject({
+      filesToModify: ["src/reference-card.tsx"],
+      riskLevel: "LOW",
+      uxImpact: designApproach.uxImpact,
+      visualImpact: "Adds one quiet status marker.",
+    });
+    expect(await readFile(sentinelPath, "utf8")).toBe("unchanged\n");
+  });
+
+  it("rejects undeclared proposal keys instead of trusting structured output", async () => {
+    const analysisRoot = await temporaryWorkspace();
+    await expect(
+      generateChangeProposal(
+        {
+          sessionId: "safe-session-1",
+          designApproach,
+          featureBrief,
+          analysisWorkingDirectory: analysisRoot,
+          projectContext: {
+            name: "Fixture",
+            routes: [],
+            componentDirectories: [],
+          },
+        },
+        {
+          createId: () => "proposal-safe-1",
+          agent: {
+            async run<TStructured>() {
+              return {
+                threadId: "thread-proposal-1",
+                structured: { ...wireOutput, undeclared: true } as TStructured,
+              };
+            },
+          },
+        },
+      ),
+    ).rejects.toThrow(/invalid structured change proposal/i);
+  });
+
+  it("enforces structured proposal string bounds in UTF-8 bytes", async () => {
+    const analysisRoot = await temporaryWorkspace();
+    await expect(
+      generateChangeProposal(
+        {
+          sessionId: "safe-session-1",
+          designApproach,
+          featureBrief,
+          analysisWorkingDirectory: analysisRoot,
+          projectContext: {
+            name: "Fixture",
+            routes: [],
+            componentDirectories: [],
+          },
+        },
+        {
+          createId: () => "proposal-safe-1",
+          agent: {
+            async run<TStructured>() {
+              return {
+                threadId: "thread-proposal-1",
+                structured: {
+                  ...wireOutput,
+                  summary: "界".repeat(2_000),
+                } as TStructured,
+              };
+            },
+          },
+        },
+      ),
+    ).rejects.toThrow(/invalid structured change proposal/i);
+  });
+});
+
+describe("Safe Mode mutation gate", () => {
+  async function executorFixture() {
+    const workspaceRoot = await temporaryWorkspace();
+    let agentRuns = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>() {
+          agentRuns += 1;
+          return {
+            threadId: "thread-proposal-1",
+            structured: null as TStructured,
+          };
+        },
+      },
+    });
+    return { executor, workspaceRoot, agentRuns: () => agentRuns };
+  }
+
+  it("refuses mutation without matching explicit approval", async () => {
+    const { executor, agentRuns } = await executorFixture();
+    await expect(
+      executor.apply({ proposal: proposalFixture(), approval: undefined }),
+    ).rejects.toThrow(/explicit approval/i);
+    expect(agentRuns()).toBe(0);
+  });
+
+  it("refuses a rejected proposal decision", async () => {
+    const { executor, agentRuns } = await executorFixture();
+    await expect(
+      executor.apply({
+        proposal: proposalFixture(),
+        approval: approvalFixture({ decision: "REJECTED" }),
+      }),
+    ).rejects.toThrow(/approved decision/i);
+    expect(agentRuns()).toBe(0);
+  });
+
+  it("refuses a proposal whose own status is rejected", async () => {
+    const { executor, agentRuns } = await executorFixture();
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({ status: "REJECTED" }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/proposal status/i);
+    expect(agentRuns()).toBe(0);
+  });
+
+  it("refuses a stale approval for another proposal id", async () => {
+    const { executor, agentRuns } = await executorFixture();
+    await expect(
+      executor.apply({
+        proposal: proposalFixture(),
+        approval: approvalFixture({ proposalId: "proposal-old" }),
+      }),
+    ).rejects.toThrow(/same proposal/i);
+    expect(agentRuns()).toBe(0);
+  });
+
+  it("refuses an approval with the wrong scope", async () => {
+    const { executor, agentRuns } = await executorFixture();
+    await expect(
+      executor.apply({
+        proposal: proposalFixture(),
+        approval: approvalFixture({ scope: "DESIGN_APPROACH" }),
+      }),
+    ).rejects.toThrow(/change_proposal scope/i);
+    expect(agentRuns()).toBe(0);
+  });
+
+  it("rejects a mutation path that exceeds its UTF-8 byte bound before agent execution", async () => {
+    const { executor, agentRuns } = await executorFixture();
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({
+          filesToCreate: [`${"界".repeat(200)}.ts`],
+          filesToModify: [],
+        }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/outside the workspace/i);
+    expect(agentRuns()).toBe(0);
+  });
+
+  it("rejects a proposal thread id that exceeds its UTF-8 byte bound before agent execution", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    let agentRuns = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "界".repeat(100),
+      agent: {
+        async run<TStructured>() {
+          agentRuns += 1;
+          return {
+            threadId: "界".repeat(100),
+            structured: null as TStructured,
+          };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({
+          filesToCreate: ["src/created.ts"],
+          filesToModify: [],
+        }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/thread id is invalid/i);
+    expect(agentRuns).toBe(0);
+  });
+});
+
+describe("Mangekyo policy-authorized mutation gate", () => {
+  it("rechecks worker ownership after a long isolated turn before touching the target", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    const ownershipChecks: string[] = [];
+    let ownerReplaced = false;
+    let persisted: AutonomousMutationAuthorization | undefined;
+
+    await expect(executePolicyAuthorizedMutation(
+      {
+        workspaceRoot,
+        loopSessionId: "mangekyo-session-1",
+        proposal: proposalFixture({
+          sessionId: "mangekyo-session-1",
+          filesToModify: ["src/file.ts"],
+        }),
+        proposalThreadId: "thread-proposal-1",
+        policy: DEFAULT_AUTONOMY_POLICY,
+        change: { kind: "STYLE_CHANGE", files: ["src/file.ts"] },
+        assertWorkerOwnership: async (boundary: "AUTHORIZATION" | "MUTATION_EXECUTION") => {
+          ownershipChecks.push(boundary);
+          if (ownerReplaced) throw new Error("Durable worker owner was replaced");
+        },
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            await writeFile(join(input.workingDirectory, "src/file.ts"), "after\n", "utf8");
+            ownerReplaced = true;
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      },
+      {
+        createId: () => "authorization-owned",
+        now: () => new Date("2026-08-27T01:00:00.000Z"),
+        persistAuthorization: async (authorization) => {
+          persisted = structuredClone(authorization);
+        },
+        loadAuthorization: async () => structuredClone(persisted),
+      },
+    )).rejects.toThrow(/worker owner was replaced/i);
+
+    expect(ownershipChecks).toEqual(["AUTHORIZATION", "MUTATION_EXECUTION"]);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("before\n");
+  });
+
+  it("checks worker ownership before consuming an Approve Once authorization", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    const proposal = proposalFixture({
+      sessionId: "mangekyo-session-1",
+      filesToModify: ["src/file.ts"],
+    });
+    let consumed = false;
+    let agentRuns = 0;
+
+    await expect(executeApproveOnceMutation({
+      workspaceRoot,
+      loopSessionId: "mangekyo-session-1",
+      sessionVersion: "2026-08-27T01:00:01.000Z",
+      proposal,
+      proposalThreadId: "thread-proposal-1",
+      change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+      gate: {
+        id: "gate-1",
+        roundNumber: 1,
+        requestedChange: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        proposal,
+        proposalThreadId: "thread-proposal-1",
+        policyEvaluationId: "policy-navigation",
+        requestedAt: "2026-08-27T01:00:00.000Z",
+        reasons: ["Navigation changes require a Human Gate."],
+        affectedScope: ["/"],
+        impact: "Changes navigation.",
+      },
+      policyEvaluation: {
+        id: "policy-navigation",
+        roundNumber: 1,
+        proposalId: proposal.id,
+        proposalThreadId: "thread-proposal-1",
+        proposalDelta: {
+          filesToCreate: [],
+          filesToModify: ["src/file.ts"],
+          filesToDelete: [],
+        },
+        change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        policy: DEFAULT_AUTONOMY_POLICY,
+        evaluation: {
+          decision: "HUMAN_GATE",
+          reasons: ["Navigation changes require a Human Gate."],
+        },
+        evaluatedAt: "2026-08-27T01:00:00.000Z",
+      },
+      decision: {
+        id: "gate-decision-1",
+        gateId: "gate-1",
+        decision: "APPROVE_ONCE",
+        decidedBy: "local-user",
+        createdAt: "2026-08-27T01:00:01.000Z",
+      },
+      now: new Date("2026-08-27T01:00:02.000Z"),
+      assertWorkerOwnership: async () => {
+        throw new Error("Approve Once worker owner is missing");
+      },
+      consumeAuthorization: async () => {
+        consumed = true;
+      },
+      agent: {
+        async run<TStructured>() {
+          agentRuns += 1;
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    })).rejects.toThrow(/worker owner is missing/i);
+    expect(consumed).toBe(false);
+    expect(agentRuns).toBe(0);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("before\n");
+  });
+
+  it("reuses the controlled transaction only for the exact persisted Approve Once gate", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    const proposal = proposalFixture({
+      sessionId: "mangekyo-session-1",
+      filesToModify: ["src/file.ts"],
+    });
+    let agentRuns = 0;
+    const result = await executeApproveOnceMutation({
+      workspaceRoot,
+      loopSessionId: "mangekyo-session-1",
+      sessionVersion: "2026-08-27T01:00:01.000Z",
+      proposal,
+      proposalThreadId: "thread-proposal-1",
+      change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+      gate: {
+        id: "gate-1",
+        roundNumber: 1,
+        requestedChange: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        proposal,
+        proposalThreadId: "thread-proposal-1",
+        policyEvaluationId: "policy-navigation",
+        requestedAt: "2026-08-27T01:00:00.000Z",
+        reasons: ["Navigation changes require a Human Gate."],
+        affectedScope: ["/"],
+        impact: "Changes navigation.",
+      },
+      policyEvaluation: {
+        id: "policy-navigation",
+        roundNumber: 1,
+        proposalId: proposal.id,
+        proposalThreadId: "thread-proposal-1",
+        proposalDelta: {
+          filesToCreate: [],
+          filesToModify: ["src/file.ts"],
+          filesToDelete: [],
+        },
+        change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        policy: DEFAULT_AUTONOMY_POLICY,
+        evaluation: { decision: "HUMAN_GATE", reasons: ["Navigation changes require a Human Gate."] },
+        evaluatedAt: "2026-08-27T01:00:00.000Z",
+      },
+      decision: {
+        id: "gate-decision-1",
+        gateId: "gate-1",
+        decision: "APPROVE_ONCE",
+        decidedBy: "local-user",
+        createdAt: "2026-08-27T01:00:01.000Z",
+      },
+      now: new Date("2026-08-27T01:00:02.000Z"),
+      consumeAuthorization: async () => undefined,
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          agentRuns += 1;
+          await writeFile(join(input.workingDirectory, "src/file.ts"), "after\n", "utf8");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    expect(result.filesChanged).toEqual(["src/file.ts"]);
+    expect(agentRuns).toBe(1);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+  });
+
+  it("durably consumes one exact Approve Once authorization before mutation and rejects sequential replay", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    const proposal = proposalFixture({
+      sessionId: "mangekyo-session-1",
+      filesToModify: ["src/file.ts"],
+    });
+    let consumed = false;
+    let agentRuns = 0;
+    const input = {
+      workspaceRoot,
+      loopSessionId: "mangekyo-session-1",
+      sessionVersion: "2026-08-27T01:00:00.500Z",
+      proposal,
+      proposalThreadId: "thread-proposal-1",
+      change: { kind: "NAVIGATION_CHANGE" as const, files: ["src/file.ts"] },
+      gate: {
+        id: "gate-1",
+        roundNumber: 1,
+        requestedChange: { kind: "NAVIGATION_CHANGE" as const, files: ["src/file.ts"] },
+        proposal,
+        proposalThreadId: "thread-proposal-1",
+        policyEvaluationId: "policy-navigation",
+        requestedAt: "2026-08-27T01:00:00.000Z",
+        reasons: ["Navigation changes require a Human Gate."],
+        affectedScope: ["/"],
+        impact: "Changes navigation.",
+      },
+      policyEvaluation: {
+        id: "policy-navigation",
+        roundNumber: 1,
+        proposalId: proposal.id,
+        proposalThreadId: "thread-proposal-1",
+        proposalDelta: {
+          filesToCreate: [],
+          filesToModify: ["src/file.ts"],
+          filesToDelete: [],
+        },
+        change: { kind: "NAVIGATION_CHANGE" as const, files: ["src/file.ts"] },
+        policy: DEFAULT_AUTONOMY_POLICY,
+        evaluation: {
+          decision: "HUMAN_GATE" as const,
+          reasons: ["Navigation changes require a Human Gate."],
+        },
+        evaluatedAt: "2026-08-27T01:00:00.000Z",
+      },
+      decision: {
+        id: "gate-decision-1",
+        gateId: "gate-1",
+        decision: "APPROVE_ONCE" as const,
+        decidedBy: "local-user",
+        createdAt: "2026-08-27T01:00:00.500Z",
+      },
+      now: new Date("2026-08-27T01:00:02.000Z"),
+      consumeAuthorization: async (claim: {
+        loopSessionId: string;
+        sessionVersion: string;
+        gateId: string;
+        decisionId: string;
+        proposalId: string;
+      }) => {
+        expect(claim).toEqual({
+          loopSessionId: "mangekyo-session-1",
+          sessionVersion: "2026-08-27T01:00:00.500Z",
+          gateId: "gate-1",
+          decisionId: "gate-decision-1",
+          proposalId: "proposal-safe-1",
+        });
+        if (consumed) throw new Error("Approve Once authorization was already consumed");
+        consumed = true;
+      },
+      agent: {
+        async run<TStructured>(agentInput: CodexAgentRunInput) {
+          agentRuns += 1;
+          await writeFile(
+            join(agentInput.workingDirectory, "src/file.ts"),
+            `after-${agentRuns}\n`,
+            "utf8",
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    };
+
+    await expect(executeApproveOnceMutation(input)).resolves.toMatchObject({
+      filesChanged: ["src/file.ts"],
+    });
+    await expect(executeApproveOnceMutation(input)).rejects.toThrow(/already consumed/i);
+    expect(agentRuns).toBe(1);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after-1\n");
+  });
+
+  it("persists and reloads an exact ALLOW evaluation before reusing the controlled mirror transaction", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    let persisted: AutonomousMutationAuthorization | undefined;
+    let agentRuns = 0;
+    const result = await executePolicyAuthorizedMutation(
+      {
+        workspaceRoot,
+        loopSessionId: "mangekyo-session-1",
+        proposal: proposalFixture({
+          sessionId: "mangekyo-session-1",
+          filesToModify: ["src/file.ts"],
+        }),
+        proposalThreadId: "thread-proposal-1",
+        policy: DEFAULT_AUTONOMY_POLICY,
+        change: { kind: "STYLE_CHANGE", files: ["src/file.ts"] },
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            agentRuns += 1;
+            await writeFile(join(input.workingDirectory, "src/file.ts"), "after\n", "utf8");
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      },
+      {
+        createId: () => "authorization-1",
+        now: () => new Date("2026-08-27T01:00:00.000Z"),
+        persistAuthorization: async (authorization) => {
+          persisted = structuredClone(authorization);
+        },
+        loadAuthorization: async () => structuredClone(persisted),
+      },
+    );
+
+    expect(result).toMatchObject({
+      decision: "APPLIED",
+      authorization: {
+        kind: "AUTONOMOUS_POLICY_ALLOW",
+        id: "authorization-1",
+        loopSessionId: "mangekyo-session-1",
+        proposalId: "proposal-safe-1",
+        evaluation: { decision: "ALLOW", reasons: [] },
+        change: { kind: "STYLE_CHANGE", files: ["src/file.ts"] },
+      },
+      mutation: {
+        proposalId: "proposal-safe-1",
+        threadId: "thread-proposal-1",
+        filesChanged: ["src/file.ts"],
+      },
+    });
+    if (result.decision !== "APPLIED") throw new Error("Expected an applied mutation");
+    expect(persisted).toEqual(result.authorization);
+    expect(agentRuns).toBe(1);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+  });
+
+  it("fails closed at HUMAN_GATE before persistence or target mutation for a navigation change", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    let persisted = false;
+    let agentRuns = 0;
+    const result = await executePolicyAuthorizedMutation(
+      {
+        workspaceRoot,
+        loopSessionId: "mangekyo-session-1",
+        proposal: proposalFixture({
+          sessionId: "mangekyo-session-1",
+          filesToModify: ["src/file.ts"],
+        }),
+        proposalThreadId: "thread-proposal-1",
+        policy: DEFAULT_AUTONOMY_POLICY,
+        change: { kind: "NAVIGATION_CHANGE", files: ["src/file.ts"] },
+        agent: {
+          async run<TStructured>() {
+            agentRuns += 1;
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      },
+      {
+        createId: () => "authorization-unused",
+        now: () => new Date("2026-08-27T01:00:00.000Z"),
+        persistAuthorization: async () => {
+          persisted = true;
+        },
+        loadAuthorization: async () => undefined,
+      },
+    );
+
+    expect(result).toMatchObject({
+      decision: "HUMAN_GATE",
+      evaluation: { decision: "HUMAN_GATE" },
+    });
+    expect(persisted).toBe(false);
+    expect(agentRuns).toBe(0);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("before\n");
+  });
+
+  it("rejects missing or tampered persisted ALLOW evidence before the mutation agent runs", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await mkdir(join(workspaceRoot, "src"));
+    await writeFile(join(workspaceRoot, "src/file.ts"), "before\n", "utf8");
+    let persisted: AutonomousMutationAuthorization | undefined;
+    let agentRuns = 0;
+    await expect(
+      executePolicyAuthorizedMutation(
+        {
+          workspaceRoot,
+          loopSessionId: "mangekyo-session-1",
+          proposal: proposalFixture({
+            sessionId: "mangekyo-session-1",
+            filesToModify: ["src/file.ts"],
+          }),
+          proposalThreadId: "thread-proposal-1",
+          policy: DEFAULT_AUTONOMY_POLICY,
+          change: { kind: "STYLE_CHANGE", files: ["src/file.ts"] },
+          agent: {
+            async run<TStructured>() {
+              agentRuns += 1;
+              return { threadId: "thread-proposal-1", structured: null as TStructured };
+            },
+          },
+        },
+        {
+          createId: () => "authorization-1",
+          now: () => new Date("2026-08-27T01:00:00.000Z"),
+          persistAuthorization: async (authorization) => {
+            persisted = authorization;
+          },
+          loadAuthorization: async () =>
+            persisted === undefined
+              ? undefined
+              : { ...persisted, proposalId: "tampered-proposal" },
+        },
+      ),
+    ).rejects.toThrow(/persisted autonomy authorization/i);
+    expect(agentRuns).toBe(0);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("before\n");
+  });
+});
+
+describe("controlled mirror mutation", () => {
+  async function writeWorkspaceFile(
+    workspaceRoot: string,
+    relativePath: string,
+    contents: string,
+  ): Promise<void> {
+    const path = join(workspaceRoot, relativePath);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, contents, "utf8");
+  }
+
+  it("resumes the exact proposal thread on a disjoint mirror and applies an exact approved create, modify, and delete delta", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/existing.ts", "export const state = 'before';\n");
+    await writeWorkspaceFile(workspaceRoot, "src/obsolete.ts", "export const obsolete = true;\n");
+    await writeWorkspaceFile(workspaceRoot, "src/user-note.ts", "export const userNote = 'preserve';\n");
+    let observedWorkingDirectory: string | undefined;
+    let observedThreadId: string | undefined;
+    const proposal = proposalFixture({
+      filesToCreate: ["src/created.ts"],
+      filesToModify: ["src/existing.ts"],
+      filesToDelete: ["src/obsolete.ts"],
+    });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          observedWorkingDirectory = input.workingDirectory;
+          observedThreadId = input.threadId;
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/created.ts",
+            "export const created = true;\n",
+          );
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/existing.ts",
+            "export const state = 'after';\n",
+          );
+          await rm(join(input.workingDirectory, "src/obsolete.ts"));
+          return {
+            threadId: "thread-proposal-1",
+            structured: null as TStructured,
+          };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal,
+      approval: approvalFixture(),
+    });
+
+    expect(observedWorkingDirectory).not.toBe(workspaceRoot);
+    expect(observedWorkingDirectory?.startsWith(workspaceRoot)).toBe(false);
+    expect(observedThreadId).toBe("thread-proposal-1");
+    expect(await readFile(join(workspaceRoot, "src/created.ts"), "utf8")).toBe(
+      "export const created = true;\n",
+    );
+    expect(await readFile(join(workspaceRoot, "src/existing.ts"), "utf8")).toBe(
+      "export const state = 'after';\n",
+    );
+    await expect(readFile(join(workspaceRoot, "src/obsolete.ts"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await readFile(join(workspaceRoot, "src/user-note.ts"), "utf8")).toBe(
+      "export const userNote = 'preserve';\n",
+    );
+    expect(result).toMatchObject({
+      proposalId: proposal.id,
+      threadId: "thread-proposal-1",
+      filesChanged: ["src/created.ts", "src/existing.ts", "src/obsolete.ts"],
+    });
+  });
+
+  it.each([
+    ["workspace escape", { filesToModify: ["../outside.ts"] }],
+    ["absolute path", { filesToModify: ["/tmp/outside.ts"] }],
+    ["control character path", { filesToModify: ["src/file\nname.ts"] }],
+    ["duplicate path", { filesToModify: ["src/file.ts", "src/file.ts"] }],
+    [
+      "overlapping operation sets",
+      { filesToModify: ["src/file.ts"], filesToDelete: ["src/file.ts"] },
+    ],
+  ])("rejects %s before running the mutation agent", async (_label, overrides) => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    let runs = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>() {
+          runs += 1;
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture(overrides),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/path|duplicate|overlap|outside/i);
+    expect(runs).toBe(0);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe(
+      "before\n",
+    );
+  });
+
+  it.each([
+    ".git/config",
+    ".design-sharingan/project.json",
+    "design-governance/DESIGN-GENOME.md",
+    ".env",
+    "config/.env.local",
+    ".envrc",
+    ".direnv/environment",
+  ])("always rejects protected mutation path %s", async (relativePath) => {
+    const workspaceRoot = await temporaryWorkspace();
+    let runs = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>() {
+          runs += 1;
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({
+          filesToCreate: [relativePath],
+          filesToModify: [],
+        }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/protected/i);
+    expect(runs).toBe(0);
+  });
+
+  it("rejects a symlink ancestor without reading or writing outside the workspace", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    const outsideRoot = await temporaryWorkspace();
+    await symlink(outsideRoot, join(workspaceRoot, "linked"), "dir");
+    let runs = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>() {
+          runs += 1;
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({
+          filesToCreate: ["linked/escape.ts"],
+          filesToModify: [],
+        }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/symbolic link/i);
+    expect(runs).toBe(0);
+    await expect(readFile(join(outsideRoot, "escape.ts"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it.each(["modify", "delete"] as const)(
+    "rejects an approved %s target hard-linked to an external inode before the agent can read it",
+    async (operation) => {
+      const workspaceRoot = await temporaryWorkspace();
+      const outsideRoot = await temporaryWorkspace();
+      const sensitivePath = join(outsideRoot, "sensitive.txt");
+      await writeFile(sensitivePath, "external-sensitive-bytes\n", "utf8");
+      await mkdir(join(workspaceRoot, "src"), { recursive: true });
+      await link(sensitivePath, join(workspaceRoot, "src/linked.ts"));
+      let agentRuns = 0;
+      const executor = new MutationExecutor({
+        workspaceRoot,
+        proposalThreadId: "thread-proposal-1",
+        agent: {
+          async run<TStructured>() {
+            agentRuns += 1;
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      });
+
+      await expect(
+        executor.apply({
+          proposal: proposalFixture({
+            filesToModify: operation === "modify" ? ["src/linked.ts"] : [],
+            filesToDelete: operation === "delete" ? ["src/linked.ts"] : [],
+          }),
+          approval: approvalFixture(),
+        }),
+      ).rejects.toThrow(/hard link|link count/i);
+      expect(agentRuns).toBe(0);
+      expect(await readFile(sensitivePath, "utf8")).toBe(
+        "external-sensitive-bytes\n",
+      );
+    },
+  );
+
+  it("seeds an empty delete placeholder instead of disclosing the target contents to the mutation mirror", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(
+      workspaceRoot,
+      "src/obsolete.ts",
+      "sensitive obsolete implementation\n",
+    );
+    let mirroredBeforeDelete: string | undefined;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          const mirrorPath = join(input.workingDirectory, "src/obsolete.ts");
+          mirroredBeforeDelete = await readFile(mirrorPath, "utf8");
+          await rm(mirrorPath);
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    await executor.apply({
+      proposal: proposalFixture({
+        filesToModify: [],
+        filesToDelete: ["src/obsolete.ts"],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(mirroredBeforeDelete).toBe("");
+  });
+
+  it.each([
+    ["create target already exists", { filesToCreate: ["src/file.ts"], filesToModify: [] }],
+    ["modify target is missing", { filesToModify: ["src/missing.ts"] }],
+    ["delete target is missing", { filesToModify: [], filesToDelete: ["src/missing.ts"] }],
+  ])("enforces the %s precondition", async (_label, overrides) => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    let runs = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>() {
+          runs += 1;
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture(overrides),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/must not exist|must be an existing regular file/i);
+    expect(runs).toBe(0);
+  });
+
+  it("treats an externally changed target mode as stale before applying approved bytes", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    const targetPath = join(workspaceRoot, "src/file.ts");
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          await chmod(targetPath, 0o600);
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toMatchObject({
+      failure: { targetDisposition: "NO_TARGET_CHANGE" },
+    });
+    expect(await readFile(targetPath, "utf8")).toBe("before\n");
+    expect((await stat(targetPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it("rejects an unapproved mirror change and leaves the target byte-for-byte unchanged", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          await writeWorkspaceFile(input.workingDirectory, "src/unapproved.ts", "no\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/unapproved mirror change/i);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe(
+      "before\n",
+    );
+    await expect(readFile(join(workspaceRoot, "src/unapproved.ts"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("rolls back an earlier target write when a later approved operation fails", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/existing.ts", "before\n");
+    let writes = 0;
+    let injected = false;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      mutationDriver: {
+        async write(path, contents) {
+          writes += 1;
+          if (!injected && writes === 2) {
+            injected = true;
+            throw new Error("injected target write failure");
+          }
+          await writeFile(path, contents);
+        },
+        async remove(path) {
+          await rm(path);
+        },
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/created.ts", "created\n");
+          await writeWorkspaceFile(input.workingDirectory, "src/existing.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({
+          filesToCreate: ["src/created.ts"],
+          filesToModify: ["src/existing.ts"],
+        }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/injected target write failure/i);
+    expect(await readFile(join(workspaceRoot, "src/existing.ts"), "utf8")).toBe(
+      "before\n",
+    );
+    await expect(readFile(join(workspaceRoot, "src/created.ts"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("preserves indeterminate bytes when a driver reports success without applying the approved delta", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    let writes = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      mutationDriver: {
+        async write(path, contents) {
+          writes += 1;
+          await writeFile(path, writes === 1 ? "corrupted\n" : contents);
+        },
+        async remove(path) {
+          await rm(path);
+        },
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toMatchObject({
+      failure: { targetDisposition: "RECONCILIATION_REQUIRED" },
+    });
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe(
+      "corrupted\n",
+    );
+  });
+
+  it("permits only one concurrent execution claim for one approved proposal", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    let releaseAgent: (() => void) | undefined;
+    const agentWaiting = new Promise<void>((resolve) => {
+      releaseAgent = resolve;
+    });
+    let enteredAgent: (() => void) | undefined;
+    const agentEntered = new Promise<void>((resolve) => {
+      enteredAgent = resolve;
+    });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          enteredAgent?.();
+          await agentWaiting;
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    const input = {
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    };
+    const winner = executor.apply(input);
+    const reachedAgent = await Promise.race([
+      agentEntered.then(() => true),
+      winner.then(
+        () => false,
+        () => false,
+      ),
+    ]);
+    expect(reachedAgent).toBe(true);
+    const loser = executor.apply(input);
+    await expect(loser).rejects.toThrow(/already being executed/i);
+    releaseAgent?.();
+    await expect(winner).resolves.toMatchObject({ proposalId: "proposal-safe-1" });
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe(
+      "after\n",
+    );
+  });
+
+  it("serializes different proposals for the same target before either can capture or mutate", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/shared.ts", "original\n");
+    await writeWorkspaceFile(workspaceRoot, "src/later.ts", "original later\n");
+    let firstApplied: (() => void) | undefined;
+    const reachedFirstApply = new Promise<void>((resolve) => {
+      firstApplied = resolve;
+    });
+    let releaseFailure: (() => void) | undefined;
+    const mayFail = new Promise<void>((resolve) => {
+      releaseFailure = resolve;
+    });
+    let writes = 0;
+    const first = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-a",
+      mutationDriver: {
+        async write(path, contents) {
+          writes += 1;
+          if (writes === 1) {
+            await writeFile(path, contents);
+            firstApplied?.();
+            return;
+          }
+          if (writes === 2) {
+            await mayFail;
+            throw new Error("injected later write failure");
+          }
+          await writeFile(path, contents);
+        },
+        async remove(path) {
+          await rm(path);
+        },
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/shared.ts", "proposal A\n");
+          await writeWorkspaceFile(input.workingDirectory, "src/later.ts", "proposal A later\n");
+          return { threadId: "thread-proposal-a", structured: null as TStructured };
+        },
+      },
+    });
+    const firstRun = first.apply({
+      proposal: proposalFixture({
+        id: "proposal-a",
+        filesToModify: ["src/shared.ts", "src/later.ts"],
+      }),
+      approval: approvalFixture({ proposalId: "proposal-a" }),
+    });
+    await reachedFirstApply;
+
+    const second = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-b",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/shared.ts", "proposal B winner\n");
+          return { threadId: "thread-proposal-b", structured: null as TStructured };
+        },
+      },
+    });
+    const secondOutcome = await second
+      .apply({
+        proposal: proposalFixture({
+          id: "proposal-b",
+          filesToModify: ["src/shared.ts"],
+        }),
+        approval: approvalFixture({ proposalId: "proposal-b" }),
+      })
+      .then(
+        () => "resolved" as const,
+        (error: unknown) =>
+          error instanceof Error && /already being executed/i.test(error.message)
+            ? ("serialized" as const)
+            : ("unexpected rejection" as const),
+      );
+    releaseFailure?.();
+    await expect(firstRun).rejects.toThrow(/injected later write failure/i);
+
+    expect(secondOutcome).toBe("serialized");
+    expect(await readFile(join(workspaceRoot, "src/shared.ts"), "utf8")).toBe(
+      "original\n",
+    );
+  });
+
+  it("does not roll back over bytes changed by another writer after this transaction applied", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/shared.ts", "original\n");
+    await writeWorkspaceFile(workspaceRoot, "src/later.ts", "original later\n");
+    let writes = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      mutationDriver: {
+        async write(path, contents) {
+          writes += 1;
+          if (writes === 2) {
+            await writeFile(join(workspaceRoot, "src/shared.ts"), "external winner\n");
+            throw new Error("injected later write failure");
+          }
+          await writeFile(path, contents);
+        },
+        async remove(path) {
+          await rm(path);
+        },
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/shared.ts", "proposal bytes\n");
+          await writeWorkspaceFile(input.workingDirectory, "src/later.ts", "later bytes\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({
+          filesToModify: ["src/shared.ts", "src/later.ts"],
+        }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/rollback both failed/i);
+    expect(await readFile(join(workspaceRoot, "src/shared.ts"), "utf8")).toBe(
+      "external winner\n",
+    );
+  });
+
+  it("does not claim external bytes written between the driver write and post-write verification", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/shared.ts", "original\n");
+    await writeWorkspaceFile(workspaceRoot, "src/later.ts", "original later\n");
+    let writes = 0;
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      mutationDriver: {
+        async write(path, contents) {
+          writes += 1;
+          if (writes === 1) {
+            await new Promise<void>((resolve, reject) => {
+              void writeFile(path, contents).then(
+                () => {
+                  resolve();
+                  writeFileSync(path, "external interval winner\n");
+                },
+                reject,
+              );
+            });
+            return;
+          }
+          if (writes === 2) {
+            throw new Error("injected later write failure");
+          }
+          await writeFile(path, contents);
+        },
+        async remove(path) {
+          await rm(path);
+        },
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/shared.ts", "proposal bytes\n");
+          await writeWorkspaceFile(input.workingDirectory, "src/later.ts", "later bytes\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const failure = await executor
+      .apply({
+        proposal: proposalFixture({
+          filesToModify: ["src/shared.ts", "src/later.ts"],
+        }),
+        approval: approvalFixture(),
+      })
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    expect(await readFile(join(workspaceRoot, "src/shared.ts"), "utf8")).toBe(
+      "external interval winner\n",
+    );
+    expect(failure).toMatchObject({
+      failure: { targetDisposition: "RECONCILIATION_REQUIRED" },
+    });
+  });
+
+  it("retains the transaction claim through source capture and rejects an interval writer", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      captureSourceRevision: async ({ requiredPaths }) => {
+        expect(requiredPaths).toEqual(["src/file.ts"]);
+        expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+        await writeFile(join(workspaceRoot, "src/file.ts"), "external interval winner\n");
+        return {
+          kind: "UNVERSIONED",
+          available: true,
+          truncated: false,
+          worktreeFingerprint: "a".repeat(64),
+          fileCount: 1,
+          requiredPathEvidence: [{
+            path: "src/file.ts",
+            state: "FILE",
+            mode: 0o644,
+            size: 25,
+            contentHash: "b".repeat(64),
+          }],
+        };
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const failure = await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    }).then(() => undefined, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      failure: {
+        targetDisposition: "RECONCILIATION_REQUIRED",
+        affectedPaths: ["src/file.ts"],
+      },
+    });
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe(
+      "external interval winner\n",
+    );
+  });
+
+  it("rejects a Git interval writer after source capture and before the transaction claim is released", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    await execFile("git", ["init", "-b", "interval-fixture"], { cwd: workspaceRoot });
+    await execFile("git", ["add", "src/file.ts"], { cwd: workspaceRoot });
+    const realGit = (await execFile("which", ["git"])).stdout.trim();
+    const wrapperDirectory = await temporaryWorkspace();
+    const wrapperPath = join(wrapperDirectory, "git");
+    const quoted = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    await writeFile(wrapperPath, [
+      "#!/bin/sh",
+      "case \" $* \" in",
+      "  *\" status \"*)",
+      `    count_file=${quoted(join(workspaceRoot, ".git-status-count"))}`,
+      "    count=0",
+      "    if [ -f \"$count_file\" ]; then count=$(cat \"$count_file\"); fi",
+      "    count=$((count + 1))",
+      "    printf '%s\\n' \"$count\" > \"$count_file\"",
+      "    if [ \"$count\" -ge 2 ]; then",
+      `      printf 'external interval winner\\n' > ${quoted(join(workspaceRoot, "src/file.ts"))}`,
+      "    fi",
+      "    ;;",
+      "esac",
+      `exec ${quoted(realGit)} \"$@\"`,
+      "",
+    ].join("\n"));
+    await chmod(wrapperPath, 0o700);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}:${originalPath ?? "/usr/bin:/bin"}`;
+    try {
+      const executor = new MutationExecutor({
+        workspaceRoot,
+        proposalThreadId: "thread-proposal-1",
+        captureSourceRevision: async ({ requiredPaths }) => {
+          const contents = await readFile(join(workspaceRoot, "src/file.ts"));
+          const metadata = await stat(join(workspaceRoot, "src/file.ts"));
+          return {
+            kind: "GIT",
+            available: true,
+            head: "a".repeat(40),
+            branch: "interval-fixture",
+            status: "DIRTY",
+            entries: [{ index: " ", workingTree: "M", path: "src/file.ts" }],
+            truncated: false,
+            worktreeFingerprint: "b".repeat(64),
+            fileCount: 1,
+            requiredPathEvidence: requiredPaths.map((path) => ({
+              path,
+              state: "FILE" as const,
+              mode: metadata.mode & 0o777,
+              size: contents.byteLength,
+              contentHash: createHash("sha256").update(contents).digest("hex"),
+            })),
+          };
+        },
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      });
+
+      const failure = await executor.apply({
+        proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+        approval: approvalFixture(),
+      }).then(() => undefined, (error: unknown) => error);
+
+      expect(failure).toMatchObject({
+        failure: {
+          targetDisposition: "RECONCILIATION_REQUIRED",
+          affectedPaths: ["src/file.ts"],
+        },
+      });
+      expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe(
+        "external interval winner\n",
+      );
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it("marks a post-application source-capture failure reconciliation-required", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      captureSourceRevision: async () => {
+        throw new Error("authenticated source capture failed");
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const failure = await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    }).then(() => undefined, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      failure: {
+        targetDisposition: "RECONCILIATION_REQUIRED",
+        affectedPaths: ["src/file.ts"],
+      },
+    });
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe("after\n");
+  });
+
+  it("rejects an over-bound complete source revision inside the mutation transaction", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      captureSourceRevision: async ({ requiredPaths }) => {
+        const contents = await readFile(join(workspaceRoot, "src/file.ts"));
+        const metadata = await stat(join(workspaceRoot, "src/file.ts"));
+        return {
+          kind: "UNVERSIONED",
+          available: true,
+          truncated: false,
+          worktreeFingerprint: "a".repeat(64),
+          fileCount: 513,
+          requiredPathEvidence: requiredPaths.map((path) => ({
+            path,
+            state: "FILE" as const,
+            mode: metadata.mode & 0o777,
+            size: contents.byteLength,
+            contentHash: createHash("sha256").update(contents).digest("hex"),
+          })),
+        };
+      },
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const failure = await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    }).then(() => undefined, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      failure: {
+        targetDisposition: "RECONCILIATION_REQUIRED",
+        affectedPaths: ["src/file.ts"],
+      },
+    });
+  });
+
+  it("fails closed when the mutation turn does not continue the exact proposal thread", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-other", structured: null as TStructured };
+        },
+      },
+    });
+    await expect(
+      executor.apply({
+        proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+        approval: approvalFixture(),
+      }),
+    ).rejects.toThrow(/same proposal thread/i);
+    expect(await readFile(join(workspaceRoot, "src/file.ts"), "utf8")).toBe(
+      "before\n",
+    );
+  });
+
+  it("captures bounded Git before/after evidence and never auto-commits", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    await execFile("git", ["add", "src/file.ts"], { cwd: workspaceRoot });
+    await execFile(
+      "git",
+      [
+        "-c",
+        "user.name=Design Sharingan Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+      ],
+      { cwd: workspaceRoot },
+    );
+    const headBefore = (await execFile("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim();
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+    const result = await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    });
+    const headAfter = (await execFile("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim();
+
+    expect(result.git).toMatchObject({
+      available: true,
+      branch: "safe-fixture",
+      statusBefore: "",
+    });
+    expect(result.git.statusAfter).toContain("src/file.ts");
+    expect(result.git.diffAfter).toContain("+after");
+    expect(headAfter).toBe(headBefore);
+  });
+
+  it("synthesizes one authoritative patch for every approved path hidden by Git index flags", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/skip.ts", "skip before\n");
+    await writeWorkspaceFile(workspaceRoot, "src/assume.ts", "assume before\n");
+    await chmod(join(workspaceRoot, "src/skip.ts"), 0o755);
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    await execFile("git", ["add", "."], { cwd: workspaceRoot });
+    await execFile(
+      "git",
+      [
+        "-c",
+        "user.name=Design Sharingan Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+      ],
+      { cwd: workspaceRoot },
+    );
+    await execFile("git", ["update-index", "--skip-worktree", "src/skip.ts"], {
+      cwd: workspaceRoot,
+    });
+    await execFile(
+      "git",
+      ["update-index", "--assume-unchanged", "src/assume.ts"],
+      { cwd: workspaceRoot },
+    );
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/skip.ts", "skip after\n");
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/assume.ts",
+            "assume after\n",
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToModify: ["src/skip.ts", "src/assume.ts"],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(
+      result.git.diffAfter.split("diff --git a/src/skip.ts b/src/skip.ts"),
+    ).toHaveLength(2);
+    expect(
+      result.git.diffAfter.split("diff --git a/src/assume.ts b/src/assume.ts"),
+    ).toHaveLength(2);
+    expect(result.git.diffAfter).toContain("-skip before");
+    expect(result.git.diffAfter).toContain("+skip after");
+    expect(result.git.diffAfter).toContain("-assume before");
+    expect(result.git.diffAfter).toContain("+assume after");
+    expect(result.git.diffAfter).toContain("old mode 100755");
+    expect(result.git.diffAfter).toContain("new mode 100755");
+  });
+
+  it("keeps the authoritative approved delta when Git metadata is unavailable", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    });
+
+    expect(result.git.available).toBe(false);
+    expect(result.git.diffAfter).toContain("-before");
+    expect(result.git.diffAfter).toContain("+after");
+    expect(result.git.note).toContain("authoritative executor-captured approved delta");
+  });
+
+  it("reports truthful modes for executable deletes and binary create/delete evidence", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "scripts/remove.sh", "#!/bin/sh\nexit 0\n");
+    await chmod(join(workspaceRoot, "scripts/remove.sh"), 0o755);
+    await writeFile(
+      join(workspaceRoot, "assets-remove.bin"),
+      Buffer.from([0, 1, 2, 3]),
+    );
+    await chmod(join(workspaceRoot, "assets-remove.bin"), 0o700);
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await rm(join(input.workingDirectory, "scripts/remove.sh"));
+          await rm(join(input.workingDirectory, "assets-remove.bin"));
+          await writeFile(
+            join(input.workingDirectory, "assets-create.bin"),
+            Buffer.from([0, 4, 5, 6]),
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToCreate: ["assets-create.bin"],
+        filesToModify: [],
+        filesToDelete: ["scripts/remove.sh", "assets-remove.bin"],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(result.git.diffAfter).toContain("deleted file mode 100755");
+    expect(result.git.diffAfter).toContain("new file mode 100644");
+    expect(result.git.diffAfter).toContain(
+      "Binary files /dev/null and b/assets-create.bin differ",
+    );
+    expect(result.git.diffAfter).toContain("deleted file mode 100700");
+    expect(result.git.diffAfter).toContain(
+      "Binary files a/assets-remove.bin and /dev/null differ",
+    );
+  });
+
+  it("includes exact before/after patches for approved untracked modify and delete operations", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(
+      workspaceRoot,
+      "src/untracked-modify.ts",
+      "export const reviewState = 'before';\n",
+    );
+    await writeWorkspaceFile(
+      workspaceRoot,
+      "src/untracked-delete.ts",
+      "export const obsolete = true;\n",
+    );
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/untracked-modify.ts",
+            "export const reviewState = 'after';\n",
+          );
+          await rm(join(input.workingDirectory, "src/untracked-delete.ts"));
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToCreate: [],
+        filesToModify: ["src/untracked-modify.ts"],
+        filesToDelete: ["src/untracked-delete.ts"],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(result.git.diffAfter).toContain("diff --git a/src/untracked-modify.ts b/src/untracked-modify.ts");
+    expect(result.git.diffAfter).toContain("-export const reviewState = 'before';");
+    expect(result.git.diffAfter).toContain("+export const reviewState = 'after';");
+    expect(result.git.diffAfter).toContain("diff --git a/src/untracked-delete.ts b/src/untracked-delete.ts");
+    expect(result.git.diffAfter).toContain("-export const obsolete = true;");
+    expect(result.git.diffAfter).not.toContain("src/unapproved");
+  });
+
+  it("limits Git diff evidence to approved paths and includes approved created-file content", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    await writeWorkspaceFile(workspaceRoot, "private/unrelated.txt", "clean\n");
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    await execFile("git", ["add", "."], { cwd: workspaceRoot });
+    await execFile(
+      "git",
+      [
+        "-c",
+        "user.name=Design Sharingan Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+      ],
+      { cwd: workspaceRoot },
+    );
+    await writeWorkspaceFile(
+      workspaceRoot,
+      "private/unrelated.txt",
+      "UNRELATED-TOP-SECRET\n",
+    );
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/created.ts",
+            "export const approvedCreate = true;\n",
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToCreate: ["src/created.ts"],
+        filesToModify: [],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(result.git.statusAfter).toContain("private/unrelated.txt");
+    expect(result.git.diffAfter).toContain("src/created.ts");
+    expect(result.git.diffAfter).toContain("+export const approvedCreate = true;");
+    expect(result.git.diffAfter).not.toContain("private/unrelated.txt");
+    expect(result.git.diffAfter).not.toContain("UNRELATED-TOP-SECRET");
+  });
+
+  it("bounds oversized multibyte Git evidence with collision-safe truncation metadata", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/created.ts",
+            `${"界 bounded evidence line\n".repeat(12_000)}`,
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToCreate: ["src/created.ts"],
+        filesToModify: [],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(Buffer.byteLength(result.git.diffAfter, "utf8")).toBeLessThanOrEqual(
+      128 * 1024,
+    );
+    expect(result.git.diffAfter).not.toContain("[Git evidence truncated]");
+    expect(result.git.truncation.diffAfter).toMatchObject({
+      truncated: true,
+      retainedBytes: Buffer.byteLength(result.git.diffAfter, "utf8"),
+    });
+    expect(result.git.truncation.diffAfter.originalBytes).toBeGreaterThan(
+      result.git.truncation.diffAfter.retainedBytes,
+    );
+  });
+
+  it("preserves literal truncation-marker content without marking evidence truncated", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(
+            input.workingDirectory,
+            "src/created.ts",
+            "[Git evidence truncated]\n",
+          );
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    const result = await executor.apply({
+      proposal: proposalFixture({
+        filesToCreate: ["src/created.ts"],
+        filesToModify: [],
+      }),
+      approval: approvalFixture(),
+    });
+
+    expect(result.git.diffAfter).toContain("+[Git evidence truncated]");
+    expect(result.git.truncation.diffAfter).toEqual({
+      truncated: false,
+      limitBytes: 128 * 1024,
+      originalBytes: Buffer.byteLength(result.git.diffAfter, "utf8"),
+      retainedBytes: Buffer.byteLength(result.git.diffAfter, "utf8"),
+    });
+  });
+
+  it("does not execute repository-configured fsmonitor, textconv, or external diff helpers", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    const outsideRoot = await temporaryWorkspace();
+    const sentinelPath = join(outsideRoot, "helper-invoked.txt");
+    const helperPath = join(outsideRoot, "malicious-helper.mjs");
+    await writeFile(
+      helperPath,
+      `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(sentinelPath)}, "invoked\\n");\n`,
+      "utf8",
+    );
+    await chmod(helperPath, 0o700);
+    await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+    await writeWorkspaceFile(workspaceRoot, ".gitattributes", "src/file.ts diff=unsafe\n");
+    await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+    await execFile("git", ["add", "."], { cwd: workspaceRoot });
+    await execFile(
+      "git",
+      [
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "user.name=Design Sharingan Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+      ],
+      { cwd: workspaceRoot },
+    );
+    await execFile("git", ["config", "core.fsmonitor", helperPath], {
+      cwd: workspaceRoot,
+    });
+    await execFile("git", ["config", "diff.unsafe.textconv", helperPath], {
+      cwd: workspaceRoot,
+    });
+    await execFile("git", ["config", "diff.external", helperPath], {
+      cwd: workspaceRoot,
+    });
+    const executor = new MutationExecutor({
+      workspaceRoot,
+      proposalThreadId: "thread-proposal-1",
+      agent: {
+        async run<TStructured>(input: CodexAgentRunInput) {
+          await writeWorkspaceFile(input.workingDirectory, "src/file.ts", "after\n");
+          return { threadId: "thread-proposal-1", structured: null as TStructured };
+        },
+      },
+    });
+
+    await executor.apply({
+      proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+      approval: approvalFixture(),
+    });
+
+    await expect(readFile(sentinelPath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("redacts sensitive environment values from an approved Git diff", async () => {
+    const workspaceRoot = await temporaryWorkspace();
+    const secret = "task-nine-sensitive-token-value";
+    const previous = process.env.DESIGN_SHARINGAN_TEST_SECRET;
+    process.env.DESIGN_SHARINGAN_TEST_SECRET = secret;
+    try {
+      await writeWorkspaceFile(workspaceRoot, "src/file.ts", "before\n");
+      await execFile("git", ["init", "-b", "safe-fixture"], { cwd: workspaceRoot });
+      await execFile("git", ["add", "."], { cwd: workspaceRoot });
+      await execFile(
+        "git",
+        [
+          "-c",
+          "user.name=Design Sharingan Test",
+          "-c",
+          "user.email=test@example.invalid",
+          "commit",
+          "-m",
+          "fixture",
+        ],
+        { cwd: workspaceRoot },
+      );
+      const executor = new MutationExecutor({
+        workspaceRoot,
+        proposalThreadId: "thread-proposal-1",
+        agent: {
+          async run<TStructured>(input: CodexAgentRunInput) {
+            await writeWorkspaceFile(
+              input.workingDirectory,
+              "src/file.ts",
+              `export const token = ${JSON.stringify(secret)};\n`,
+            );
+            return { threadId: "thread-proposal-1", structured: null as TStructured };
+          },
+        },
+      });
+
+      const result = await executor.apply({
+        proposal: proposalFixture({ filesToModify: ["src/file.ts"] }),
+        approval: approvalFixture(),
+      });
+
+      expect(result.git.diffAfter).not.toContain(secret);
+      expect(result.git.diffAfter).toContain("[REDACTED]");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.DESIGN_SHARINGAN_TEST_SECRET;
+      } else {
+        process.env.DESIGN_SHARINGAN_TEST_SECRET = previous;
+      }
+    }
+  });
+});

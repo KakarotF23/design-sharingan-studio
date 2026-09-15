@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "paths": {
+      "@design-sharingan/agent-runtime": ["../agent-runtime/src/index.ts"],
+      "@design-sharingan/core": ["../core/src/index.ts"],
+      "@design-sharingan/governance": ["../governance/src/index.ts"]
+    },
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

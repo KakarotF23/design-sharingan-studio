@@ -1,0 +1,3926 @@
+import {
+  lstat,
+  link,
+  mkdir,
+  open,
+  readdir,
+  realpath,
+  rename,
+  unlink,
+} from "node:fs/promises";
+import { constants } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { basename, dirname, extname, join, posix } from "node:path";
+import type {
+  ActivityEvent,
+  Approval,
+  DesignApproach,
+  DesignDNA,
+  DesignSession,
+  FeatureBrief,
+  GenomeEvidence,
+  GovernanceFindingSource,
+  LearnSessionStatus,
+  Project,
+  Reference,
+  RenderArtifact,
+  RenderSourcePathEvidence,
+  UXImpact,
+} from "@design-sharingan/core";
+import {
+  canTransitionLearnSession,
+  createActivityEvent,
+  isCanonicalIdentifier,
+  isCanonicalIsoDateTime,
+  isDesignSessionEnvelope,
+  isGenomeEvidence,
+  isGovernanceFindingSource,
+  orderActivityEvents,
+  validateActivityEvent,
+} from "@design-sharingan/core";
+import { assertPathInsideWorkspace } from "./path-policy";
+
+const MACHINE_DIRECTORY = ".design-sharingan";
+const MAX_REFERENCE_BYTES = 10 * 1024 * 1024;
+const MAX_RECORD_BYTES = 1024 * 1024;
+const MAX_RENDER_BYTES = 25 * 1024 * 1024;
+const MAX_SESSION_HISTORY_ENTRIES = 512;
+const MAX_ACTIVITY_HISTORY_ENTRIES = 1_024;
+const MAX_ACTIVITY_DIRECTORY_ENTRIES =
+  MAX_ACTIVITY_HISTORY_ENTRIES + MAX_SESSION_HISTORY_ENTRIES;
+const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
+const CHECKPOINT_SUFFIX = ".checkpoint.json";
+const SESSION_HEAD_SUFFIX = ".session-head.json";
+const ACTIVITY_ID_PATTERN = /^act_[a-f0-9]{64}$/;
+const AUTHENTICATED_SESSION_READ_ATTEMPTS = 10;
+// Learn transitions are short, local durable writes. A bounded lease protects
+// a live owner across processes while still making a crashed owner (including
+// PID reuse) recoverable instead of permanently wedging the state machine.
+const LEARN_CLAIM_LEASE_MS = 30_000;
+
+/** A complete retry can safely replace only this proven stale directory view. */
+class ConcurrentSessionPublicationError extends Error {
+  constructor() {
+    super("Session activity event appeared after the reader snapshot");
+    this.name = "ConcurrentSessionPublicationError";
+  }
+}
+
+function isConcurrentSessionRead(error: unknown): boolean {
+  if (error instanceof ConcurrentSessionPublicationError) return true;
+  if (!(error instanceof Error)) return false;
+  return [
+    /^(?:Activity record|Session (?:checkpoint|head) record|Session record) changed while reading$/,
+    /^Session head is not authenticated by its immutable checkpoint$/,
+    /^Session commit (?:is still in progress|recovery raced)/,
+    /^Session journal has no committed head$/,
+    /^Session history filename\/identity count is invalid against its authenticated head index$/,
+    /^Session page (?:index points to a missing record|record does not match its authenticated head index)$/,
+    /^Session record (?:does not match its authenticated activity checkpoint head index|does not match its latest immutable checkpoint|is not part of a committed journal pair)$/,
+    /^Activity checkpoint is orphaned or belongs to another project$/,
+  ].some((pattern) => pattern.test(error.message));
+}
+
+/**
+ * A writer publishes checkpoint, body, and head as separate durable renames.
+ * Re-run the complete authenticated read when those renames cross a reader's
+ * bounded directory snapshot. Every attempt revalidates the immutable
+ * checkpoint relation, and a persistent mismatch is still rejected.
+ */
+async function retryAuthenticatedSessionRead<T>(read: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await read();
+    } catch (error) {
+      if (
+        attempt >= AUTHENTICATED_SESSION_READ_ATTEMPTS ||
+        !isConcurrentSessionRead(error)
+      ) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, attempt));
+    }
+  }
+}
+
+export type SessionCommitFault =
+  | "after-journal-before-session"
+  | "after-session-before-commit"
+  | "after-execution-head-before-approval-head"
+  | "after-reference-session-before-head";
+let sessionCommitFault: SessionCommitFault | undefined;
+
+/** Test-only fault injection for process-death boundaries in the session journal. */
+export function setSessionCommitFaultForTest(value: SessionCommitFault | undefined): void {
+  sessionCommitFault = value;
+}
+
+class InjectedSessionCommitCrash extends Error {
+  constructor(point: SessionCommitFault) {
+    super(`Injected session commit crash: ${point}`);
+    this.name = "InjectedSessionCommitCrash";
+  }
+}
+
+function throwSessionCommitFault(point: SessionCommitFault): void {
+  if (sessionCommitFault === point) throw new InjectedSessionCommitCrash(point);
+}
+
+/** Test-only pause point after a recovery reader captured its activity index. */
+let sessionRecoveryHook: (() => Promise<void> | void) | undefined;
+export function setSessionRecoveryHookForTest(value: (() => Promise<void> | void) | undefined): void {
+  sessionRecoveryHook = value;
+}
+
+export type LearnTransitionHookPoint = "after-claim" | "before-release";
+export type LearnTransitionHook = (input: {
+  point: LearnTransitionHookPoint;
+  ownerId: string;
+  projectId: string;
+  sessionId: string;
+}) => Promise<void> | void;
+let learnTransitionHook: LearnTransitionHook | undefined;
+
+/** Test-only scheduling hook for deterministic claim interleavings. */
+export function setLearnTransitionHookForTest(value: LearnTransitionHook | undefined): void {
+  learnTransitionHook = value;
+}
+
+interface SessionCheckpoint {
+  eventId: string;
+  sessionId: string;
+  projectId: string;
+  version: number;
+  sessionHash: string;
+  session: DesignSession;
+}
+
+interface SessionCommitHead {
+  kind: "DESIGN_SHARINGAN_SESSION_HEAD";
+  projectId: string;
+  sessionId: string;
+  eventId: string;
+  version: number;
+  sessionHash: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface SessionCommitClaim {
+  kind: "DESIGN_SHARINGAN_SESSION_COMMIT_CLAIM";
+  ownerId: string;
+  pid: number;
+  projectId: string;
+  sessionId: string;
+}
+
+interface OwnedSessionCommitClaim {
+  path: string;
+  value: SessionCommitClaim;
+  handle: Awaited<ReturnType<typeof open>>;
+  ownership: { dev: number; ino: number };
+}
+
+interface LearnTransitionClaim {
+  kind: "DESIGN_SHARINGAN_LEARN_CLAIM";
+  ownerId: string;
+  pid: number;
+  projectId: string;
+  sessionId: string;
+  expectedStatus: string;
+  expectedSessionHash: string;
+  leaseExpiresAt: string;
+  processStartedAt?: string;
+}
+
+const activeLearnClaimOwners = new Set<string>();
+
+export interface DesignWorkspace {
+  rootPath: string;
+  machinePath: string;
+  projectMetadataPath: string;
+  referencesPath: string;
+  sessionsPath: string;
+  activityPath: string;
+  rendersPath: string;
+  cachePath: string;
+}
+
+export interface SavedArtifact {
+  artifactPath: string;
+  metadataPath: string;
+}
+
+export interface WorkspaceOwnership {
+  rootPath: string;
+  parentPath: string;
+  dev: number;
+  ino: number;
+}
+
+function expectedWorkspacePaths(rootPath: string): DesignWorkspace {
+  const canonicalRoot = assertPathInsideWorkspace(rootPath, rootPath);
+  const machinePath = join(canonicalRoot, MACHINE_DIRECTORY);
+
+  return {
+    rootPath: canonicalRoot,
+    machinePath,
+    projectMetadataPath: join(machinePath, "project.json"),
+    referencesPath: join(machinePath, "references"),
+    sessionsPath: join(machinePath, "sessions"),
+    activityPath: join(machinePath, "activity"),
+    rendersPath: join(machinePath, "renders"),
+    cachePath: join(machinePath, "cache"),
+  };
+}
+
+function assertSafePathSegment(value: string, label: string): void {
+  if (
+    value.length === 0 ||
+    value === "." ||
+    value === ".." ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.includes("\0")
+  ) {
+    throw new Error(`${label} must be a safe path segment`);
+  }
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortJsonValue);
+  }
+
+  if (value !== null && typeof value === "object") {
+    const maybeSerializable = value as { toJSON?: () => unknown };
+    if (typeof maybeSerializable.toJSON === "function") {
+      return sortJsonValue(maybeSerializable.toJSON());
+    }
+
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, nestedValue]) => [key, sortJsonValue(nestedValue)]),
+    );
+  }
+
+  return value;
+}
+
+function stableJson(value: unknown): string {
+  const serialized = JSON.stringify(sortJsonValue(value), null, 2);
+  if (serialized === undefined) {
+    throw new TypeError("Value cannot be serialized as JSON");
+  }
+  return `${serialized}\n`;
+}
+
+async function atomicWrite(
+  allowedRoot: string,
+  destinationPath: string,
+  contents: string | Uint8Array,
+): Promise<void> {
+  const canonicalDestination = assertPathInsideWorkspace(
+    allowedRoot,
+    destinationPath,
+  );
+  const temporaryPath = assertPathInsideWorkspace(
+    allowedRoot,
+    join(
+      dirname(canonicalDestination),
+      `.${basename(canonicalDestination)}.tmp-${process.pid}-${randomUUID()}`,
+    ),
+  );
+  let temporaryFile: Awaited<ReturnType<typeof open>> | undefined;
+  const destinationBefore = await lstat(canonicalDestination).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (destinationBefore !== undefined &&
+    (!destinationBefore.isFile() || destinationBefore.isSymbolicLink() || destinationBefore.nlink !== 1)) {
+    throw new Error("Runtime record destination is not a private regular file");
+  }
+
+  try {
+    temporaryFile = await open(temporaryPath, "wx", 0o600);
+    await temporaryFile.writeFile(contents);
+    await temporaryFile.sync();
+    await temporaryFile.close();
+    temporaryFile = undefined;
+    const destinationAtCommit = await lstat(canonicalDestination).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (
+      destinationBefore === undefined
+        ? destinationAtCommit !== undefined
+        : destinationAtCommit === undefined ||
+          destinationAtCommit.dev !== destinationBefore.dev ||
+          destinationAtCommit.ino !== destinationBefore.ino ||
+          destinationAtCommit.nlink !== 1
+    ) {
+      throw new Error("Runtime record destination changed before atomic commit");
+    }
+    await rename(temporaryPath, canonicalDestination);
+    const destinationAfter = await lstat(canonicalDestination);
+    if (
+      destinationAfter.isSymbolicLink() ||
+      !destinationAfter.isFile() ||
+      destinationAfter.nlink !== 1
+    ) {
+      throw new Error("Runtime record destination is not a private regular file after commit");
+    }
+  } catch (error) {
+    if (temporaryFile !== undefined) {
+      await temporaryFile.close().catch(() => undefined);
+    }
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function atomicWriteJson(
+  allowedRoot: string,
+  destinationPath: string,
+  value: unknown,
+): Promise<void> {
+  await atomicWrite(allowedRoot, destinationPath, stableJson(value));
+}
+
+async function atomicCreate(
+  allowedRoot: string,
+  destinationPath: string,
+  contents: string | Uint8Array,
+): Promise<{ dev: number; ino: number }> {
+  const canonicalDestination = assertPathInsideWorkspace(
+    allowedRoot,
+    destinationPath,
+  );
+  const temporaryPath = assertPathInsideWorkspace(
+    allowedRoot,
+    join(
+      dirname(canonicalDestination),
+      `.${basename(canonicalDestination)}.tmp-${process.pid}-${randomUUID()}`,
+    ),
+  );
+  let temporaryFile: Awaited<ReturnType<typeof open>> | undefined;
+  let ownership: { dev: number; ino: number } | undefined;
+
+  try {
+    temporaryFile = await open(temporaryPath, "wx", 0o600);
+    await temporaryFile.writeFile(contents);
+    await temporaryFile.sync();
+    const entry = await temporaryFile.stat();
+    ownership = { dev: entry.dev, ino: entry.ino };
+    await temporaryFile.close();
+    temporaryFile = undefined;
+    await link(temporaryPath, canonicalDestination);
+    await unlink(temporaryPath).catch(() => undefined);
+    const destination = await lstat(canonicalDestination);
+    if (
+      destination.isSymbolicLink() ||
+      !destination.isFile() ||
+      destination.nlink !== 1 ||
+      destination.dev !== ownership.dev ||
+      destination.ino !== ownership.ino
+    ) {
+      throw new Error("Runtime record could not be committed as a private regular file");
+    }
+    return ownership;
+  } catch (error) {
+    if (temporaryFile !== undefined) {
+      await temporaryFile.close().catch(() => undefined);
+    }
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function unlinkCreatedFileIfOwned(
+  path: string,
+  ownership: { dev: number; ino: number },
+): Promise<void> {
+  // Give an interleaved writer that observed the newly-created inode a chance
+  // to publish its replacement before ownership is checked for rollback.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  let entry: Awaited<ReturnType<typeof lstat>>;
+  try {
+    entry = await lstat(path);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+  if (entry.dev !== ownership.dev || entry.ino !== ownership.ino) {
+    throw new Error("Render artifact ownership changed during rollback; replacement was preserved");
+  }
+  await unlink(path);
+}
+
+function boundedSessionContents(session: DesignSession): string {
+  assertBoundedSessionReferenceIds(session);
+  const contents = stableJson(session);
+  if (new TextEncoder().encode(contents).byteLength > MAX_RECORD_BYTES) {
+    throw new Error("Session record is too large; maximum size is 1 MiB");
+  }
+  return contents;
+}
+
+function assertBoundedSessionReferenceIds(session: DesignSession): void {
+  const record = session as unknown as Record<string, unknown>;
+  const candidates: unknown[] = [record.referenceIds];
+  if (record.designDNA !== null && typeof record.designDNA === "object") {
+    candidates.push((record.designDNA as Record<string, unknown>).referenceIds);
+  }
+  for (const value of candidates) {
+    if (value === undefined) continue;
+    if (
+      !Array.isArray(value) || value.length > 32 ||
+      value.some((entry) => !isCanonicalIdentifier(entry)) ||
+      new Set(value).size !== value.length
+    ) throw new Error("Session reference-id arrays must be unique and bounded to 32 canonical ids");
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function validateFixedDirectory(
+  containingRoot: string,
+  directoryPath: string,
+  label: string,
+): Promise<string> {
+  if (await pathExists(directoryPath)) {
+    const entry = await lstat(directoryPath);
+    if (entry.isSymbolicLink()) {
+      throw new Error(`${label} must not be a symbolic link`);
+    }
+    if (!entry.isDirectory()) {
+      throw new Error(`${label} must be a real directory`);
+    }
+  } else {
+    await mkdir(directoryPath).catch((error: unknown) => {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+      // Another initializer may have won. The exact fixed path is still
+      // validated below; a file or symlink is never accepted as that winner.
+    });
+  }
+
+  const createdEntry = await lstat(directoryPath);
+  if (createdEntry.isSymbolicLink()) {
+    throw new Error(`${label} must not be a symbolic link`);
+  }
+  if (!createdEntry.isDirectory()) {
+    throw new Error(`${label} must be a real directory`);
+  }
+
+  return assertPathInsideWorkspace(containingRoot, directoryPath);
+}
+
+async function validateProjectMetadataFile(
+  workspace: DesignWorkspace,
+): Promise<string> {
+  const metadataPath = workspace.projectMetadataPath;
+  if (await pathExists(metadataPath)) {
+    const entry = await lstat(metadataPath);
+    if (entry.isSymbolicLink() || entry.nlink !== 1) {
+      throw new Error("Workspace project metadata must be a private regular file, not a symbolic link or hard link");
+    }
+    if (!entry.isFile()) {
+      throw new Error("Workspace project metadata must be a regular file");
+    }
+  } else {
+    await atomicCreate(workspace.machinePath, metadataPath, stableJson({})).catch((error: unknown) => {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+    });
+  }
+
+  const createdEntry = await lstat(metadataPath);
+  if (createdEntry.isSymbolicLink() || createdEntry.nlink !== 1) {
+    throw new Error("Workspace project metadata must be a private regular file, not a symbolic link or hard link");
+  }
+  if (!createdEntry.isFile()) {
+    throw new Error("Workspace project metadata must be a regular file");
+  }
+
+  return assertPathInsideWorkspace(workspace.machinePath, metadataPath);
+}
+
+export async function ensureDesignWorkspace(
+  rootPath: string,
+): Promise<DesignWorkspace> {
+  const expected = expectedWorkspacePaths(rootPath);
+  const machinePath = await validateFixedDirectory(
+    expected.rootPath,
+    expected.machinePath,
+    "Machine workspace directory",
+  );
+  const referencesPath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "references"),
+    "References directory",
+  );
+  const sessionsPath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "sessions"),
+    "Sessions directory",
+  );
+  const activityPath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "activity"),
+    "Activity directory",
+  );
+  const rendersPath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "renders"),
+    "Renders directory",
+  );
+  const cachePath = await validateFixedDirectory(
+    machinePath,
+    join(machinePath, "cache"),
+    "Cache directory",
+  );
+  const workspace: DesignWorkspace = {
+    rootPath: expected.rootPath,
+    machinePath,
+    projectMetadataPath: join(machinePath, "project.json"),
+    referencesPath,
+    sessionsPath,
+    activityPath,
+    rendersPath,
+    cachePath,
+  };
+  workspace.projectMetadataPath = await validateProjectMetadataFile(workspace);
+
+  return workspace;
+}
+
+export async function saveProjectMetadata(project: Project): Promise<string> {
+  const workspace = await ensureDesignWorkspace(project.rootPath);
+  await atomicWriteJson(
+    workspace.machinePath,
+    workspace.projectMetadataPath,
+    project,
+  );
+  return workspace.projectMetadataPath;
+}
+
+function invalidWorkspaceOwnership(): Error {
+  return new Error(
+    "Owned workspace identity changed; refusing guarded persistence",
+  );
+}
+
+async function assertOpenWorkspaceOwnership(
+  rootHandle: Awaited<ReturnType<typeof open>>,
+  ownership: WorkspaceOwnership,
+): Promise<void> {
+  let pathEntry: Awaited<ReturnType<typeof lstat>>;
+  let handleEntry: Awaited<ReturnType<typeof rootHandle.stat>>;
+  try {
+    [pathEntry, handleEntry] = await Promise.all([
+      lstat(ownership.rootPath),
+      rootHandle.stat(),
+    ]);
+  } catch {
+    throw invalidWorkspaceOwnership();
+  }
+
+  if (
+    pathEntry.isSymbolicLink() ||
+    !pathEntry.isDirectory() ||
+    !handleEntry.isDirectory() ||
+    pathEntry.dev !== ownership.dev ||
+    pathEntry.ino !== ownership.ino ||
+    handleEntry.dev !== ownership.dev ||
+    handleEntry.ino !== ownership.ino
+  ) {
+    throw invalidWorkspaceOwnership();
+  }
+}
+
+async function openOwnedWorkspaceRoot(
+  project: Project,
+  ownership: WorkspaceOwnership,
+): Promise<Awaited<ReturnType<typeof open>>> {
+  if (
+    project.rootPath !== ownership.rootPath ||
+    dirname(ownership.rootPath) !== ownership.parentPath ||
+    assertPathInsideWorkspace(ownership.parentPath, ownership.rootPath) !==
+      ownership.rootPath
+  ) {
+    throw invalidWorkspaceOwnership();
+  }
+
+  let rootHandle: Awaited<ReturnType<typeof open>>;
+  try {
+    rootHandle = await open(
+      ownership.rootPath,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+  } catch {
+    throw invalidWorkspaceOwnership();
+  }
+
+  try {
+    const canonicalParent = await realpath(ownership.parentPath);
+    const canonicalRoot = await realpath(ownership.rootPath);
+    if (
+      canonicalParent !== ownership.parentPath ||
+      canonicalRoot !== ownership.rootPath
+    ) {
+      throw invalidWorkspaceOwnership();
+    }
+    await assertOpenWorkspaceOwnership(rootHandle, ownership);
+    return rootHandle;
+  } catch (error) {
+    await rootHandle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Persist project metadata only while the canonical workspace path still
+ * resolves to the exact directory inode captured by its adapter.
+ */
+export async function saveGuardedProjectMetadata(
+  project: Project,
+  ownership: WorkspaceOwnership,
+): Promise<string> {
+  const rootHandle = await openOwnedWorkspaceRoot(project, ownership);
+  try {
+    // No caller-provided JavaScript executes between the guarded open and the
+    // fixed runtime hierarchy mutation below.
+    const workspace = await ensureDesignWorkspace(project.rootPath);
+    await assertOpenWorkspaceOwnership(rootHandle, ownership);
+    await atomicWriteJson(
+      workspace.machinePath,
+      workspace.projectMetadataPath,
+      project,
+    );
+    await assertOpenWorkspaceOwnership(rootHandle, ownership);
+    return workspace.projectMetadataPath;
+  } finally {
+    await rootHandle.close().catch(() => undefined);
+  }
+}
+
+function invalidProjectIdentity(cause?: unknown): Error {
+  const error = new Error(
+    "Cannot validate active project identity; refusing artifact persistence",
+  );
+  if (cause !== undefined) {
+    error.cause = cause;
+  }
+  return error;
+}
+
+function isPersistedProject(value: unknown): value is Project {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const project = value as Partial<Project>;
+  const optionalStrings = [
+    project.repositoryUrl,
+    project.branch,
+    project.framework,
+    project.packageManager,
+    project.devCommand,
+  ];
+  return (
+    typeof project.id === "string" &&
+    project.id.length > 0 &&
+    typeof project.name === "string" &&
+    project.name.length > 0 &&
+    (project.sourceType === "LOCAL" || project.sourceType === "GITHUB") &&
+    typeof project.rootPath === "string" &&
+    (project.status === "UNINITIALIZED" ||
+      project.status === "SCANNING" ||
+      project.status === "NEEDS_CONFIGURATION" ||
+      project.status === "READY") &&
+    typeof project.createdAt === "string" &&
+    typeof project.updatedAt === "string" &&
+    optionalStrings.every(
+      (field) => field === undefined || typeof field === "string",
+    )
+  );
+}
+
+/**
+ * Reads an existing project identity without creating or repairing runtime
+ * state. A locator is accepted only when the canonical root, fixed metadata
+ * inode, persisted root, and requested project id all agree.
+ */
+export async function loadProjectMetadata(
+  rootPath: string,
+  expectedProjectId: string,
+): Promise<Project> {
+  let metadataHandle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    assertSafePathSegment(expectedProjectId, "Project id");
+    const canonicalRoot = await realpath(rootPath);
+    if (canonicalRoot !== rootPath) throw invalidProjectIdentity();
+
+    const rootEntry = await lstat(rootPath);
+    if (rootEntry.isSymbolicLink() || !rootEntry.isDirectory()) {
+      throw invalidProjectIdentity();
+    }
+
+    const workspace = expectedWorkspacePaths(canonicalRoot);
+    const machineEntry = await lstat(workspace.machinePath);
+    if (machineEntry.isSymbolicLink() || !machineEntry.isDirectory()) {
+      throw invalidProjectIdentity();
+    }
+    if (
+      (await realpath(/* turbopackIgnore: true */ workspace.machinePath)) !==
+      workspace.machinePath
+    ) {
+      throw invalidProjectIdentity();
+    }
+
+    const pathEntry = await lstat(workspace.projectMetadataPath);
+    if (pathEntry.isSymbolicLink() || !pathEntry.isFile() || pathEntry.nlink !== 1) {
+      throw invalidProjectIdentity();
+    }
+    metadataHandle = await open(
+      /* turbopackIgnore: true */ workspace.projectMetadataPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    const handleEntry = await metadataHandle.stat();
+    if (
+      !handleEntry.isFile() ||
+      handleEntry.nlink !== 1 ||
+      handleEntry.dev !== pathEntry.dev ||
+      handleEntry.ino !== pathEntry.ino
+    ) {
+      throw invalidProjectIdentity();
+    }
+
+    const persisted: unknown = JSON.parse(
+      await metadataHandle.readFile({ encoding: "utf8" }),
+    );
+    const currentEntry = await lstat(workspace.projectMetadataPath);
+    if (
+      currentEntry.isSymbolicLink() ||
+      !currentEntry.isFile() ||
+      currentEntry.nlink !== 1 ||
+      currentEntry.dev !== handleEntry.dev ||
+      currentEntry.ino !== handleEntry.ino ||
+      currentEntry.size !== handleEntry.size
+    ) {
+      throw invalidProjectIdentity();
+    }
+    if (
+      !isPersistedProject(persisted) ||
+      persisted.id !== expectedProjectId ||
+      persisted.rootPath !== canonicalRoot
+    ) {
+      throw invalidProjectIdentity();
+    }
+    return persisted;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith("Cannot validate active project identity")
+    ) {
+      throw error;
+    }
+    throw invalidProjectIdentity(error);
+  } finally {
+    await metadataHandle?.close().catch(() => undefined);
+  }
+}
+
+async function loadValidatedProjectContext(
+  rootPath: string,
+  expectedProjectId: string,
+): Promise<DesignWorkspace> {
+  const workspace = await ensureDesignWorkspace(rootPath);
+
+  try {
+    const persisted = await readBoundedJsonFile(
+      workspace.projectMetadataPath,
+      "Workspace project metadata",
+    );
+    if (
+      persisted === null ||
+      typeof persisted !== "object" ||
+      !("id" in persisted) ||
+      typeof persisted.id !== "string" ||
+      persisted.id !== expectedProjectId ||
+      !("rootPath" in persisted) ||
+      typeof persisted.rootPath !== "string"
+    ) {
+      throw invalidProjectIdentity();
+    }
+
+    const persistedRoot = assertPathInsideWorkspace(
+      workspace.rootPath,
+      persisted.rootPath,
+    );
+    if (persistedRoot !== workspace.rootPath) {
+      throw invalidProjectIdentity();
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith("Cannot validate active project identity")
+    ) {
+      throw error;
+    }
+    throw invalidProjectIdentity(error);
+  }
+
+  return workspace;
+}
+
+export function validateReferenceImage(
+  declaredMime: string,
+  bytes: Uint8Array,
+): ".png" | ".jpg" | ".webp" | ".gif" {
+  if (bytes.byteLength === 0) {
+    throw new Error("Reference image must not be empty");
+  }
+  if (bytes.byteLength > MAX_REFERENCE_BYTES) {
+    throw new Error("Reference image must be no larger than 10 MiB");
+  }
+
+  let extension: ".png" | ".jpg" | ".webp" | ".gif";
+  let signatureMatches: boolean;
+  switch (declaredMime) {
+    case "image/png":
+      extension = ".png";
+      signatureMatches =
+        bytes.byteLength >= 8 &&
+        [137, 80, 78, 71, 13, 10, 26, 10].every(
+          (value, index) => bytes[index] === value,
+        );
+      break;
+    case "image/jpeg":
+      extension = ".jpg";
+      signatureMatches =
+        bytes.byteLength >= 3 &&
+        bytes[0] === 0xff &&
+        bytes[1] === 0xd8 &&
+        bytes[2] === 0xff;
+      break;
+    case "image/webp":
+      extension = ".webp";
+      signatureMatches =
+        bytes.byteLength >= 12 &&
+        new TextDecoder("ascii").decode(bytes.subarray(0, 4)) === "RIFF" &&
+        new TextDecoder("ascii").decode(bytes.subarray(8, 12)) === "WEBP";
+      break;
+    case "image/gif":
+      extension = ".gif";
+      signatureMatches =
+        bytes.byteLength >= 6 &&
+        ["GIF87a", "GIF89a"].includes(
+          new TextDecoder("ascii").decode(bytes.subarray(0, 6)),
+        );
+      break;
+    default:
+      throw new Error("Reference image must be PNG, JPEG, WebP, or GIF");
+  }
+
+  if (!signatureMatches) {
+    throw new Error("Reference image signature does not match its declared MIME");
+  }
+  return extension;
+}
+
+export async function saveReferenceArtifact(
+  rootPath: string,
+  reference: Reference,
+  bytes: Uint8Array,
+): Promise<SavedArtifact> {
+  assertSafePathSegment(reference.id, "Reference id");
+  const workspace = await loadValidatedProjectContext(
+    rootPath,
+    reference.projectId,
+  );
+  const artifactExtension = validateReferenceImage(reference.type, bytes);
+  const referencePath = assertPathInsideWorkspace(
+    workspace.referencesPath,
+    join(workspace.referencesPath, reference.id),
+  );
+  await validateFixedDirectory(
+    workspace.referencesPath,
+    referencePath,
+    "Reference directory",
+  );
+
+  const artifactPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, `artifact${artifactExtension}`),
+  );
+  const metadataPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "reference.json"),
+  );
+
+  await atomicWrite(referencePath, artifactPath, bytes);
+  await atomicWriteJson(referencePath, metadataPath, {
+    ...reference,
+    imagePath: artifactPath,
+  });
+
+  return { artifactPath, metadataPath };
+}
+
+async function readBoundedJsonFile(path: string, label: string): Promise<unknown> {
+  const pathEntry = await lstat(path);
+  if (
+    pathEntry.isSymbolicLink() ||
+    !pathEntry.isFile() ||
+    pathEntry.nlink !== 1 ||
+    pathEntry.size > MAX_RECORD_BYTES
+  ) {
+    throw new Error(`${label} is invalid`);
+  }
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const handleEntry = await handle.stat();
+    if (
+      !handleEntry.isFile() ||
+      handleEntry.nlink !== 1 ||
+      handleEntry.dev !== pathEntry.dev ||
+      handleEntry.ino !== pathEntry.ino ||
+      handleEntry.size > MAX_RECORD_BYTES
+    ) {
+      throw new Error(`${label} changed while reading`);
+    }
+    const contents = await handle.readFile({ encoding: "utf8" });
+    let current: Awaited<ReturnType<typeof lstat>>;
+    try {
+      current = await lstat(path);
+    } catch {
+      throw new Error(`${label} changed while reading`);
+    }
+    if (
+      current.isSymbolicLink() ||
+      !current.isFile() ||
+      current.nlink !== 1 ||
+      current.dev !== handleEntry.dev ||
+      current.ino !== handleEntry.ino ||
+      current.size !== handleEntry.size
+    ) {
+      throw new Error(`${label} changed while reading`);
+    }
+    return JSON.parse(contents) as unknown;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function isPersistedReference(value: unknown): value is Reference {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const reference = value as Partial<Reference>;
+  return (
+    typeof reference.id === "string" &&
+    typeof reference.projectId === "string" &&
+    typeof reference.title === "string" &&
+    typeof reference.type === "string" &&
+    typeof reference.source === "string" &&
+    (reference.imagePath === undefined || typeof reference.imagePath === "string") &&
+    (reference.notes === undefined || typeof reference.notes === "string") &&
+    isStringArray(reference.likes) &&
+    isStringArray(reference.dislikes) &&
+    isStringArray(reference.tags) &&
+    ["UPLOADED", "PROCESSING", "READY", "ANALYZED", "ASSIMILATED"].includes(
+      reference.analysisStatus ?? "",
+    ) &&
+    (reference.compatibility === undefined ||
+      typeof reference.compatibility === "string") &&
+    typeof reference.createdAt === "string"
+  );
+}
+
+function isPersistedSession(value: unknown): value is DesignSession {
+  return isDesignSessionEnvelope(value);
+}
+
+function isPersistedDesignDNA(value: unknown): value is DesignDNA {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const designDNA = value as Partial<DesignDNA>;
+  return (
+    typeof designDNA.id === "string" &&
+    [
+      designDNA.referenceIds,
+      designDNA.hierarchy,
+      designDNA.layout,
+      designDNA.spacing,
+      designDNA.typography,
+      designDNA.colorLogic,
+      designDNA.componentGeometry,
+      designDNA.navigation,
+      designDNA.interaction,
+      designDNA.motion,
+      designDNA.density,
+      designDNA.emotionalTone,
+      designDNA.visualWeight,
+      designDNA.keep,
+      designDNA.reject,
+      designDNA.adapt,
+      designDNA.invent,
+    ].every(isStringArray)
+  );
+}
+
+function isObjectWithOnlyKeys(
+  value: unknown,
+  allowedKeys: readonly string[],
+): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).every((key) => allowedKeys.includes(key))
+  );
+}
+
+function hasNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isFeatureBrief(value: unknown): value is FeatureBrief {
+  if (
+    !isObjectWithOnlyKeys(value, [
+      "name",
+      "goal",
+      "description",
+      "constraints",
+      "mustKeep",
+      "mustNotChange",
+      "successCriteria",
+    ])
+  ) {
+    return false;
+  }
+  return (
+    hasNonEmptyString(value.name) &&
+    hasNonEmptyString(value.goal) &&
+    hasNonEmptyString(value.description) &&
+    isStringArray(value.constraints) &&
+    isStringArray(value.mustKeep) &&
+    isStringArray(value.mustNotChange) &&
+    isStringArray(value.successCriteria)
+  );
+}
+
+function isUXImpact(value: unknown): value is UXImpact {
+  if (
+    !isObjectWithOnlyKeys(value, [
+      "area",
+      "severity",
+      "reason",
+      "affectedRoutes",
+      "affectedComponents",
+      "decisionRequired",
+    ])
+  ) {
+    return false;
+  }
+  return (
+    hasNonEmptyString(value.area) &&
+    ["CRITICAL", "IMPORTANT", "POLISH", "IGNORE"].includes(
+      value.severity as string,
+    ) &&
+    hasNonEmptyString(value.reason) &&
+    isStringArray(value.affectedRoutes) &&
+    isStringArray(value.affectedComponents) &&
+    typeof value.decisionRequired === "boolean"
+  );
+}
+
+function isDesignApproach(value: unknown): value is DesignApproach {
+  if (
+    !isObjectWithOnlyKeys(value, [
+      "id",
+      "title",
+      "summary",
+      "recommended",
+      "pros",
+      "cons",
+      "uxImpact",
+      "estimatedComplexity",
+      "genomeFit",
+      "likelyFiles",
+      "status",
+    ])
+  ) {
+    return false;
+  }
+  return (
+    hasNonEmptyString(value.id) &&
+    /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value.id) &&
+    hasNonEmptyString(value.title) &&
+    hasNonEmptyString(value.summary) &&
+    typeof value.recommended === "boolean" &&
+    isStringArray(value.pros) &&
+    value.pros.length > 0 &&
+    isStringArray(value.cons) &&
+    value.cons.length > 0 &&
+    Array.isArray(value.uxImpact) &&
+    value.uxImpact.length > 0 &&
+    value.uxImpact.every(isUXImpact) &&
+    hasNonEmptyString(value.estimatedComplexity) &&
+    hasNonEmptyString(value.genomeFit) &&
+    isStringArray(value.likelyFiles) &&
+    value.likelyFiles.length > 0 &&
+    value.status === "PROPOSED"
+  );
+}
+
+function isApproval(value: unknown): value is Approval {
+  if (
+    !isObjectWithOnlyKeys(value, [
+      "id",
+      "proposalId",
+      "decision",
+      "scope",
+      "approvedBy",
+      "comment",
+      "createdAt",
+    ])
+  ) {
+    return false;
+  }
+  return (
+    hasNonEmptyString(value.id) &&
+    hasNonEmptyString(value.proposalId) &&
+    ["APPROVED", "REJECTED", "REVISION_REQUESTED"].includes(
+      value.decision as string,
+    ) &&
+    hasNonEmptyString(value.scope) &&
+    hasNonEmptyString(value.approvedBy) &&
+    (value.comment === undefined || typeof value.comment === "string") &&
+    hasNonEmptyString(value.createdAt)
+  );
+}
+
+function isApproachSet(value: unknown): value is DesignApproach[] {
+  return (
+    Array.isArray(value) &&
+    value.length >= 2 &&
+    value.length <= 3 &&
+    value.every(isDesignApproach) &&
+    value.filter((approach) => approach.recommended).length === 1 &&
+    new Set(value.map((approach) => approach.id)).size === value.length
+  );
+}
+
+export async function loadReference(
+  rootPath: string,
+  projectId: string,
+  referenceId: string,
+): Promise<Reference> {
+  assertSafePathSegment(referenceId, "Reference id");
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  const referencePath = assertPathInsideWorkspace(
+    workspace.referencesPath,
+    join(workspace.referencesPath, referenceId),
+  );
+  const directoryEntry = await lstat(referencePath);
+  if (directoryEntry.isSymbolicLink() || !directoryEntry.isDirectory()) {
+    throw new Error("Reference directory is invalid");
+  }
+  const metadataPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "reference.json"),
+  );
+  const persisted = await readBoundedJsonFile(metadataPath, "Reference record");
+  if (
+    !isPersistedReference(persisted) ||
+    persisted.projectId !== projectId ||
+    persisted.id !== referenceId ||
+    persisted.imagePath === undefined ||
+    assertPathInsideWorkspace(referencePath, persisted.imagePath) !==
+      persisted.imagePath
+  ) {
+    throw new Error("Reference record is invalid");
+  }
+  return persisted;
+}
+
+export async function loadReferenceImage(
+  rootPath: string,
+  projectId: string,
+  referenceId: string,
+): Promise<{ bytes: Uint8Array; type: Reference["type"] }> {
+  const reference = await loadReference(rootPath, projectId, referenceId);
+  const imagePath = reference.imagePath as string;
+  const pathEntry = await lstat(imagePath);
+  if (
+    pathEntry.isSymbolicLink() ||
+    !pathEntry.isFile() ||
+    pathEntry.nlink !== 1 ||
+    pathEntry.size === 0 ||
+    pathEntry.size > MAX_REFERENCE_BYTES
+  ) {
+    throw new Error("Reference image artifact is invalid");
+  }
+  const handle = await open(
+    imagePath,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  try {
+    const handleEntry = await handle.stat();
+    if (
+      !handleEntry.isFile() ||
+      handleEntry.nlink !== 1 ||
+      handleEntry.dev !== pathEntry.dev ||
+      handleEntry.ino !== pathEntry.ino ||
+      handleEntry.size !== pathEntry.size
+    ) {
+      throw new Error("Reference image artifact changed while reading");
+    }
+    const bytes = new Uint8Array(await handle.readFile());
+    const current = await lstat(imagePath);
+    if (
+      current.isSymbolicLink() ||
+      !current.isFile() ||
+      current.nlink !== 1 ||
+      current.dev !== handleEntry.dev ||
+      current.ino !== handleEntry.ino ||
+      current.size !== handleEntry.size
+    ) {
+      throw new Error("Reference image artifact changed while reading");
+    }
+    validateReferenceImage(reference.type, bytes);
+    return { bytes, type: reference.type };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+export async function listReferences(
+  rootPath: string,
+  projectId: string,
+): Promise<Reference[]> {
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  const entries = await readdir(workspace.referencesPath, {
+    withFileTypes: true,
+  });
+  const references = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+      .map((entry) => loadReference(rootPath, projectId, entry.name)),
+  );
+  return references.sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt),
+  );
+}
+
+export async function updateReference(
+  rootPath: string,
+  reference: Reference,
+): Promise<string> {
+  const existing = await loadReference(rootPath, reference.projectId, reference.id);
+  if (
+    reference.imagePath !== existing.imagePath ||
+    reference.type !== existing.type ||
+    reference.source !== existing.source ||
+    reference.createdAt !== existing.createdAt
+  ) {
+    throw new Error("Reference artifact identity cannot be changed");
+  }
+  const referencePath = dirname(existing.imagePath as string);
+  const metadataPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "reference.json"),
+  );
+  await atomicWriteJson(referencePath, metadataPath, reference);
+  return metadataPath;
+}
+
+export async function saveReferenceDesignDNA(
+  rootPath: string,
+  projectId: string,
+  referenceId: string,
+  designDNA: DesignDNA,
+): Promise<string> {
+  const reference = await loadReference(rootPath, projectId, referenceId);
+  if (!designDNA.referenceIds.includes(reference.id)) {
+    throw new Error("DesignDNA does not include the active reference");
+  }
+  const referencePath = dirname(reference.imagePath as string);
+  const designDNAPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "design-dna.json"),
+  );
+  await atomicWriteJson(referencePath, designDNAPath, designDNA);
+  return designDNAPath;
+}
+
+export async function loadReferenceDesignDNA(
+  rootPath: string,
+  projectId: string,
+  referenceId: string,
+): Promise<DesignDNA> {
+  const reference = await loadReference(rootPath, projectId, referenceId);
+  const referencePath = dirname(reference.imagePath as string);
+  const designDNAPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "design-dna.json"),
+  );
+  const persisted = await readBoundedJsonFile(designDNAPath, "DesignDNA record");
+  if (
+    !isPersistedDesignDNA(persisted) ||
+    !persisted.referenceIds.includes(referenceId)
+  ) {
+    throw new Error("DesignDNA record is invalid");
+  }
+  return persisted;
+}
+
+function activityDescriptor(session: DesignSession): {
+  category: ActivityEvent["category"];
+  message: string;
+} {
+  const error = (session as DesignSession & { error?: unknown }).error;
+  const hasSafeExecutionFailure = session.type === "SAFE_EXECUTION" &&
+    Object.hasOwn(session as object, "executionFailure");
+  if (
+    (typeof error === "string" && error.trim().length > 0) ||
+    session.status === "FAILED" ||
+    hasSafeExecutionFailure
+  ) {
+    return {
+      category: "SYSTEM",
+      message: `${session.type.replaceAll("_", " ")} failed`,
+    };
+  }
+  if (session.status === "NOT_VERIFIED") {
+    return {
+      category: "SYSTEM",
+      message: `${session.type.replaceAll("_", " ")} not verified`,
+    };
+  }
+  switch (session.type) {
+    case "REFERENCE_SCAN":
+      if (session.status === "ANALYZING") {
+        return { category: "AGENT", message: "Analyzing reference" };
+      }
+      if (session.status === "RESULT_READY") {
+        return { category: "AGENT", message: "Reference analysis evidence saved" };
+      }
+      return { category: "SYSTEM", message: "Reference scan created" };
+    case "ASSIMILATION":
+    case "DESIGN_VERIFY":
+      return { category: "AGENT", message: session.status === "RESULT_READY" ? "Readonly design evidence saved" : "Analyzing design direction" };
+    case "GOVERNANCE_CAPTURE":
+      return { category: "RENDER", message: "Scoped browser and visual verification evidence saved" };
+    case "FEATURE_EVOLVE":
+      if (session.status === "AWAITING_DECISION") {
+        return { category: "APPROVAL", message: "Waiting for approach approval" };
+      }
+      if (session.status === "APPROVED") {
+        return { category: "APPROVAL", message: "Design approach approved" };
+      }
+      if (session.status === "ANALYZING") {
+        return { category: "AGENT", message: "Analyzing feature impact" };
+      }
+      if (session.status === "REVISE") {
+        return { category: "APPROVAL", message: "Feature direction needs revision" };
+      }
+      if (session.status === "REJECT") {
+        return { category: "APPROVAL", message: "Feature direction rejected" };
+      }
+      return { category: "AGENT", message: "Feature EVOLVE evidence saved" };
+    case "SAFE_EXECUTION":
+      if (session.status === "WAITING_APPROVAL") {
+        return { category: "APPROVAL", message: "Waiting for approval" };
+      }
+      if (session.status === "APPROVED") {
+        return { category: "APPROVAL", message: "Mutation approval recorded" };
+      }
+      if (session.status === "REJECTED") {
+        return { category: "APPROVAL", message: "Mutation proposal rejected" };
+      }
+      if (session.status === "PREPARING") {
+        return { category: "AGENT", message: "Preparing change proposal" };
+      }
+      if (session.status === "PROPOSING") {
+        return { category: "AGENT", message: "Change proposal ready" };
+      }
+      if (session.status === "REVISING") {
+        return { category: "AGENT", message: "Revising change proposal" };
+      }
+      if (session.status === "EDITING") {
+        return { category: "GIT", message: "Safe mutation evidence saved" };
+      }
+      if (session.status === "RUNNING") {
+        return { category: "RENDER", message: "Running project" };
+      }
+      if (session.status === "CAPTURING") {
+        return { category: "RENDER", message: "Capturing configured route" };
+      }
+      if (session.status === "VERIFYING") {
+        return { category: "RENDER", message: "Verifying mutation evidence" };
+      }
+      if (session.status === "COMPLETE") {
+        return { category: "SYSTEM", message: "Safe execution verified" };
+      }
+      return { category: "SYSTEM", message: "Safe execution initialized" };
+    case "MANGEKYO_LOOP":
+      if (session.status === "CAPTURING") {
+        return { category: "RENDER", message: "Capturing configured route" };
+      }
+      if (session.status === "RUNNING") {
+        return { category: "RENDER", message: "Running project" };
+      }
+      if (session.status === "HUMAN_GATE") {
+        return { category: "APPROVAL", message: "Human decision required" };
+      }
+      if (session.status === "COMPARING") {
+        return { category: "AGENT", message: "Comparing render evidence" };
+      }
+      if (session.status === "POLICY_CHECK") {
+        return { category: "APPROVAL", message: "Checking autonomy policy" };
+      }
+      if (session.status === "EDITING") {
+        return { category: "GIT", message: "Applying approved visual change" };
+      }
+      if (session.status === "PREPARING") {
+        return { category: "AGENT", message: "Preparing visual round" };
+      }
+      if (session.status === "DECIDING") {
+        return { category: "AGENT", message: "Evaluating visual findings" };
+      }
+      if (session.status === "FIXING") {
+        return { category: "AGENT", message: "Preparing next visual refinement" };
+      }
+      if (session.status === "COMPLETE") {
+        return { category: "SYSTEM", message: "Visual round verified" };
+      }
+      if (session.status === "BLOCKED") {
+        return { category: "APPROVAL", message: "Mangekyō loop blocked" };
+      }
+      if (session.status === "FAILED") {
+        return { category: "SYSTEM", message: "Mangekyō loop failed" };
+      }
+      return { category: "AGENT", message: "Mangekyō loop initialized" };
+    case "GENOME_INIT":
+      return { category: "GOVERNANCE", message: "Design Genome evidence saved" };
+    case "DRIFT_AUDIT":
+      return { category: "GOVERNANCE", message: "Drift audit evidence saved" };
+    case "RELEASE_GATE":
+      return { category: "GOVERNANCE", message: "Release evidence evaluated" };
+  }
+}
+
+function sessionCheckpointHash(session: DesignSession): string {
+  return createHash("sha256").update(stableJson(session), "utf8").digest("hex");
+}
+
+function activityEventForSession(
+  session: DesignSession,
+  checkpointHash: string,
+  checkpointVersion: number,
+): ActivityEvent {
+  const descriptor = activityDescriptor(session);
+  const digest = createHash("sha256")
+    .update(`${checkpointHash}\u0000${checkpointVersion}`)
+    .digest("hex");
+  return createActivityEvent({
+    id: `act_${digest}`,
+    projectId: session.projectId,
+    sessionId: session.id,
+    occurredAt: session.updatedAt,
+    category: descriptor.category,
+    message: descriptor.message,
+    evidence: [{ kind: "SESSION", id: session.id }],
+  });
+}
+
+function isSessionCheckpoint(value: unknown): value is SessionCheckpoint {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<SessionCheckpoint>;
+  const keys = Object.keys(value).sort();
+  return keys.length === 6 &&
+    keys.join("\u0000") === [
+      "eventId",
+      "projectId",
+      "session",
+      "sessionHash",
+      "sessionId",
+      "version",
+    ].join("\u0000") &&
+    typeof record.eventId === "string" && ACTIVITY_ID_PATTERN.test(record.eventId) &&
+    typeof record.projectId === "string" && isDesignSessionEnvelope(record.session) &&
+    typeof record.sessionId === "string" && isDesignSessionEnvelope(record.session) &&
+    record.session.id === record.sessionId && record.session.projectId === record.projectId &&
+    typeof record.version === "number" && Number.isSafeInteger(record.version) &&
+    record.version > 0 && record.version <= MAX_SESSION_HISTORY_ENTRIES &&
+    typeof record.sessionHash === "string" && /^[a-f0-9]{64}$/.test(record.sessionHash) &&
+    record.sessionHash === sessionCheckpointHash(record.session);
+}
+
+interface BoundedFileEntry {
+  name: string;
+  path: string;
+  size: number;
+  dev: number;
+  ino: number;
+}
+
+async function boundedJsonDirectory(
+  directory: string,
+  label: string,
+  maximumEntries: number,
+): Promise<BoundedFileEntry[]> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  if (entries.length > maximumEntries) {
+    throw new Error(`${label} exceeds the bounded history entry budget`);
+  }
+  const candidates = entries.filter((entry) => entry.name.endsWith(".json"));
+  if (candidates.length > maximumEntries) {
+    throw new Error(`${label} exceeds the bounded history entry budget`);
+  }
+  const files: BoundedFileEntry[] = [];
+  let aggregateBytes = 0;
+  for (const entry of candidates) {
+    const path = assertPathInsideWorkspace(directory, join(directory, entry.name));
+    const identity = await lstat(path);
+    if (identity.isSymbolicLink() || !identity.isFile() || identity.nlink !== 1) {
+      throw new Error(`${label} contains an unsafe runtime record`);
+    }
+    if (identity.size > MAX_RECORD_BYTES) {
+      throw new Error(`${label} contains an oversized runtime record`);
+    }
+    aggregateBytes += identity.size;
+    if (aggregateBytes > MAX_HISTORY_BYTES) {
+      throw new Error(`${label} exceeds the bounded history byte budget`);
+    }
+    files.push({
+      name: entry.name,
+      path,
+      size: identity.size,
+      dev: identity.dev,
+      ino: identity.ino,
+    });
+  }
+  return files;
+}
+
+async function readSessionCheckpoints(
+  workspace: DesignWorkspace,
+  projectId?: string,
+  existingFiles?: readonly BoundedFileEntry[],
+): Promise<SessionCheckpoint[]> {
+  const files = existingFiles ?? await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const checkpoints: SessionCheckpoint[] = [];
+  for (const file of files.filter(({ name }) => name.endsWith(CHECKPOINT_SUFFIX))) {
+    const value = await readBoundedJsonFile(file.path, "Session checkpoint");
+    if (!isSessionCheckpoint(value)) throw new Error("Session checkpoint is invalid");
+    const expectedFileName = `${value.eventId}${CHECKPOINT_SUFFIX}`;
+    if (file.name !== expectedFileName) throw new Error("Session checkpoint filename is invalid");
+    if (projectId !== undefined && value.projectId !== projectId) {
+      throw new Error("Session checkpoint project identity is invalid");
+    }
+    checkpoints.push(value);
+  }
+  return checkpoints;
+}
+
+function sessionHeadFileName(sessionId: string): string {
+  assertSafePathSegment(sessionId, "Session id");
+  return `${sessionId}${SESSION_HEAD_SUFFIX}`;
+}
+
+function sessionCommitHeadFor(checkpoint: SessionCheckpoint): SessionCommitHead {
+  return {
+    kind: "DESIGN_SHARINGAN_SESSION_HEAD",
+    projectId: checkpoint.projectId,
+    sessionId: checkpoint.sessionId,
+    eventId: checkpoint.eventId,
+    version: checkpoint.version,
+    sessionHash: checkpoint.sessionHash,
+    createdAt: checkpoint.session.createdAt,
+    updatedAt: checkpoint.session.updatedAt,
+  };
+}
+
+function isSessionCommitHead(value: unknown): value is SessionCommitHead {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const head = value as Partial<SessionCommitHead>;
+  return (
+    Object.keys(value).sort().join("\0") === [
+      "createdAt", "eventId", "kind", "projectId", "sessionHash", "sessionId",
+      "updatedAt", "version",
+    ].join("\0") &&
+    head.kind === "DESIGN_SHARINGAN_SESSION_HEAD" &&
+    isCanonicalIdentifier(head.projectId) && isCanonicalIdentifier(head.sessionId) &&
+    typeof head.eventId === "string" && ACTIVITY_ID_PATTERN.test(head.eventId) &&
+    Number.isSafeInteger(head.version) && Number(head.version) > 0 &&
+    Number(head.version) <= MAX_SESSION_HISTORY_ENTRIES &&
+    typeof head.sessionHash === "string" && /^[a-f0-9]{64}$/.test(head.sessionHash) &&
+    isCanonicalIsoDateTime(head.createdAt) && isCanonicalIsoDateTime(head.updatedAt) &&
+    Date.parse(head.updatedAt) >= Date.parse(head.createdAt)
+  );
+}
+
+async function readSessionCommitHeads(
+  workspace: DesignWorkspace,
+  projectId: string,
+  files: readonly BoundedFileEntry[],
+  checkpoints: readonly SessionCheckpoint[],
+): Promise<Map<string, SessionCommitHead>> {
+  const checkpointsByEvent = new Map(checkpoints.map((checkpoint) => [checkpoint.eventId, checkpoint]));
+  const heads = new Map<string, SessionCommitHead>();
+  const headFiles = files.filter(({ name }) => name.endsWith(SESSION_HEAD_SUFFIX));
+  if (headFiles.length > MAX_SESSION_HISTORY_ENTRIES) {
+    throw new Error("Session head index exceeds its bounded entry budget");
+  }
+  for (const file of headFiles) {
+    const sessionId = file.name.slice(0, -SESSION_HEAD_SUFFIX.length);
+    assertSafePathSegment(sessionId, "Session id");
+    const value = await readBoundedJsonFile(file.path, "Session head record");
+    if (
+      !isSessionCommitHead(value) || value.projectId !== projectId ||
+      value.sessionId !== sessionId || file.name !== sessionHeadFileName(value.sessionId) ||
+      heads.has(value.sessionId)
+    ) throw new Error("Session head index is invalid or ambiguous");
+    const checkpoint = checkpointsByEvent.get(value.eventId);
+    if (
+      checkpoint === undefined || checkpoint.sessionId !== value.sessionId ||
+      stableJson(value) !== stableJson(sessionCommitHeadFor(checkpoint))
+    ) throw new Error("Session head is not authenticated by its immutable checkpoint");
+    heads.set(value.sessionId, value);
+  }
+  return heads;
+}
+
+async function writeSessionCommitHead(
+  workspace: DesignWorkspace,
+  checkpoint: SessionCheckpoint,
+): Promise<void> {
+  await atomicWriteJson(
+    workspace.activityPath,
+    assertPathInsideWorkspace(
+      workspace.activityPath,
+      join(workspace.activityPath, sessionHeadFileName(checkpoint.sessionId)),
+    ),
+    sessionCommitHeadFor(checkpoint),
+  );
+}
+
+async function removeBoundedFileIfOwned(file: BoundedFileEntry): Promise<void> {
+  await unlinkCreatedFileIfOwned(file.path, { dev: file.dev, ino: file.ino });
+}
+
+function sessionCommitClaimPath(workspace: DesignWorkspace, sessionId: string): string {
+  assertSafePathSegment(sessionId, "Session id");
+  return assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `.${sessionId}.session-commit.claim`),
+  );
+}
+
+function isSessionCommitClaim(value: unknown): value is SessionCommitClaim {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const claim = value as Partial<SessionCommitClaim>;
+  return (
+    Object.keys(value).sort().join("\0") === [
+      "kind", "ownerId", "pid", "projectId", "sessionId",
+    ].join("\0") &&
+    claim.kind === "DESIGN_SHARINGAN_SESSION_COMMIT_CLAIM" &&
+    typeof claim.ownerId === "string" && /^[a-f0-9-]{36}$/.test(claim.ownerId) &&
+    Number.isSafeInteger(claim.pid) && Number(claim.pid) > 0 && Number(claim.pid) <= 2_147_483_647 &&
+    isCanonicalIdentifier(claim.projectId) && isCanonicalIdentifier(claim.sessionId)
+  );
+}
+
+async function removeExactSessionCommitClaim(
+  path: string,
+  value: SessionCommitClaim,
+  ownership: { dev: number; ino: number },
+): Promise<boolean> {
+  const before = await lstat(path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (
+    before === undefined || before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 ||
+    before.dev !== ownership.dev || before.ino !== ownership.ino
+  ) return false;
+  const persisted = await readBoundedJsonFile(path, "Session commit claim");
+  const after = await lstat(path).catch(() => undefined);
+  if (
+    !isSessionCommitClaim(persisted) || stableJson(persisted) !== stableJson(value) ||
+    after === undefined || after.dev !== before.dev || after.ino !== before.ino || after.nlink !== 1
+  ) return false;
+  await unlink(path);
+  return true;
+}
+
+function processIsAlive(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(error instanceof Error && "code" in error && error.code === "ESRCH");
+  }
+}
+
+async function hasLiveSessionCommitClaim(
+  workspace: DesignWorkspace,
+  projectId: string,
+  sessionId: string,
+): Promise<boolean> {
+  const path = sessionCommitClaimPath(workspace, sessionId);
+  const identity = await lstat(path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (identity === undefined) return false;
+  if (identity.isSymbolicLink() || !identity.isFile() || identity.nlink !== 1) {
+    throw new Error("Session commit claim is invalid or ambiguous");
+  }
+  const value = await readBoundedJsonFile(path, "Session commit claim");
+  if (!isSessionCommitClaim(value) || value.projectId !== projectId || value.sessionId !== sessionId) {
+    throw new Error("Session commit claim is invalid or ambiguous");
+  }
+  if (processIsAlive(value.pid)) return true;
+  await removeExactSessionCommitClaim(path, value, { dev: identity.dev, ino: identity.ino });
+  return false;
+}
+
+async function acquireSessionCommitClaim(
+  workspace: DesignWorkspace,
+  projectId: string,
+  sessionId: string,
+): Promise<OwnedSessionCommitClaim> {
+  const path = sessionCommitClaimPath(workspace, sessionId);
+  const value: SessionCommitClaim = {
+    kind: "DESIGN_SHARINGAN_SESSION_COMMIT_CLAIM",
+    ownerId: randomUUID(),
+    pid: process.pid,
+    projectId,
+    sessionId,
+  };
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(stableJson(value), "utf8");
+    await handle.sync();
+    const identity = await handle.stat();
+    return {
+      path,
+      value,
+      handle,
+      ownership: { dev: identity.dev, ino: identity.ino },
+    };
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      throw new Error("Session commit is already in progress", { cause: error });
+    }
+    throw error;
+  }
+}
+
+async function releaseSessionCommitClaim(claim: OwnedSessionCommitClaim): Promise<void> {
+  await claim.handle.close().catch(() => undefined);
+  await removeExactSessionCommitClaim(
+    claim.path,
+    claim.value,
+    claim.ownership,
+  ).catch(() => undefined);
+}
+
+/**
+ * A recovery publish is itself a write transaction. Re-check the exact head
+ * only after taking the same per-session claim as writers, so a writer that
+ * starts between stale-claim inspection and recovery cannot be regressed.
+ */
+async function publishRecoveredSessionHead(
+  workspace: DesignWorkspace,
+  projectId: string,
+  candidate: SessionCheckpoint,
+  expectedHead: SessionCommitHead | undefined,
+): Promise<void> {
+  const claim = await acquireSessionCommitClaim(workspace, projectId, candidate.sessionId)
+    .catch((error: unknown) => {
+      if (error instanceof Error && /already in progress/i.test(error.message)) {
+        throw new Error("Session commit recovery raced a live writer; retry from the committed head", { cause: error });
+      }
+      throw error;
+    });
+  try {
+    const headPath = assertPathInsideWorkspace(
+      workspace.activityPath,
+      join(workspace.activityPath, sessionHeadFileName(candidate.sessionId)),
+    );
+    const currentHead = await readBoundedJsonFile(headPath, "Session head record").catch(
+      (error: unknown) => {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+        throw error;
+      },
+    );
+    const headMatches = expectedHead === undefined
+      ? currentHead === undefined
+      : isSessionCommitHead(currentHead) && stableJson(currentHead) === stableJson(expectedHead);
+    if (!headMatches) throw new Error("Session commit recovery raced a changed committed head");
+    const current = await readSessionRecordForRecovery(workspace, projectId, candidate.sessionId);
+    if (
+      current === undefined || sessionCheckpointHash(current) !== candidate.sessionHash ||
+      stableJson(current) !== stableJson(candidate.session)
+    ) throw new Error("Session commit recovery raced a changed session record");
+    await writeSessionCommitHead(workspace, candidate);
+  } finally {
+    await releaseSessionCommitClaim(claim);
+  }
+}
+
+async function readSessionRecordForRecovery(
+  workspace: DesignWorkspace,
+  projectId: string,
+  sessionId: string,
+): Promise<DesignSession | undefined> {
+  const path = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${sessionId}.json`),
+  );
+  try {
+    const value = await readBoundedJsonFile(path, "Session record");
+    if (!isPersistedSession(value) || value.projectId !== projectId || value.id !== sessionId) {
+      throw new Error("Session record is invalid during commit recovery");
+    }
+    return value;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Recover only a single uncommitted next checkpoint per session. The session
+ * head is the final authority marker: if the mutable session reached the next
+ * immutable checkpoint, publish its head; otherwise remove that exact future
+ * journal pair. Committed history is never repaired or silently discarded.
+ */
+async function recoverSessionCommits(
+  workspace: DesignWorkspace,
+  projectId: string,
+): Promise<void> {
+  let files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  let checkpoints = await readSessionCheckpoints(workspace, projectId, files);
+  let heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
+  await sessionRecoveryHook?.();
+  const fileByName = new Map(files.map((file) => [file.name, file]));
+  const bySession = new Map<string, SessionCheckpoint[]>();
+  for (const checkpoint of checkpoints) {
+    bySession.set(checkpoint.sessionId, [
+      ...(bySession.get(checkpoint.sessionId) ?? []),
+      checkpoint,
+    ]);
+  }
+  for (const [sessionId, values] of bySession) {
+    values.sort((left, right) => left.version - right.version);
+    const versions = new Set(values.map(({ version }) => version));
+    if (
+      versions.size !== values.length ||
+      values.some((checkpoint, index) => checkpoint.version !== index + 1)
+    ) throw new Error("Session checkpoint versions are ambiguous or non-contiguous");
+    const head = heads.get(sessionId);
+    const committedVersion = head?.version ?? 0;
+    const future = values.filter(({ version }) => version > committedVersion);
+    if (future.length === 0) continue;
+    if (await hasLiveSessionCommitClaim(workspace, projectId, sessionId)) {
+      throw new Error("Session commit is still in progress; committed head remains authoritative");
+    }
+    if (future.length !== 1 || future[0]!.version !== committedVersion + 1) {
+      throw new Error("Session has ambiguous future checkpoints");
+    }
+    const candidate = future[0]!;
+    const eventFile = fileByName.get(`${candidate.eventId}.json`);
+    const checkpointFile = fileByName.get(`${candidate.eventId}${CHECKPOINT_SUFFIX}`);
+    if (checkpointFile === undefined) {
+      throw new Error("Future session activity is missing its immutable checkpoint");
+    }
+    const session = await readSessionRecordForRecovery(workspace, projectId, sessionId);
+    if (eventFile === undefined) {
+      const currentEventPath = assertPathInsideWorkspace(
+        workspace.activityPath,
+        join(workspace.activityPath, `${candidate.eventId}.json`),
+      );
+      // A matching event appearing after `files` was captured is the exact
+      // checkpoint-before-event publication race. Retry a complete snapshot;
+      // a genuinely absent event remains fail-closed below.
+      if (await pathExists(currentEventPath)) {
+        throw new ConcurrentSessionPublicationError();
+      }
+      const currentMatchesHead = session !== undefined && head !== undefined &&
+        sessionCheckpointHash(session) === head.sessionHash;
+      if ((session === undefined && head === undefined) || currentMatchesHead) {
+        await removeBoundedFileIfOwned(checkpointFile);
+        continue;
+      }
+      throw new Error("Future session checkpoint cannot be recovered without its activity event");
+    }
+    const event = await readBoundedJsonFile(eventFile.path, "Activity record");
+    const expectedEvent = activityEventForSession(
+      candidate.session,
+      candidate.sessionHash,
+      candidate.version,
+    );
+    if (!validateActivityEvent(event) || stableJson(event) !== stableJson(expectedEvent)) {
+      throw new Error("Future activity event does not match its immutable checkpoint");
+    }
+    if (
+      session !== undefined && sessionCheckpointHash(session) === candidate.sessionHash &&
+      stableJson(session) === stableJson(candidate.session)
+    ) {
+      await publishRecoveredSessionHead(workspace, projectId, candidate, head);
+      continue;
+    }
+    const currentMatchesHead = session !== undefined && head !== undefined &&
+      sessionCheckpointHash(session) === head.sessionHash;
+    if ((session === undefined && head === undefined) || currentMatchesHead) {
+      await removeBoundedFileIfOwned(eventFile);
+      await removeBoundedFileIfOwned(checkpointFile);
+      continue;
+    }
+    throw new Error("Session and future journal checkpoint have ambiguous commit truth");
+  }
+
+  // Re-read after recovery and require every retained immutable checkpoint to
+  // be at or below one exact authenticated session head.
+  files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  checkpoints = await readSessionCheckpoints(workspace, projectId, files);
+  heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
+  const latestBySession = new Map<string, SessionCheckpoint>();
+  for (const checkpoint of checkpoints) {
+    const previous = latestBySession.get(checkpoint.sessionId);
+    if (previous === undefined || checkpoint.version > previous.version) {
+      latestBySession.set(checkpoint.sessionId, checkpoint);
+    }
+  }
+  for (const [sessionId, latest] of latestBySession) {
+    const head = heads.get(sessionId);
+    if (head === undefined || head.eventId !== latest.eventId || head.version !== latest.version) {
+      throw new Error("Session journal has no committed head");
+    }
+  }
+}
+
+/**
+ * Check the two-file activity journal before any caller consumes it. A
+ * checkpoint and event are deliberately separate immutable records, so an
+ * interrupted write must be either fully present or rejected as an orphan.
+ */
+async function assertActivityJournalPairing(
+  projectId: string,
+  files: BoundedFileEntry[],
+  checkpoints: readonly SessionCheckpoint[],
+): Promise<void> {
+  const events = new Set<string>();
+  const checkpointsByEvent = new Map(
+    checkpoints.map((checkpoint) => [checkpoint.eventId, checkpoint]),
+  );
+  for (const file of files.filter(
+    ({ name }) => !name.endsWith(CHECKPOINT_SUFFIX) && !name.endsWith(SESSION_HEAD_SUFFIX),
+  )) {
+    const id = file.name.slice(0, -".json".length);
+    if (!ACTIVITY_ID_PATTERN.test(id)) throw new Error("Activity event identity is invalid");
+    const value = await readBoundedJsonFile(file.path, "Activity record");
+    if (!validateActivityEvent(value) || value.projectId !== projectId || value.id !== id) {
+      throw new Error("Activity record is invalid");
+    }
+    if (!checkpointsByEvent.has(id)) {
+      throw new Error("Activity record checkpoint is missing");
+    }
+    events.add(id);
+  }
+  for (const checkpoint of checkpoints) {
+    if (checkpoint.projectId !== projectId || !events.has(checkpoint.eventId)) {
+      throw new Error("Activity checkpoint is orphaned or belongs to another project");
+    }
+  }
+}
+
+async function persistSessionActivity(
+  workspace: DesignWorkspace,
+  session: DesignSession,
+  recover = true,
+): Promise<{
+  path: string;
+  ownership?: { dev: number; ino: number };
+  checkpointPath: string;
+  checkpointOwnership?: { dev: number; ino: number };
+  checkpoint: SessionCheckpoint;
+}> {
+  assertBoundedSessionReferenceIds(session);
+  const committedHeadPath = assertPathInsideWorkspace(
+    workspace.activityPath,
+    join(workspace.activityPath, sessionHeadFileName(session.id)),
+  );
+  const sessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${session.id}.json`),
+  );
+  if (recover && ((await pathExists(committedHeadPath)) || (await pathExists(sessionPath)))) {
+    await recoverSessionCommits(workspace, session.projectId);
+  }
+  const boundedFiles = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const boundedCheckpoints = await readSessionCheckpoints(
+    workspace,
+    session.projectId,
+    boundedFiles,
+  );
+  await readSessionCommitHeads(
+    workspace,
+    session.projectId,
+    boundedFiles,
+    boundedCheckpoints,
+  );
+  await assertActivityJournalPairing(
+    session.projectId,
+    boundedFiles,
+    boundedCheckpoints,
+  );
+  const checkpointHash = sessionCheckpointHash(session);
+  const committedHeadValue = await readBoundedJsonFile(
+    committedHeadPath,
+    "Session head record",
+  ).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  let committedCheckpoint: SessionCheckpoint | undefined;
+  if (committedHeadValue !== undefined) {
+    if (
+      !isSessionCommitHead(committedHeadValue) ||
+      committedHeadValue.projectId !== session.projectId ||
+      committedHeadValue.sessionId !== session.id
+    ) throw new Error("Session head record is invalid");
+    const path = assertPathInsideWorkspace(
+      workspace.activityPath,
+      join(workspace.activityPath, `${committedHeadValue.eventId}${CHECKPOINT_SUFFIX}`),
+    );
+    const value = await readBoundedJsonFile(path, "Session checkpoint");
+    if (
+      !isSessionCheckpoint(value) ||
+      stableJson(committedHeadValue) !== stableJson(sessionCommitHeadFor(value))
+    ) throw new Error("Session head is not authenticated by its immutable checkpoint");
+    committedCheckpoint = value;
+  }
+  const latestVersion = committedCheckpoint?.version ?? 0;
+  // A retry of the current head is idempotent. A deliberate rollback to an
+  // earlier immutable checkpoint receives a new version so the head remains
+  // monotonic and its event remains auditable.
+  const existingCheckpoint = committedCheckpoint !== undefined &&
+    committedCheckpoint.sessionHash === checkpointHash &&
+    stableJson(committedCheckpoint.session) === stableJson(session)
+    ? committedCheckpoint
+    : undefined;
+  const checkpointVersion = existingCheckpoint?.version ?? latestVersion + 1;
+  if (checkpointVersion > MAX_SESSION_HISTORY_ENTRIES) {
+    throw new Error("Session checkpoint history exceeds its bounded entry budget");
+  }
+  const event = activityEventForSession(session, checkpointHash, checkpointVersion);
+  const path = assertPathInsideWorkspace(
+    workspace.activityPath,
+    join(workspace.activityPath, `${event.id}.json`),
+  );
+  const checkpointPath = assertPathInsideWorkspace(
+    workspace.activityPath,
+    join(workspace.activityPath, `${event.id}${CHECKPOINT_SUFFIX}`),
+  );
+  const contents = stableJson(event);
+  const checkpointContents = stableJson({
+    eventId: event.id,
+    sessionId: session.id,
+    projectId: session.projectId,
+    version: checkpointVersion,
+    sessionHash: checkpointHash,
+    session,
+  } satisfies SessionCheckpoint);
+  const checkpoint: SessionCheckpoint = {
+    eventId: event.id,
+    sessionId: session.id,
+    projectId: session.projectId,
+    version: checkpointVersion,
+    sessionHash: checkpointHash,
+    session,
+  };
+  if (existingCheckpoint !== undefined && existingCheckpoint.eventId !== event.id) {
+    throw new Error("Session checkpoint identity could not be reproduced");
+  }
+  let checkpointOwnership: { dev: number; ino: number } | undefined;
+  try {
+    if (existingCheckpoint === undefined) {
+      checkpointOwnership = await atomicCreate(
+        workspace.activityPath,
+        checkpointPath,
+        checkpointContents,
+      );
+    }
+    try {
+      const ownership = await atomicCreate(workspace.activityPath, path, contents);
+      return { path, ownership, checkpointPath, checkpointOwnership, checkpoint };
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+      const existing = await readBoundedJsonFile(path, "Activity record");
+      const existingCheckpointValue = await readBoundedJsonFile(checkpointPath, "Session checkpoint");
+      if (
+        !validateActivityEvent(existing) || stableJson(existing) !== contents ||
+        !isSessionCheckpoint(existingCheckpointValue) ||
+        stableJson(existingCheckpointValue) !== checkpointContents
+      ) {
+        throw new Error("Activity event identity conflicts with durable evidence");
+      }
+      return { path, checkpointPath, checkpointOwnership, checkpoint };
+    }
+  } catch (error) {
+    if (checkpointOwnership !== undefined) {
+      await unlinkCreatedFileIfOwned(checkpointPath, checkpointOwnership).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Returns a project-scoped, validated, deterministically ordered activity
+ * stream. It never reads caller-supplied paths or exposes artifact contents.
+ */
+export async function listActivityEvents(
+  rootPath: string,
+  projectId: string,
+): Promise<readonly ActivityEvent[]> {
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
+  const files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const checkpoints = await readSessionCheckpoints(workspace, projectId, files);
+  const heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
+  await assertActivityJournalPairing(projectId, files, checkpoints);
+  const checkpointsByEvent = new Map(checkpoints.map((checkpoint) => [checkpoint.eventId, checkpoint]));
+  const latestBySession = new Map<string, SessionCheckpoint>();
+  for (const checkpoint of checkpoints) {
+    const previous = latestBySession.get(checkpoint.sessionId);
+    if (previous !== undefined && previous.version === checkpoint.version && previous.eventId !== checkpoint.eventId) {
+      throw new Error("Session checkpoint versions are ambiguous");
+    }
+    if (previous === undefined || checkpoint.version > previous.version) latestBySession.set(checkpoint.sessionId, checkpoint);
+  }
+  const events: ActivityEvent[] = [];
+  for (const file of files.filter(
+    ({ name }) => !name.endsWith(CHECKPOINT_SUFFIX) && !name.endsWith(SESSION_HEAD_SUFFIX),
+  )) {
+    const id = file.name.slice(0, -".json".length);
+    if (!ACTIVITY_ID_PATTERN.test(id)) throw new Error("Activity event identity is invalid");
+    const event = await readBoundedJsonFile(file.path, "Activity record");
+    if (!validateActivityEvent(event) || event.projectId !== projectId || event.id !== id) {
+      throw new Error("Activity record is invalid");
+    }
+    const checkpoint = checkpointsByEvent.get(id);
+    if (checkpoint === undefined) throw new Error("Activity record checkpoint is missing");
+    const expected = activityEventForSession(checkpoint.session, checkpoint.sessionHash, checkpoint.version);
+    if (stableJson(expected) !== stableJson(event)) {
+      throw new Error("Activity record is stale or does not match its session checkpoint");
+    }
+    events.push(createActivityEvent(event));
+  }
+  // Every historical event is authenticated by its own immutable checkpoint;
+  // only the current session head must match the newest checkpoint. This keeps
+  // durable history readable after legitimate later transitions while still
+  // rejecting orphaned or directly replaced session records.
+  const sessions = await listSessions(rootPath, projectId, false);
+  const sessionsById = new Map(sessions.map((session) => [session.id, session]));
+  for (const [sessionId, latest] of latestBySession) {
+    const session = sessionsById.get(sessionId);
+    const head = heads.get(sessionId);
+    if (
+      session === undefined || latest.sessionHash !== sessionCheckpointHash(session) ||
+      head === undefined || head.eventId !== latest.eventId || head.version !== latest.version
+    ) {
+      throw new Error("Session record does not match its latest immutable checkpoint");
+    }
+  }
+  for (const session of sessions) {
+    if (!latestBySession.has(session.id)) {
+      throw new Error("Session record checkpoint is missing");
+    }
+  }
+  return orderActivityEvents(events);
+}
+
+/**
+ * Return activity only for already-authenticated visible session bodies. The
+ * complete checkpoint/head index is still validated, but unrelated session
+ * bodies and activity payloads are never opened while projecting a page.
+ */
+export async function listActivityEventsForSessions(
+  rootPath: string,
+  projectId: string,
+  sessions: readonly DesignSession[],
+): Promise<readonly ActivityEvent[]> {
+  const requested = new Map<string, DesignSession>();
+  for (const session of sessions) {
+    if (
+      !isPersistedSession(session) || session.projectId !== projectId ||
+      requested.has(session.id)
+    ) throw new Error("Visible activity session scope is invalid or ambiguous");
+    requested.set(session.id, session);
+  }
+  if (requested.size === 0) return [];
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
+  const files = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const checkpoints = await readSessionCheckpoints(workspace, projectId, files);
+  const heads = await readSessionCommitHeads(workspace, projectId, files, checkpoints);
+  const eventFiles = new Map<string, BoundedFileEntry>();
+  for (const file of files.filter(
+    ({ name }) => !name.endsWith(CHECKPOINT_SUFFIX) && !name.endsWith(SESSION_HEAD_SUFFIX),
+  )) {
+    const eventId = file.name.slice(0, -".json".length);
+    if (!ACTIVITY_ID_PATTERN.test(eventId) || eventFiles.has(eventId)) {
+      throw new Error("Activity event identity is invalid");
+    }
+    eventFiles.set(eventId, file);
+  }
+  const selectedCheckpoints = checkpoints.filter((checkpoint) => requested.has(checkpoint.sessionId));
+  const selectedBySession = new Map<string, SessionCheckpoint[]>();
+  for (const checkpoint of selectedCheckpoints) {
+    if (!eventFiles.has(checkpoint.eventId)) throw new Error("Visible activity checkpoint is orphaned");
+    selectedBySession.set(checkpoint.sessionId, [
+      ...(selectedBySession.get(checkpoint.sessionId) ?? []),
+      checkpoint,
+    ]);
+  }
+  for (const [sessionId, session] of requested) {
+    const values = selectedBySession.get(sessionId) ?? [];
+    const latest = values.reduce<SessionCheckpoint | undefined>(
+      (current, value) => current === undefined || value.version > current.version ? value : current,
+      undefined,
+    );
+    const head = heads.get(sessionId);
+    if (
+      latest === undefined || head === undefined ||
+      head.eventId !== latest.eventId || head.version !== latest.version ||
+      head.sessionHash !== sessionCheckpointHash(session)
+    ) throw new Error("Visible session does not match its authenticated activity head");
+  }
+  const events: ActivityEvent[] = [];
+  for (const checkpoint of selectedCheckpoints) {
+    const file = eventFiles.get(checkpoint.eventId);
+    if (file === undefined) throw new Error("Visible activity checkpoint is orphaned");
+    const event = await readBoundedJsonFile(file.path, "Activity record");
+    const expected = activityEventForSession(
+      checkpoint.session,
+      checkpoint.sessionHash,
+      checkpoint.version,
+    );
+    if (!validateActivityEvent(event) || stableJson(event) !== stableJson(expected)) {
+      throw new Error("Visible activity event is stale or invalid");
+    }
+    events.push(createActivityEvent(event));
+  }
+  return orderActivityEvents(events);
+}
+
+export async function saveSession(
+  rootPath: string,
+  session: DesignSession,
+): Promise<string> {
+  assertSafePathSegment(session.id, "Session id");
+  if (!isDesignSessionEnvelope(session)) {
+    throw new Error("Session record envelope is invalid (including canonical timestamps)");
+  }
+  const workspace = await loadValidatedProjectContext(
+    rootPath,
+    session.projectId,
+  );
+  const sessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${session.id}.json`),
+  );
+  const contents = boundedSessionContents(session);
+  await recoverSessionCommits(workspace, session.projectId);
+  let commitClaim: OwnedSessionCommitClaim | undefined =
+    await acquireSessionCommitClaim(workspace, session.projectId, session.id);
+  try {
+    const activity = await persistSessionActivity(workspace, session, false);
+    let sessionWritten = false;
+    try {
+      throwSessionCommitFault("after-journal-before-session");
+      await atomicWrite(workspace.sessionsPath, sessionPath, contents);
+      sessionWritten = true;
+      throwSessionCommitFault("after-session-before-commit");
+      await writeSessionCommitHead(workspace, activity.checkpoint);
+    } catch (error) {
+      if (error instanceof InjectedSessionCommitCrash) throw error;
+      if (sessionWritten) {
+        await releaseSessionCommitClaim(commitClaim);
+        commitClaim = undefined;
+        await recoverSessionCommits(workspace, session.projectId);
+        const headPath = assertPathInsideWorkspace(
+          workspace.activityPath,
+          join(workspace.activityPath, sessionHeadFileName(session.id)),
+        );
+        const recovered = await readBoundedJsonFile(headPath, "Session head record");
+        if (
+          isSessionCommitHead(recovered) &&
+          recovered.eventId === activity.checkpoint.eventId &&
+          recovered.sessionHash === activity.checkpoint.sessionHash
+        ) return sessionPath;
+      } else {
+        if (activity.ownership !== undefined) {
+          await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(() => undefined);
+        }
+        if (activity.checkpointOwnership !== undefined) {
+          await unlinkCreatedFileIfOwned(activity.checkpointPath, activity.checkpointOwnership).catch(() => undefined);
+        }
+      }
+      throw error;
+    }
+    return sessionPath;
+  } finally {
+    if (commitClaim !== undefined) await releaseSessionCommitClaim(commitClaim);
+  }
+}
+
+async function loadSessionOnce(
+  rootPath: string,
+  projectId: string,
+  sessionId: string,
+): Promise<DesignSession> {
+  assertSafePathSegment(sessionId, "Session id");
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
+  const sessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${sessionId}.json`),
+  );
+  const persisted = await readBoundedJsonFile(sessionPath, "Session record");
+  if (
+    !isPersistedSession(persisted) ||
+    persisted.projectId !== projectId ||
+    persisted.id !== sessionId
+  ) {
+    throw new Error("Session record is invalid");
+  }
+  const headPath = assertPathInsideWorkspace(
+    workspace.activityPath,
+    join(workspace.activityPath, sessionHeadFileName(sessionId)),
+  );
+  const head = await readBoundedJsonFile(headPath, "Session head record");
+  if (
+    !isSessionCommitHead(head) || head.projectId !== projectId || head.sessionId !== sessionId ||
+    head.sessionHash !== sessionCheckpointHash(persisted) ||
+    head.createdAt !== persisted.createdAt || head.updatedAt !== persisted.updatedAt
+  ) throw new Error("Session record is not part of a committed journal pair");
+  return persisted;
+}
+
+export async function loadSession(
+  rootPath: string,
+  projectId: string,
+  sessionId: string,
+): Promise<DesignSession> {
+  return retryAuthenticatedSessionRead(() =>
+    loadSessionOnce(rootPath, projectId, sessionId),
+  );
+}
+
+function claimProcessStart(pid: number): string | undefined {
+  try { return execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined; }
+  catch { return undefined; }
+}
+
+export async function withLearnTransitionClaim<T>(
+  rootPath: string,
+  projectId: string,
+  sessionId: string,
+  expectedStatus: string,
+  action: () => Promise<T>,
+  claimKind: "learn" | "approval" | "safe-execution" = "learn",
+): Promise<T> {
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  const claimPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `.${sessionId}.${claimKind}.claim`),
+  );
+  const source = await loadSession(rootPath, projectId, sessionId);
+  const claimValue: LearnTransitionClaim = {
+    kind: "DESIGN_SHARINGAN_LEARN_CLAIM" as const,
+    ownerId: randomUUID(),
+    pid: process.pid,
+    projectId,
+    sessionId,
+    expectedStatus,
+    expectedSessionHash: sessionCheckpointHash(source),
+    leaseExpiresAt: new Date(Date.now() + LEARN_CLAIM_LEASE_MS).toISOString(),
+    processStartedAt: claimProcessStart(process.pid),
+  };
+  const claimContents = stableJson(claimValue);
+  let claim: Awaited<ReturnType<typeof open>> | undefined;
+  let ownership: { dev: number; ino: number } | undefined;
+
+  const removeExactClaim = async (
+    expected: LearnTransitionClaim,
+    expectedOwnership: { dev: number; ino: number },
+  ): Promise<boolean> => {
+    const before = await lstat(claimPath).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (
+      before === undefined || before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 ||
+      before.dev !== expectedOwnership.dev || before.ino !== expectedOwnership.ino
+    ) return false;
+    const persisted = await readBoundedJsonFile(claimPath, "Learn transition claim");
+    const after = await lstat(claimPath).catch(() => undefined);
+    if (
+      stableJson(persisted) !== stableJson(expected) || after === undefined ||
+      after.dev !== before.dev || after.ino !== before.ino || after.nlink !== 1
+    ) return false;
+    await unlink(claimPath);
+    return true;
+  };
+
+  const recoverStaleClaim = async (): Promise<boolean> => {
+    const identity = await lstat(claimPath);
+    if (identity.isSymbolicLink() || !identity.isFile() || identity.nlink !== 1) {
+      throw new Error("Learn session transition claim is invalid or ambiguous");
+    }
+    const persisted = await readBoundedJsonFile(claimPath, "Learn transition claim") as Partial<LearnTransitionClaim>;
+    if (
+      persisted.kind !== "DESIGN_SHARINGAN_LEARN_CLAIM" ||
+      typeof persisted.ownerId !== "string" || !/^[a-f0-9-]{36}$/.test(persisted.ownerId) ||
+      !Number.isSafeInteger(persisted.pid) || Number(persisted.pid) <= 0 ||
+      Number(persisted.pid) > 2_147_483_647 ||
+      persisted.projectId !== projectId || persisted.sessionId !== sessionId ||
+      !isCanonicalIsoDateTime(persisted.leaseExpiresAt) ||
+      typeof persisted.expectedStatus !== "string" ||
+      typeof persisted.expectedSessionHash !== "string" ||
+      !/^[a-f0-9]{64}$/.test(persisted.expectedSessionHash) ||
+      (persisted.processStartedAt !== undefined && (typeof persisted.processStartedAt !== "string" || persisted.processStartedAt.length > 80)) ||
+      Object.keys(persisted).sort().join("\0") !== [
+        "expectedSessionHash", "expectedStatus", "kind", "leaseExpiresAt", "ownerId", "pid", "projectId", "sessionId",
+        ...(persisted.processStartedAt === undefined ? [] : ["processStartedAt"]),
+      ].sort().join("\0")
+    ) throw new Error("Learn session transition claim is invalid or ambiguous");
+    const claim = persisted as LearnTransitionClaim;
+    const current = await loadSession(rootPath, projectId, sessionId);
+    if (claimKind === "safe-execution") {
+      // Safe's transaction spans several checkpoints and a long render. A
+      // current owner must not be displaced by a checkpoint change or lease.
+      if (activeLearnClaimOwners.has(claim.ownerId)) return false;
+      if (claim.pid !== process.pid && processIsAlive(claim.pid)) {
+        const start = claimProcessStart(claim.pid);
+        if (!claim.processStartedAt || !start || start === claim.processStartedAt) return false;
+      }
+    }
+    if (sessionCheckpointHash(current) === claim.expectedSessionHash) {
+      // A same-process claimant can be proven live only by its unforgeable
+      // in-memory owner token. For another process, PID plus a current lease
+      // is a bounded liveness proof; either may be stale after a crash.
+      if (
+        activeLearnClaimOwners.has(claim.ownerId) ||
+        (claim.pid !== process.pid && processIsAlive(claim.pid) && Date.parse(claim.leaseExpiresAt) > Date.now())
+      ) return false;
+    }
+    return removeExactClaim(claim, {
+      dev: identity.dev,
+      ino: identity.ino,
+    });
+  };
+
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        claim = await open(
+          claimPath,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          0o600,
+        );
+        await claim.writeFile(claimContents, "utf8");
+        await claim.sync();
+        const entry = await claim.stat();
+        ownership = { dev: entry.dev, ino: entry.ino };
+        activeLearnClaimOwners.add(claimValue.ownerId);
+        break;
+      } catch (error) {
+        if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+        if (attempt > 0 || !(await recoverStaleClaim())) {
+          throw new Error("Learn session transition is already in progress", { cause: error });
+        }
+      }
+    }
+    if (claim === undefined || ownership === undefined) {
+      throw new Error("Learn session transition claim could not be acquired");
+    }
+    await learnTransitionHook?.({
+      point: "after-claim",
+      ownerId: claimValue.ownerId,
+      projectId,
+      sessionId,
+    });
+    return await action();
+  } finally {
+    if (claim !== undefined && ownership !== undefined) {
+      await learnTransitionHook?.({
+        point: "before-release",
+        ownerId: claimValue.ownerId,
+        projectId,
+        sessionId,
+      });
+      await claim.close().catch(() => undefined);
+      await removeExactClaim(claimValue, ownership).catch(() => undefined);
+      activeLearnClaimOwners.delete(claimValue.ownerId);
+    }
+  }
+}
+
+export async function transitionLearnSession(
+  rootPath: string,
+  expectedStatus: LearnSessionStatus,
+  session: DesignSession & { status: LearnSessionStatus },
+): Promise<string> {
+  return withLearnTransitionClaim(rootPath, session.projectId, session.id, expectedStatus, async () => {
+    const existing = await loadSession(rootPath, session.projectId, session.id);
+    const oldIdentity = existing as unknown as Record<string, unknown>;
+    const newIdentity = session as unknown as Record<string, unknown>;
+    const immutableFields = ["referenceId", "referenceIds", "referenceTitle", "featureBrief", "sourceFinding", "genomeEvidence", "intendedDirection", "currentDirection"];
+    if (
+      existing.type !== session.type ||
+      existing.status !== expectedStatus ||
+      existing.createdAt !== session.createdAt ||
+      immutableFields.some((field) => stableJson({ value: oldIdentity[field] }) !== stableJson({ value: newIdentity[field] })) ||
+      !canTransitionLearnSession(expectedStatus, session.status)
+    ) {
+      throw new Error(
+        `Learn session identity or transition from ${existing.status} to ${session.status} is invalid`,
+      );
+    }
+    return saveSession(rootPath, session);
+  });
+}
+
+interface FeatureEvolveSessionBase extends DesignSession {
+  type: "FEATURE_EVOLVE";
+  featureBrief: FeatureBrief;
+  referenceIds: string[];
+  genomeEvidence?: GenomeEvidence;
+  sourceFinding?: GovernanceFindingSource;
+}
+
+export interface FeatureEvolvePendingSession
+  extends FeatureEvolveSessionBase {
+  status: "DRAFT" | "ANALYZING";
+  error?: string;
+}
+
+export interface FeatureEvolveResultSession extends FeatureEvolveSessionBase {
+  status: "RESULT_READY" | "AWAITING_DECISION";
+  uxImpact: UXImpact[];
+  approaches: DesignApproach[];
+  agentThreadId: string;
+}
+
+export interface FeatureEvolveApprovedSession
+  extends FeatureEvolveSessionBase {
+  status: "APPROVED";
+  uxImpact: UXImpact[];
+  approaches: DesignApproach[];
+  agentThreadId: string;
+  approvedApproachId: string;
+  approval: Approval;
+  executeSessionId: string;
+}
+
+export interface SafeExecutionDraftSession extends DesignSession {
+  type: "SAFE_EXECUTION";
+  status: "IDLE";
+  sourceSessionId: string;
+  approvedApproachId: string;
+  approvalId: string;
+  featureBrief: FeatureBrief;
+  designApproach: DesignApproach;
+}
+
+export function isFeatureEvolvePendingSession(
+  value: unknown,
+): value is FeatureEvolvePendingSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<FeatureEvolvePendingSession>;
+  return (
+    isObjectWithOnlyKeys(value, [
+      "id",
+      "projectId",
+      "type",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "featureBrief",
+      "referenceIds",
+      "genomeEvidence",
+      "sourceFinding",
+      "error",
+    ]) &&
+    session.type === "FEATURE_EVOLVE" &&
+    (session.status === "DRAFT" || session.status === "ANALYZING") &&
+    isFeatureBrief(session.featureBrief) &&
+    (session.genomeEvidence === undefined || isGenomeEvidence(session.genomeEvidence)) &&
+    (session.sourceFinding === undefined || isGovernanceFindingSource(session.sourceFinding)) &&
+    isStringArray(session.referenceIds) &&
+    new Set(session.referenceIds).size === session.referenceIds.length &&
+    (session.error === undefined || typeof session.error === "string")
+  );
+}
+
+export function isFeatureEvolveResultSession(
+  value: unknown,
+): value is FeatureEvolveResultSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<FeatureEvolveResultSession>;
+  return (
+    isObjectWithOnlyKeys(value, [
+      "id",
+      "projectId",
+      "type",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "featureBrief",
+      "referenceIds",
+      "genomeEvidence",
+      "sourceFinding",
+      "uxImpact",
+      "approaches",
+      "agentThreadId",
+    ]) &&
+    session.type === "FEATURE_EVOLVE" &&
+    (session.status === "RESULT_READY" ||
+      session.status === "AWAITING_DECISION") &&
+    isFeatureBrief(session.featureBrief) &&
+    (session.genomeEvidence === undefined || isGenomeEvidence(session.genomeEvidence)) &&
+    (session.sourceFinding === undefined || isGovernanceFindingSource(session.sourceFinding)) &&
+    isStringArray(session.referenceIds) &&
+    new Set(session.referenceIds).size === session.referenceIds.length &&
+    Array.isArray(session.uxImpact) &&
+    session.uxImpact.length > 0 &&
+    session.uxImpact.every(isUXImpact) &&
+    isApproachSet(session.approaches) &&
+    hasNonEmptyString(session.agentThreadId)
+  );
+}
+
+export function isFeatureEvolveApprovedSession(
+  value: unknown,
+): value is FeatureEvolveApprovedSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<FeatureEvolveApprovedSession>;
+  return (
+    isObjectWithOnlyKeys(value, [
+      "id",
+      "projectId",
+      "type",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "featureBrief",
+      "referenceIds",
+      "genomeEvidence",
+      "sourceFinding",
+      "uxImpact",
+      "approaches",
+      "agentThreadId",
+      "approvedApproachId",
+      "approval",
+      "executeSessionId",
+    ]) &&
+    session.type === "FEATURE_EVOLVE" &&
+    session.status === "APPROVED" &&
+    isFeatureBrief(session.featureBrief) &&
+    (session.genomeEvidence === undefined || isGenomeEvidence(session.genomeEvidence)) &&
+    (session.sourceFinding === undefined || isGovernanceFindingSource(session.sourceFinding)) &&
+    isStringArray(session.referenceIds) &&
+    new Set(session.referenceIds).size === session.referenceIds.length &&
+    Array.isArray(session.uxImpact) &&
+    session.uxImpact.length > 0 &&
+    session.uxImpact.every(isUXImpact) &&
+    isApproachSet(session.approaches) &&
+    hasNonEmptyString(session.agentThreadId) &&
+    hasNonEmptyString(session.approvedApproachId) &&
+    isApproval(session.approval) &&
+    hasNonEmptyString(session.executeSessionId)
+  );
+}
+
+export function isSafeExecutionDraftSession(
+  value: unknown,
+): value is SafeExecutionDraftSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<SafeExecutionDraftSession>;
+  return (
+    isObjectWithOnlyKeys(value, [
+      "id",
+      "projectId",
+      "type",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "sourceSessionId",
+      "approvedApproachId",
+      "approvalId",
+      "featureBrief",
+      "designApproach",
+    ]) &&
+    session.type === "SAFE_EXECUTION" &&
+    session.status === "IDLE" &&
+    hasNonEmptyString(session.sourceSessionId) &&
+    hasNonEmptyString(session.approvedApproachId) &&
+    hasNonEmptyString(session.approvalId) &&
+    isFeatureBrief(session.featureBrief) &&
+    isDesignApproach(session.designApproach)
+  );
+}
+
+export async function commitFeatureEvolveResult(
+  rootPath: string,
+  session: FeatureEvolveResultSession,
+): Promise<void> {
+  if (
+    !isFeatureEvolveResultSession(session) ||
+    session.status !== "RESULT_READY"
+  ) {
+    throw new Error("Feature EVOLVE result evidence is incomplete");
+  }
+  await withLearnTransitionClaim(rootPath, session.projectId, session.id, "ANALYZING", async () => {
+    const existing = await loadSession(rootPath, session.projectId, session.id);
+    if (
+      !isFeatureEvolvePendingSession(existing) ||
+      existing.status !== "ANALYZING" ||
+      existing.type !== session.type ||
+      existing.createdAt !== session.createdAt ||
+      stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
+      stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
+      stableJson(existing.genomeEvidence ?? null) !== stableJson(session.genomeEvidence ?? null) ||
+      stableJson(existing.sourceFinding ?? null) !== stableJson(session.sourceFinding ?? null) ||
+      !canTransitionLearnSession("ANALYZING", session.status)
+    ) {
+      throw new Error(
+        "Feature EVOLVE result requires a matching ANALYZING session",
+      );
+    }
+    await saveSession(rootPath, session);
+  });
+}
+
+export async function approveFeatureEvolveApproach(
+  rootPath: string,
+  checkpoint: {
+    session: FeatureEvolveApprovedSession;
+    approval: Approval;
+    executeSession: SafeExecutionDraftSession;
+  },
+): Promise<void> {
+  const { session, approval, executeSession } = checkpoint;
+  if (
+    !isFeatureEvolveApprovedSession(session) ||
+    !isApproval(approval) ||
+    !isSafeExecutionDraftSession(executeSession)
+  ) {
+    throw new Error("Feature EVOLVE approval checkpoint is incomplete or has invalid timestamps");
+  }
+  if (
+    session.updatedAt !== approval.createdAt ||
+    executeSession.createdAt !== approval.createdAt ||
+    executeSession.updatedAt !== approval.createdAt
+  ) {
+    throw new Error(
+      "Feature EVOLVE approval checkpoint timestamps must match approval.createdAt",
+    );
+  }
+  assertSafePathSegment(session.id, "Session id");
+  assertSafePathSegment(executeSession.id, "Session id");
+  const workspace = await loadValidatedProjectContext(rootPath, session.projectId);
+  // Bound both halves before claiming or replacing any durable record. This
+  // keeps rejection side-effect free and ensures every committed session can
+  // pass the matching bounded read path.
+  const approvalSessionContents = boundedSessionContents(session);
+  const executeSessionContents = boundedSessionContents(executeSession);
+  return withLearnTransitionClaim(rootPath, session.projectId, session.id, "AWAITING_DECISION", async () => {
+  const sessionCommitClaims: OwnedSessionCommitClaim[] = [];
+
+  try {
+    // Re-read after the exclusive claim. A request queued behind another
+    // completed approval sees APPROVED here and fails closed.
+    const existing = await loadSession(rootPath, session.projectId, session.id);
+    if (!isFeatureEvolveResultSession(existing)) {
+      throw new Error("Feature EVOLVE approval requires matching result evidence");
+    }
+    const selectedApproach = existing.approaches.find(
+      (approach) => approach.id === session.approvedApproachId,
+    );
+    if (
+      existing.status !== "AWAITING_DECISION" ||
+      !canTransitionLearnSession("AWAITING_DECISION", session.status) ||
+      existing.createdAt !== session.createdAt ||
+      stableJson(existing.featureBrief) !== stableJson(session.featureBrief) ||
+      stableJson(existing.referenceIds) !== stableJson(session.referenceIds) ||
+      stableJson(existing.genomeEvidence ?? null) !== stableJson(session.genomeEvidence ?? null) ||
+      stableJson(existing.sourceFinding ?? null) !== stableJson(session.sourceFinding ?? null) ||
+      stableJson(existing.uxImpact) !== stableJson(session.uxImpact) ||
+      stableJson(existing.approaches) !== stableJson(session.approaches) ||
+      existing.agentThreadId !== session.agentThreadId ||
+      selectedApproach === undefined ||
+      approval.decision !== "APPROVED" ||
+      approval.scope !== "DESIGN_APPROACH" ||
+      approval.proposalId !== selectedApproach.id ||
+      session.approvedApproachId !== selectedApproach.id ||
+      stableJson(session.approval) !== stableJson(approval) ||
+      session.executeSessionId !== executeSession.id ||
+      executeSession.projectId !== session.projectId ||
+      executeSession.sourceSessionId !== session.id ||
+      executeSession.approvedApproachId !== selectedApproach.id ||
+      executeSession.approvalId !== approval.id ||
+      stableJson(executeSession.featureBrief) !== stableJson(session.featureBrief) ||
+      stableJson(executeSession.designApproach) !== stableJson(selectedApproach)
+    ) {
+      throw new Error(
+        "Feature EVOLVE approval, approach, and execution evidence must match",
+      );
+    }
+
+    // Hold both session identities while their journals and records cross the
+    // shared commit boundary. Sorted acquisition keeps competing pair writes
+    // deterministic and lets readers distinguish a live transaction from
+    // recoverable crash residue.
+    for (const sessionId of [session.id, executeSession.id].sort()) {
+      sessionCommitClaims.push(
+        await acquireSessionCommitClaim(workspace, session.projectId, sessionId),
+      );
+    }
+
+    const approvalSessionPath = assertPathInsideWorkspace(
+      workspace.sessionsPath,
+      join(workspace.sessionsPath, `${session.id}.json`),
+    );
+    const executeSessionPath = assertPathInsideWorkspace(
+      workspace.sessionsPath,
+      join(workspace.sessionsPath, `${executeSession.id}.json`),
+    );
+    const originalSessionContents = stableJson(existing);
+    const approvalActivity = await persistSessionActivity(workspace, session, false);
+    let executionActivity: Awaited<ReturnType<typeof persistSessionActivity>>;
+    let pairBodiesWritten = false;
+    try {
+      executionActivity = await persistSessionActivity(workspace, executeSession, false);
+    } catch (error) {
+      if (approvalActivity.ownership !== undefined) {
+        await unlinkCreatedFileIfOwned(approvalActivity.path, approvalActivity.ownership)
+          .catch(() => undefined);
+      }
+      if (approvalActivity.checkpointOwnership !== undefined) {
+        await unlinkCreatedFileIfOwned(
+          approvalActivity.checkpointPath,
+          approvalActivity.checkpointOwnership,
+        ).catch(() => undefined);
+      }
+      throw error;
+    }
+
+    try {
+      // The approved Feature EVOLVE record embeds the first-class Approval and
+      // is made durable before the linked execution draft becomes visible.
+      await atomicWrite(
+        workspace.sessionsPath,
+        approvalSessionPath,
+        approvalSessionContents,
+      );
+      await atomicCreate(
+        workspace.sessionsPath,
+        executeSessionPath,
+        executeSessionContents,
+      );
+      pairBodiesWritten = true;
+      await writeSessionCommitHead(workspace, executionActivity.checkpoint);
+      throwSessionCommitFault("after-execution-head-before-approval-head");
+      await writeSessionCommitHead(workspace, approvalActivity.checkpoint);
+    } catch (error) {
+      if (pairBodiesWritten) {
+        // Once both mutable records exist, the journals are the only durable
+        // evidence capable of authenticating them. Do not delete that proof
+        // after a partial head publish: release the exact pair claims, then
+        // let normal recovery roll the committed heads forward together.
+        for (const claim of sessionCommitClaims.reverse()) {
+          await releaseSessionCommitClaim(claim);
+        }
+        sessionCommitClaims.length = 0;
+        await recoverSessionCommits(workspace, session.projectId);
+        throw error;
+      }
+      if (executionActivity.ownership !== undefined) {
+        await unlinkCreatedFileIfOwned(executionActivity.path, executionActivity.ownership)
+          .catch(() => undefined);
+      }
+      if (executionActivity.checkpointOwnership !== undefined) {
+        await unlinkCreatedFileIfOwned(
+          executionActivity.checkpointPath,
+          executionActivity.checkpointOwnership,
+        ).catch(() => undefined);
+      }
+      if (approvalActivity.ownership !== undefined) {
+        await unlinkCreatedFileIfOwned(approvalActivity.path, approvalActivity.ownership)
+          .catch(() => undefined);
+      }
+      if (approvalActivity.checkpointOwnership !== undefined) {
+        await unlinkCreatedFileIfOwned(
+          approvalActivity.checkpointPath,
+          approvalActivity.checkpointOwnership,
+        ).catch(() => undefined);
+      }
+      try {
+        await atomicWrite(
+          workspace.sessionsPath,
+          approvalSessionPath,
+          originalSessionContents,
+        );
+      } catch (rollbackError) {
+        throw new Error("Feature EVOLVE approval and rollback both failed", {
+          cause: { commitError: error, rollbackError },
+        });
+      }
+      throw error;
+    }
+  } finally {
+    for (const claim of sessionCommitClaims.reverse()) {
+      await releaseSessionCommitClaim(claim);
+    }
+  }
+  }, "approval");
+}
+
+export async function loadApprovedExecutionDirection(
+  rootPath: string,
+  projectId: string,
+): Promise<SafeExecutionDraftSession> {
+  const sessions = await listSessions(rootPath, projectId);
+  const executionRecords = sessions.filter(
+    (session) => session.type === "SAFE_EXECUTION",
+  );
+  if (executionRecords.length === 0) {
+    throw new Error("Approved execution source evidence is missing");
+  }
+  if (executionRecords.length > 1) {
+    throw new Error("Multiple SAFE_EXECUTION drafts are ambiguous");
+  }
+  const [executionRecord] = executionRecords;
+  if (!isSafeExecutionDraftSession(executionRecord)) {
+    throw new Error("SAFE_EXECUTION draft evidence is invalid");
+  }
+
+  let sourceRecord: DesignSession;
+  try {
+    sourceRecord = await loadSession(
+      rootPath,
+      projectId,
+      executionRecord.sourceSessionId,
+    );
+  } catch {
+    throw new Error("Approved execution source evidence is missing");
+  }
+  if (!isFeatureEvolveApprovedSession(sourceRecord)) {
+    throw new Error("Approved Feature EVOLVE source evidence is invalid");
+  }
+  const approval = sourceRecord.approval;
+  const selectedApproach = sourceRecord.approaches.find(
+    (approach) => approach.id === sourceRecord.approvedApproachId,
+  );
+  if (
+    selectedApproach === undefined ||
+    sourceRecord.projectId !== projectId ||
+    executionRecord.projectId !== projectId ||
+    sourceRecord.id !== executionRecord.sourceSessionId ||
+    sourceRecord.executeSessionId !== executionRecord.id ||
+    sourceRecord.approvedApproachId !== executionRecord.approvedApproachId ||
+    approval.id !== executionRecord.approvalId ||
+    approval.decision !== "APPROVED" ||
+    approval.scope !== "DESIGN_APPROACH" ||
+    approval.proposalId !== sourceRecord.approvedApproachId ||
+    executionRecord.createdAt !== approval.createdAt ||
+    executionRecord.updatedAt !== approval.createdAt ||
+    sourceRecord.updatedAt !== approval.createdAt ||
+    stableJson(executionRecord.designApproach) !== stableJson(selectedApproach) ||
+    stableJson(executionRecord.featureBrief) !== stableJson(sourceRecord.featureBrief)
+  ) {
+    throw new Error(
+      "Approval, approach, Feature Brief, and Execute evidence do not match",
+    );
+  }
+  return executionRecord;
+}
+
+export interface ReferenceScanPendingSession extends DesignSession {
+  type: "REFERENCE_SCAN";
+  status: "DRAFT" | "ANALYZING";
+  referenceId: string;
+  referenceTitle: string;
+  error?: string;
+}
+
+export function isReferenceScanPendingSession(
+  value: unknown,
+): value is ReferenceScanPendingSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<ReferenceScanPendingSession>;
+  const keys = Object.keys(value);
+  const allowed = [
+    "id", "projectId", "type", "status", "createdAt", "updatedAt",
+    "referenceId", "referenceTitle", "error",
+  ];
+  const required = allowed.filter((key) => key !== "error");
+  return (
+    keys.length >= 8 &&
+    keys.length <= 9 &&
+    required.every((key) => keys.includes(key)) &&
+    keys.every((key) => allowed.includes(key)) &&
+    session.type === "REFERENCE_SCAN" &&
+    (session.status === "DRAFT" || session.status === "ANALYZING") &&
+    typeof session.referenceId === "string" &&
+    session.referenceId.length > 0 &&
+    typeof session.referenceTitle === "string" &&
+    session.referenceTitle.length > 0 &&
+    (session.error === undefined || typeof session.error === "string")
+  );
+}
+
+export interface ReferenceScanResultSession extends DesignSession {
+  type: "REFERENCE_SCAN";
+  status: "RESULT_READY";
+  referenceId: string;
+  referenceTitle: string;
+  designDNA: DesignDNA;
+  agentThreadId: string;
+}
+
+export function isReferenceScanResultSession(
+  value: unknown,
+): value is ReferenceScanResultSession {
+  if (!isPersistedSession(value)) return false;
+  const session = value as Partial<ReferenceScanResultSession>;
+  const keys = Object.keys(value);
+  return (
+    keys.length === 10 &&
+    [
+      "id", "projectId", "type", "status", "createdAt", "updatedAt",
+      "referenceId", "referenceTitle", "designDNA", "agentThreadId",
+    ].every((key) => keys.includes(key)) &&
+    session.type === "REFERENCE_SCAN" &&
+    session.status === "RESULT_READY" &&
+    typeof session.referenceId === "string" &&
+    session.referenceId.length > 0 &&
+    typeof session.referenceTitle === "string" &&
+    session.referenceTitle.length > 0 &&
+    isPersistedDesignDNA(session.designDNA) &&
+    typeof session.agentThreadId === "string" &&
+    session.agentThreadId.trim().length > 0
+  );
+}
+
+export interface ReferenceScanCheckpoint {
+  reference: Reference;
+  designDNA: DesignDNA;
+  session: ReferenceScanResultSession;
+}
+
+async function readOptionalJsonContents(path: string): Promise<string | undefined> {
+  try {
+    return stableJson(await readBoundedJsonFile(path, "DesignDNA record"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+export async function commitReferenceScan(
+  rootPath: string,
+  checkpoint: ReferenceScanCheckpoint,
+): Promise<void> {
+  const { reference, designDNA, session } = checkpoint;
+  if (
+    !isPersistedReference(reference) ||
+    !isPersistedDesignDNA(designDNA) ||
+    !isReferenceScanResultSession(session)
+  ) {
+    throw new Error("Reference scan checkpoint evidence is incomplete");
+  }
+  const finalDesignDNAContents = stableJson(designDNA);
+  if (
+    stableJson(session.designDNA) !== finalDesignDNAContents ||
+    designDNA.referenceIds.length !== 1 ||
+    designDNA.referenceIds[0] !== reference.id
+  ) {
+    throw new Error("Reference scan checkpoint evidence does not match");
+  }
+  const [existingReference, existingSession] = await Promise.all([
+    loadReference(rootPath, reference.projectId, reference.id),
+    loadSession(rootPath, session.projectId, session.id),
+  ]);
+  if (
+    !isReferenceScanPendingSession(existingSession) ||
+    existingSession.status !== "ANALYZING" ||
+    existingSession.id !== session.id ||
+    existingSession.projectId !== session.projectId ||
+    existingSession.referenceId !== session.referenceId ||
+    existingSession.referenceTitle !== session.referenceTitle ||
+    existingReference.projectId !== session.projectId ||
+    session.referenceId !== reference.id ||
+    session.referenceTitle !== reference.title ||
+    existingSession.createdAt !== session.createdAt ||
+    !canTransitionLearnSession("ANALYZING", session.status) ||
+    reference.analysisStatus !== "ANALYZED" ||
+    reference.imagePath !== existingReference.imagePath ||
+    reference.type !== existingReference.type ||
+    reference.source !== existingReference.source ||
+    reference.createdAt !== existingReference.createdAt
+  ) {
+    throw new Error(
+      "Reference scan checkpoint requires an ANALYZING session and matching artifacts",
+    );
+  }
+
+  const workspace = await loadValidatedProjectContext(
+    rootPath,
+    reference.projectId,
+  );
+  const referencePath = dirname(existingReference.imagePath as string);
+  const referenceMetadataPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "reference.json"),
+  );
+  const designDNAPath = assertPathInsideWorkspace(
+    referencePath,
+    join(referencePath, "design-dna.json"),
+  );
+  const sessionPath = assertPathInsideWorkspace(
+    workspace.sessionsPath,
+    join(workspace.sessionsPath, `${session.id}.json`),
+  );
+  const originalReferenceContents = stableJson(existingReference);
+  const originalDesignDNAContents = await readOptionalJsonContents(designDNAPath);
+  const originalSessionContents = stableJson(existingSession);
+  const finalReferenceContents = stableJson(reference);
+  const finalSessionContents = stableJson(session);
+  await recoverSessionCommits(workspace, session.projectId);
+  const commitClaim = await acquireSessionCommitClaim(
+    workspace,
+    session.projectId,
+    session.id,
+  );
+  let scanSessionWritten = false;
+  try {
+    const activity = await persistSessionActivity(workspace, session, false);
+
+    try {
+      await atomicWrite(referencePath, designDNAPath, finalDesignDNAContents);
+      await atomicWrite(
+        referencePath,
+        referenceMetadataPath,
+        finalReferenceContents,
+      );
+      await atomicWrite(workspace.sessionsPath, sessionPath, finalSessionContents);
+      scanSessionWritten = true;
+      throwSessionCommitFault("after-reference-session-before-head");
+      await writeSessionCommitHead(workspace, activity.checkpoint);
+    } catch (error) {
+      if (scanSessionWritten) {
+        // Reference, DNA, session body, and immutable activity all reached
+        // disk. Preserve the complete new checkpoint and publish its head
+        // through normal recovery rather than reverting only part of it.
+        await releaseSessionCommitClaim(commitClaim);
+        scanSessionWritten = false;
+        await recoverSessionCommits(workspace, session.projectId);
+        throw error;
+      }
+      if (activity.ownership !== undefined) {
+        await unlinkCreatedFileIfOwned(activity.path, activity.ownership).catch(
+          () => undefined,
+        );
+      }
+      if (activity.checkpointOwnership !== undefined) {
+        await unlinkCreatedFileIfOwned(
+          activity.checkpointPath,
+          activity.checkpointOwnership,
+        ).catch(() => undefined);
+      }
+      const rollbackErrors: unknown[] = [];
+      await (originalDesignDNAContents === undefined
+        ? unlink(designDNAPath).catch((rollbackError: unknown) => {
+            if (
+              !(
+                rollbackError instanceof Error &&
+                "code" in rollbackError &&
+                rollbackError.code === "ENOENT"
+              )
+            ) {
+              rollbackErrors.push(rollbackError);
+            }
+          })
+        : atomicWrite(
+            referencePath,
+            designDNAPath,
+            originalDesignDNAContents,
+          ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError)));
+      await atomicWrite(
+        referencePath,
+        referenceMetadataPath,
+        originalReferenceContents,
+      ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError));
+      await atomicWrite(
+        workspace.sessionsPath,
+        sessionPath,
+        originalSessionContents,
+      ).catch((rollbackError: unknown) => rollbackErrors.push(rollbackError));
+      if (rollbackErrors.length > 0) {
+        throw new Error("Reference scan checkpoint and rollback both failed", {
+          cause: { commitError: error, rollbackErrors },
+        });
+      }
+      throw error;
+    }
+  } finally {
+    await releaseSessionCommitClaim(commitClaim);
+  }
+}
+
+export interface DesignSessionPage {
+  total: number;
+  sessions: DesignSession[];
+}
+
+/**
+ * Page from the bounded committed-head index before opening session bodies or
+ * any referenced artifacts. The index count and exact filename set are still
+ * authenticated for the whole retained history.
+ */
+async function listSessionPageOnce(
+  rootPath: string,
+  projectId: string,
+  offset: number,
+  limit: number,
+): Promise<DesignSessionPage> {
+  if (
+    !Number.isSafeInteger(offset) || offset < 0 || offset > 100_000 ||
+    !Number.isSafeInteger(limit) || limit < 1 || limit > 50
+  ) throw new Error("Session pagination is invalid");
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
+  const files = await boundedJsonDirectory(
+    workspace.sessionsPath,
+    "Session history",
+    MAX_SESSION_HISTORY_ENTRIES,
+  );
+  const activityFiles = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const checkpoints = await readSessionCheckpoints(workspace, projectId, activityFiles);
+  const heads = await readSessionCommitHeads(workspace, projectId, activityFiles, checkpoints);
+  await assertActivityJournalPairing(projectId, activityFiles, checkpoints);
+  const filesById = new Map<string, BoundedFileEntry>();
+  for (const file of files) {
+    const sessionId = file.name.slice(0, -".json".length);
+    assertSafePathSegment(sessionId, "Session id");
+    if (file.name !== `${sessionId}.json` || filesById.has(sessionId)) {
+      throw new Error("Session history filename index is invalid or ambiguous");
+    }
+    filesById.set(sessionId, file);
+  }
+  if (
+    heads.size !== filesById.size ||
+    [...heads.keys()].some((sessionId) => !filesById.has(sessionId))
+  ) throw new Error("Session history filename/identity count is invalid against its authenticated head index");
+  const selectedHeads = [...heads.values()]
+    .sort((left, right) =>
+      right.createdAt.localeCompare(left.createdAt) || left.sessionId.localeCompare(right.sessionId),
+    )
+    .slice(offset, offset + limit);
+  const sessions: DesignSession[] = [];
+  for (const head of selectedHeads) {
+    const file = filesById.get(head.sessionId);
+    if (file === undefined) throw new Error("Session page index points to a missing record");
+    const persisted = await readBoundedJsonFile(file.path, "Session record");
+    if (
+      !isPersistedSession(persisted) || persisted.projectId !== projectId ||
+      persisted.id !== head.sessionId || sessionCheckpointHash(persisted) !== head.sessionHash ||
+      persisted.createdAt !== head.createdAt || persisted.updatedAt !== head.updatedAt
+    ) throw new Error("Session page record does not match its authenticated head index");
+    sessions.push(persisted);
+  }
+  return { total: heads.size, sessions };
+}
+
+export async function listSessionPage(
+  rootPath: string,
+  projectId: string,
+  offset: number,
+  limit: number,
+): Promise<DesignSessionPage> {
+  return retryAuthenticatedSessionRead(() =>
+    listSessionPageOnce(rootPath, projectId, offset, limit),
+  );
+}
+
+async function listSessionsOnce(
+  rootPath: string,
+  projectId: string,
+  verifyActivity = true,
+): Promise<DesignSession[]> {
+  const workspace = await loadValidatedProjectContext(rootPath, projectId);
+  await recoverSessionCommits(workspace, projectId);
+  const files = await boundedJsonDirectory(
+    workspace.sessionsPath,
+    "Session history",
+    MAX_SESSION_HISTORY_ENTRIES,
+  );
+  const activityFiles = await boundedJsonDirectory(
+    workspace.activityPath,
+    "Activity history",
+    MAX_ACTIVITY_DIRECTORY_ENTRIES,
+  );
+  const checkpoints = await readSessionCheckpoints(workspace, projectId, activityFiles);
+  const heads = await readSessionCommitHeads(workspace, projectId, activityFiles, checkpoints);
+  await assertActivityJournalPairing(projectId, activityFiles, checkpoints);
+  if (heads.size !== files.length) {
+    throw new Error("Session history filename/identity count is invalid against its authenticated head index");
+  }
+  const sessions: DesignSession[] = [];
+  for (const file of files) {
+    const sessionId = file.name.slice(0, -".json".length);
+    assertSafePathSegment(sessionId, "Session id");
+    const persisted = await readBoundedJsonFile(file.path, "Session record");
+    if (
+      !isPersistedSession(persisted) ||
+      persisted.projectId !== projectId ||
+      persisted.id !== sessionId
+    ) {
+      throw new Error("Session record is invalid");
+    }
+    const head = heads.get(sessionId);
+    if (
+      head === undefined || head.sessionHash !== sessionCheckpointHash(persisted) ||
+      head.createdAt !== persisted.createdAt || head.updatedAt !== persisted.updatedAt
+    ) throw new Error("Session record does not match its authenticated activity checkpoint head index");
+    sessions.push(persisted);
+  }
+  if (verifyActivity) {
+    const latestBySession = new Map<string, SessionCheckpoint>();
+    for (const checkpoint of checkpoints) {
+      if (checkpoint.projectId !== projectId) continue;
+      const previous = latestBySession.get(checkpoint.sessionId);
+      if (previous !== undefined && previous.version === checkpoint.version && previous.eventId !== checkpoint.eventId) {
+        throw new Error("Session checkpoint versions are ambiguous");
+      }
+      if (previous === undefined || checkpoint.version > previous.version) {
+        latestBySession.set(checkpoint.sessionId, checkpoint);
+      }
+    }
+    for (const session of sessions) {
+      const latest = latestBySession.get(session.id);
+      const head = heads.get(session.id);
+      if (
+        latest === undefined || latest.sessionHash !== sessionCheckpointHash(session) ||
+        head === undefined || head.eventId !== latest.eventId || head.version !== latest.version
+      ) {
+        throw new Error("Session record does not match its latest immutable checkpoint");
+      }
+    }
+  }
+  return sessions.sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id),
+  );
+}
+
+export async function listSessions(
+  rootPath: string,
+  projectId: string,
+  verifyActivity = true,
+): Promise<DesignSession[]> {
+  return retryAuthenticatedSessionRead(() =>
+    listSessionsOnce(rootPath, projectId, verifyActivity),
+  );
+}
+
+const RENDER_INTEGRITY_SUFFIX = ".integrity.json";
+
+interface RenderIntegrityRecord {
+  artifactId: string;
+  sessionId: string;
+  roundId: string;
+  route: string;
+  state: "default";
+  viewport: string;
+  viewportWidth: number;
+  viewportHeight: number;
+  imagePath: string;
+  capturedAt: string;
+  sourceRevisionFingerprint: string | null;
+  contentHash: string;
+  byteLength: number;
+}
+
+function renderMetadataPath(imagePath: string): string {
+  const extension = extname(imagePath);
+  return join(
+    dirname(imagePath),
+    `${basename(imagePath, extension)}${extension === ".json" ? ".metadata" : ""}.json`,
+  );
+}
+
+function renderIntegrityPath(imagePath: string): string {
+  const extension = extname(imagePath);
+  return join(
+    dirname(imagePath),
+    `${basename(imagePath, extension)}${extension === ".json" ? ".metadata" : ""}${RENDER_INTEGRITY_SUFFIX}`,
+  );
+}
+
+function renderIntegrityFor(
+  metadata: RenderArtifact,
+  bytes: Uint8Array,
+): RenderIntegrityRecord {
+  return {
+    artifactId: metadata.id,
+    sessionId: metadata.sessionId,
+    roundId: metadata.roundId,
+    route: metadata.route,
+    state: "default",
+    viewport: metadata.viewport,
+    viewportWidth: metadata.viewportWidth,
+    viewportHeight: metadata.viewportHeight,
+    imagePath: metadata.imagePath,
+    capturedAt: metadata.capturedAt,
+    sourceRevisionFingerprint: metadata.sourceRevision.available === true
+      ? metadata.sourceRevision.worktreeFingerprint
+      : null,
+    contentHash: createHash("sha256").update(bytes).digest("hex"),
+    byteLength: bytes.byteLength,
+  };
+}
+
+function isRenderIntegrity(value: unknown): value is RenderIntegrityRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<RenderIntegrityRecord>;
+  const keys = Object.keys(value).sort();
+  return keys.join("\u0000") === [
+    "artifactId",
+    "byteLength",
+    "capturedAt",
+    "contentHash",
+    "imagePath",
+    "roundId",
+    "route",
+    "sessionId",
+    "sourceRevisionFingerprint",
+    "state",
+    "viewport",
+    "viewportHeight",
+    "viewportWidth",
+  ].join("\u0000") &&
+    typeof record.artifactId === "string" && isCanonicalIdentifier(record.artifactId) &&
+    typeof record.sessionId === "string" && isCanonicalIdentifier(record.sessionId) &&
+    typeof record.roundId === "string" && isCanonicalIdentifier(record.roundId) &&
+    typeof record.route === "string" && record.route.startsWith("/") &&
+    record.state === "default" &&
+    typeof record.viewport === "string" && isCanonicalIdentifier(record.viewport) &&
+    Number.isSafeInteger(record.viewportWidth) && Number.isSafeInteger(record.viewportHeight) &&
+    typeof record.imagePath === "string" &&
+    typeof record.capturedAt === "string" &&
+    (record.sourceRevisionFingerprint === null || /^[a-f0-9]{64}$/.test(record.sourceRevisionFingerprint ?? "")) &&
+    typeof record.contentHash === "string" && /^[a-f0-9]{64}$/.test(record.contentHash) &&
+    typeof record.byteLength === "number" && Number.isSafeInteger(record.byteLength) &&
+    record.byteLength >= 24 && record.byteLength <= MAX_RENDER_BYTES;
+}
+
+async function readBoundedBinaryFile(
+  path: string,
+  label: string,
+  maximumBytes: number,
+): Promise<Uint8Array> {
+  const pathEntry = await lstat(path);
+  if (
+    pathEntry.isSymbolicLink() || !pathEntry.isFile() || pathEntry.nlink !== 1 ||
+    pathEntry.size > maximumBytes
+  ) throw new Error(`${label} is invalid`);
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (
+      opened.isSymbolicLink?.() || !opened.isFile() || opened.nlink !== 1 ||
+      opened.dev !== pathEntry.dev || opened.ino !== pathEntry.ino || opened.size !== pathEntry.size
+    ) throw new Error(`${label} changed while reading`);
+    const bytes = new Uint8Array(await handle.readFile());
+    const current = await lstat(path);
+    if (
+      current.isSymbolicLink() || !current.isFile() || current.nlink !== 1 ||
+      current.dev !== opened.dev || current.ino !== opened.ino || current.size !== opened.size
+    ) throw new Error(`${label} changed while reading`);
+    return bytes;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function assertPngBytesAndDimensions(
+  bytes: Uint8Array,
+  width: number,
+  height: number,
+): void {
+  if (
+    bytes.byteLength < 24 ||
+    ![137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte) ||
+    bytes[12] !== 73 || bytes[13] !== 72 || bytes[14] !== 68 || bytes[15] !== 82
+  ) throw new Error("Render artifact bytes must be a non-empty PNG");
+  const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (header.getUint32(16) !== width || header.getUint32(20) !== height) {
+    throw new Error("Render artifact PNG dimensions do not match metadata dimensions");
+  }
+}
+
+/** Revalidate the immutable image, metadata sidecar, and digest sidecar. */
+export async function assertRenderArtifactIntegrity(
+  rootPath: string,
+  metadata: RenderArtifact,
+): Promise<void> {
+  if (!isRenderArtifactMetadata(metadata)) {
+    throw new Error("Render metadata sidecar identity is invalid");
+  }
+  const workspace = await ensureDesignWorkspace(rootPath);
+  assertSafePathSegment(metadata.sessionId, "Render session id");
+  assertSafePathSegment(metadata.roundId, "Render round id");
+  assertSafePathSegment(metadata.viewport, "Render viewport");
+  const expectedPath = assertPathInsideWorkspace(
+    workspace.rendersPath,
+    join(workspace.rendersPath, metadata.sessionId, metadata.roundId, `${metadata.viewport}.png`),
+  );
+  const imagePath = assertPathInsideWorkspace(workspace.rendersPath, metadata.imagePath);
+  if (imagePath !== expectedPath) throw new Error("Render artifact path identity is invalid");
+  const canonical = await realpath(imagePath);
+  if (canonical !== imagePath) throw new Error("Render artifact path is not canonical");
+  const imageEntry = await lstat(imagePath);
+  if (
+    imageEntry.isSymbolicLink() || !imageEntry.isFile() || imageEntry.nlink !== 1 ||
+    imageEntry.size < 24 || imageEntry.size > MAX_RENDER_BYTES
+  ) throw new Error("Render artifact is not an authenticated project-scoped file");
+  const persistedMetadata = await readBoundedJsonFile(
+    renderMetadataPath(imagePath),
+    "Render metadata",
+  );
+  if (
+    !isRenderArtifactMetadata(persistedMetadata) ||
+    stableJson(persistedMetadata) !== stableJson({ ...metadata, imagePath })
+  ) throw new Error("Render metadata sidecar identity does not match the session artifact");
+  const integrityPath = renderIntegrityPath(imagePath);
+  const integrityValue = await readBoundedJsonFile(integrityPath, "Render integrity sidecar");
+  if (!isRenderIntegrity(integrityValue)) throw new Error("Render integrity sidecar is invalid");
+  const bytes = await readBoundedBinaryFile(imagePath, "Render artifact", MAX_RENDER_BYTES);
+  assertPngBytesAndDimensions(bytes, metadata.viewportWidth, metadata.viewportHeight);
+  const expectedIntegrity = renderIntegrityFor({ ...metadata, imagePath }, bytes);
+  if (stableJson(integrityValue) !== stableJson(expectedIntegrity)) {
+    throw new Error("Render artifact bytes or sidecar integrity does not match authenticated evidence");
+  }
+}
+
+function isRenderArtifactMetadata(value: unknown): value is RenderArtifact {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<RenderArtifact>;
+  const keys = Object.keys(value).sort();
+  return keys.join("\u0000") === [
+    "capturedAt",
+    "id",
+    "imagePath",
+    "roundId",
+    "route",
+    "sessionId",
+    "sourceRevision",
+    "viewport",
+    "viewportHeight",
+    "viewportWidth",
+  ].join("\u0000") &&
+    typeof record.id === "string" && isCanonicalIdentifier(record.id) &&
+    typeof record.sessionId === "string" && isCanonicalIdentifier(record.sessionId) &&
+    typeof record.roundId === "string" && isCanonicalIdentifier(record.roundId) &&
+    typeof record.route === "string" && record.route.startsWith("/") &&
+    typeof record.viewport === "string" && isCanonicalIdentifier(record.viewport) &&
+    Number.isSafeInteger(record.viewportWidth) && Number.isSafeInteger(record.viewportHeight) &&
+    typeof record.imagePath === "string" && typeof record.capturedAt === "string" &&
+    isCanonicalIsoDateTime(record.capturedAt) && record.sourceRevision !== undefined;
+}
+
+export async function saveRenderArtifact(
+  rootPath: string,
+  metadata: RenderArtifact,
+  bytes: Uint8Array,
+): Promise<SavedArtifact> {
+  const hasExactKeys = (value: object, expected: readonly string[]): boolean => {
+    const actual = Object.keys(value).sort();
+    const wanted = [...expected].sort();
+    return actual.length === wanted.length &&
+      actual.every((key, index) => key === wanted[index]);
+  };
+  if (!hasExactKeys(metadata, [
+    "id",
+    "sessionId",
+    "roundId",
+    "route",
+    "viewport",
+    "viewportWidth",
+    "viewportHeight",
+    "imagePath",
+    "capturedAt",
+    "sourceRevision",
+  ])) {
+    throw new Error("Render artifact metadata contains missing or undeclared fields");
+  }
+  const isIsoTimestamp = (value: string): boolean => {
+    const milliseconds = Date.parse(value);
+    return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+  };
+  const isCanonicalRoute = (value: string): boolean => {
+    try {
+      if (
+        !value.startsWith("/") ||
+        value.startsWith("//") ||
+        value.length > 2048 ||
+        value.includes("\\") ||
+        /[\u0000-\u001f\u007f]/.test(value) ||
+        /[\u0000-\u001f\u007f]/.test(decodeURIComponent(value))
+      ) {
+        return false;
+      }
+      const parsed = new URL(value, "http://render.invalid");
+      return `${parsed.pathname}${parsed.search}${parsed.hash}` === value;
+    } catch {
+      return false;
+    }
+  };
+  const isSafeGitPath = (value: unknown): value is string =>
+    typeof value === "string" &&
+    Buffer.byteLength(value, "utf8") > 0 &&
+    Buffer.byteLength(value, "utf8") <= 1024 &&
+    !value.startsWith("/") &&
+    value !== ".." &&
+    !value.startsWith("../") &&
+    !value.includes("\\") &&
+    posix.normalize(value) === value &&
+    value !== ".git" &&
+    !value.startsWith(".git/") &&
+    value !== ".design-sharingan" &&
+    !value.startsWith(".design-sharingan/") &&
+    !value.includes("\0") &&
+    !value.includes("\n") &&
+    !value.includes("\r");
+  const source = metadata.sourceRevision;
+  const validRequiredPathEvidence = (value: RenderSourcePathEvidence[]): boolean => Array.isArray(value) &&
+    value.length <= 128 &&
+    new Set(value.map((entry) => entry.path)).size === value.length &&
+    value.every((entry) => {
+      if (!isSafeGitPath(entry.path)) return false;
+      if (entry.state === "MISSING") return hasExactKeys(entry, ["path", "state"]);
+      return (
+        entry.state === "FILE" &&
+        hasExactKeys(entry, ["path", "state", "mode", "size", "contentHash"]) &&
+        Number.isSafeInteger(entry.mode) &&
+        entry.mode >= 0 &&
+        entry.mode <= 0o777 &&
+        Number.isSafeInteger(entry.size) &&
+        entry.size >= 0 &&
+        entry.size <= 16 * 1024 * 1024 &&
+        /^[0-9a-f]{64}$/.test(entry.contentHash)
+      );
+    });
+  const allowedIndexStatusCodes = new Set([" ", "M", "T", "A", "D", "R", "C", "U"]);
+  const allowedWorktreeStatusCodes = new Set([" ", "M", "T", "D", "R", "C", "U"]);
+  const validSourceRevision = source.kind === "UNVERSIONED"
+    ? source.available === false
+      ? hasExactKeys(source, ["kind", "available", "reason"]) &&
+        (source.reason === "NOT_A_GIT_WORKSPACE" || source.reason === "GIT_EVIDENCE_UNAVAILABLE")
+      : hasExactKeys(source, ["kind", "available", "truncated", "worktreeFingerprint", "fileCount", "requiredPathEvidence"]) &&
+        source.available === true &&
+        source.truncated === false &&
+        /^[0-9a-f]{64}$/.test(source.worktreeFingerprint) &&
+        Number.isSafeInteger(source.fileCount) &&
+        source.fileCount >= 0 &&
+        source.fileCount <= 512 &&
+        validRequiredPathEvidence(source.requiredPathEvidence)
+    : source.kind === "GIT" &&
+      hasExactKeys(source, ["kind", "available", "head", "branch", "status", "entries", "truncated", "worktreeFingerprint", "fileCount", "requiredPathEvidence"]) &&
+      source.available === true &&
+      /^[0-9a-f]{40,64}$/i.test(source.head) &&
+      Buffer.byteLength(source.branch, "utf8") > 0 &&
+      Buffer.byteLength(source.branch, "utf8") <= 255 &&
+      !/[\0\r\n]/.test(source.branch) &&
+      (source.status === "CLEAN" || source.status === "DIRTY") &&
+      source.truncated === false &&
+      /^[0-9a-f]{64}$/.test(source.worktreeFingerprint) &&
+      Number.isSafeInteger(source.fileCount) &&
+      source.fileCount >= 1 &&
+      source.fileCount <= 512 &&
+      Array.isArray(source.entries) &&
+      source.entries.length <= 512 &&
+      source.fileCount >= source.entries.length &&
+      validRequiredPathEvidence(source.requiredPathEvidence) &&
+      new Set(source.entries.map((entry) => entry.path)).size === source.entries.length &&
+      source.entries.every((entry) => {
+        const renamed = entry.index === "R" || entry.index === "C" ||
+          entry.workingTree === "R" || entry.workingTree === "C";
+        return (
+        (entry.originalPath === undefined
+          ? hasExactKeys(entry, ["index", "workingTree", "path"])
+          : hasExactKeys(entry, ["index", "workingTree", "path", "originalPath"])) &&
+        typeof entry.index === "string" && entry.index.length === 1 &&
+        typeof entry.workingTree === "string" && entry.workingTree.length === 1 &&
+        (((entry.index === "?" && entry.workingTree === "?") ||
+          (entry.index === "!" && entry.workingTree === "!")) ||
+          (allowedIndexStatusCodes.has(entry.index) &&
+            allowedWorktreeStatusCodes.has(entry.workingTree) &&
+            !(entry.index === " " && entry.workingTree === " "))) &&
+        renamed === (entry.originalPath !== undefined) &&
+        isSafeGitPath(entry.path) &&
+        (entry.originalPath === undefined || isSafeGitPath(entry.originalPath)));
+      }) &&
+      (source.status === "CLEAN"
+        ? source.entries.length === 0 && source.truncated === false
+        : source.entries.length > 0);
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(metadata.id) ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(metadata.sessionId) ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(metadata.roundId) ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(metadata.viewport) ||
+    !isCanonicalRoute(metadata.route) ||
+    !Number.isSafeInteger(metadata.viewportWidth) ||
+    metadata.viewportWidth < 240 ||
+    metadata.viewportWidth > 7680 ||
+    !Number.isSafeInteger(metadata.viewportHeight) ||
+    metadata.viewportHeight < 240 ||
+    metadata.viewportHeight > 7680 ||
+    !isIsoTimestamp(metadata.capturedAt) ||
+    !validSourceRevision
+  ) {
+    throw new Error("Render artifact metadata, timestamp, route, or source revision is invalid");
+  }
+  if (
+    bytes.byteLength < 24 ||
+    ![137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte) ||
+    bytes[12] !== 73 || bytes[13] !== 72 || bytes[14] !== 68 || bytes[15] !== 82
+  ) {
+    throw new Error("Render artifact bytes must be a non-empty PNG");
+  }
+  if (bytes.byteLength > MAX_RENDER_BYTES) {
+    throw new Error("Render artifact PNG is too large; maximum size is 25 MiB");
+  }
+  const pngHeader = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (
+    pngHeader.getUint32(16) !== metadata.viewportWidth ||
+    pngHeader.getUint32(20) !== metadata.viewportHeight
+  ) {
+    throw new Error("Render artifact PNG dimensions do not match metadata dimensions");
+  }
+  const workspace = await ensureDesignWorkspace(rootPath);
+  assertSafePathSegment(metadata.sessionId, "Render session id");
+  assertSafePathSegment(metadata.roundId, "Render round id");
+  assertSafePathSegment(metadata.viewport, "Render viewport");
+  const expectedArtifactPath = assertPathInsideWorkspace(workspace.rendersPath, join(
+    workspace.rendersPath,
+    metadata.sessionId,
+    metadata.roundId,
+    `${metadata.viewport}.png`,
+  ));
+  const artifactPath = assertPathInsideWorkspace(
+    workspace.rendersPath,
+    metadata.imagePath,
+  );
+  if (artifactPath !== expectedArtifactPath) {
+    throw new Error("Render artifact must use the exact render artifact path");
+  }
+  const artifactDirectory = dirname(artifactPath);
+  const sessionDirectory = assertPathInsideWorkspace(
+    workspace.rendersPath,
+    join(workspace.rendersPath, metadata.sessionId),
+  );
+  await validateFixedDirectory(
+    workspace.rendersPath,
+    sessionDirectory,
+    "Render session directory",
+  );
+  await validateFixedDirectory(
+    sessionDirectory,
+    artifactDirectory,
+    "Render round directory",
+  );
+
+  const artifactExtension = extname(artifactPath);
+  const metadataPath = assertPathInsideWorkspace(
+    workspace.rendersPath,
+    join(
+      artifactDirectory,
+      `${basename(artifactPath, artifactExtension)}${
+        artifactExtension === ".json" ? ".metadata" : ""
+      }.json`,
+    ),
+  );
+  const integrityPath = assertPathInsideWorkspace(
+    workspace.rendersPath,
+    renderIntegrityPath(artifactPath),
+  );
+
+  const persistedMetadata = {
+    ...metadata,
+    imagePath: artifactPath,
+  };
+  const metadataContents = stableJson(persistedMetadata);
+  const integrityContents = stableJson(renderIntegrityFor(persistedMetadata, bytes));
+  if (Buffer.byteLength(metadataContents, "utf8") > MAX_RECORD_BYTES) {
+    throw new Error("Render artifact metadata is too large; maximum size is 1 MiB");
+  }
+
+  let artifactOwnership: { dev: number; ino: number } | undefined;
+  let metadataOwnership: { dev: number; ino: number } | undefined;
+  let integrityOwnership: { dev: number; ino: number } | undefined;
+  try {
+    artifactOwnership = await atomicCreate(workspace.rendersPath, artifactPath, bytes);
+    metadataOwnership = await atomicCreate(workspace.rendersPath, metadataPath, metadataContents);
+    integrityOwnership = await atomicCreate(workspace.rendersPath, integrityPath, integrityContents);
+  } catch (error) {
+    if (integrityOwnership !== undefined) {
+      await unlinkCreatedFileIfOwned(integrityPath, integrityOwnership).catch(() => undefined);
+    }
+    if (metadataOwnership !== undefined) {
+      await unlinkCreatedFileIfOwned(metadataPath, metadataOwnership).catch(() => undefined);
+    }
+    if (artifactOwnership !== undefined) {
+      try {
+        await unlinkCreatedFileIfOwned(artifactPath, artifactOwnership);
+      } catch (rollbackError) {
+        throw new Error("Render artifact metadata creation failed and owned-image rollback could not safely complete", {
+          cause: { persistenceError: error, rollbackError },
+        });
+      }
+    }
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error.code === "EEXIST" || error.code === "EISDIR")
+    ) {
+      throw new Error("Render artifact already exists; evidence is immutable", { cause: error });
+    }
+    throw error;
+  }
+
+  return { artifactPath, metadataPath };
+}

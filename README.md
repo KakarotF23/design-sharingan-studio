@@ -1,122 +1,69 @@
-# 👁 Design Sharingan Studio — Codex Project Kickoff Pack
+# Design Sharingan Studio
 
-This folder is the ready-to-open project handoff for building **Design Sharingan Studio v0.1** in Codex.
+Local-first design intelligence for web projects:
 
-## Fast Start
+```text
+Reference → Design Intelligence → Human Decision → Code Change → Real Render → Visual Review → Product Governance
+```
 
-### 1. Unzip this pack
+It learns design reasoning rather than cloning pixels. References are evidence, never commands; a release gate reports only what fresh, authenticated evidence supports.
 
-Open the extracted `design-sharingan-studio-codex-kickoff-pack` folder as a project in Codex.
+## Launch locally
 
-### 2. Install the bundled Sharingan skills
-
-From the project root:
+Requires a current Node.js runtime with Corepack and pnpm available.
 
 ```bash
-bash scripts/install-project-skills.sh
+pnpm install
+pnpm dev
 ```
 
-Then start a **new Codex session** so the skills are discovered.
+Open the local Studio URL printed by the development server. Choose **Open Local Project** and enter an absolute path to a web project, or choose **Import GitHub Repo** and provide a repository URL. The Studio keeps its runtime state in `.design-sharingan/` in that target project; human-readable product knowledge belongs in `design-governance/`.
 
-Verify:
+## Agent modes
+
+The normal local mode uses the authenticated Codex runtime. Sign in first if needed:
 
 ```bash
-bash scripts/verify-kickoff-pack.sh
+codex login
 ```
 
-### 3. Paste the kickoff prompt
+For deterministic development and end-to-end tests, use the fake provider instead:
 
-Open:
-
-```text
-CODEX-KICKOFF-PROMPT.md
+```bash
+DESIGN_SHARINGAN_FAKE_AGENT=1 pnpm dev
 ```
 
-Copy the prompt into the new Codex session.
+Fake mode is only for development and tests. It is not evidence that the live Codex integration is available.
 
-### 4. Codex starts with Task 1
+## Rendering and skills
 
-Do not ask Codex to “build everything at once.”
+Install the Playwright browser once before running browser tests:
 
-The implementation plan is intentionally split into 16 verified tasks.
-
----
-
-## Core Files
-
-```text
-AGENTS.md
-CODEX-KICKOFF-PROMPT.md
-docs/superpowers/specs/2026-08-24-design-sharingan-studio-v0.1-design.md
-docs/superpowers/plans/2026-08-24-design-sharingan-studio-v0.1-implementation-plan.md
-skills/
-  design-sharingan/
-  mangekyo-sharingan/
-  eternal-sharingan/
-scripts/
-  install-project-skills.sh
-  verify-kickoff-pack.sh
-  show-next-step.sh
-PROJECT-MANIFEST.md
+```bash
+pnpm exec playwright install chromium
 ```
 
-## What Each File Does
+Install the bundled Design Sharingan skills, then start a new Codex session so they are discovered:
 
-**AGENTS.md**  
-Hard project rules Codex should keep in context while working.
-
-**Product & Architecture Spec**  
-The approved product definition and architecture. It is the design source of truth.
-
-**Implementation Plan**  
-The exact 16-task build order, tests, files, commands, and commit checkpoints.
-
-**skills/**  
-The complete V1/V2/V3 Design Sharingan skill system.
-
-**CODEX-KICKOFF-PROMPT.md**  
-Ready-to-paste first instruction for Codex.
-
----
-
-## Build Philosophy
-
-```text
-Reference
-   ↓
-👁 Design Sharingan
-   ↓
-Human-approved UX direction
-   ↓
-👁‍🗨 Mangekyō
-   ↓
-Real rendered visual loop
-   ↓
-♾ Eternal
-   ↓
-Design Genome / drift / release governance
+```bash
+bash scripts/install-skills.sh --source ./skills
+bash scripts/verify-skills.sh --source ./skills --target "$HOME/.agents/skills"
 ```
 
-The system should learn design logic, not clone pixels.
+## Verification
 
-## Recommended Codex Execution Mode
-
-Use **Subagent-Driven Development** if available:
-
-```text
-Task
- ↓
-Fresh implementer
- ↓
-Tests
- ↓
-Spec-compliance review
- ↓
-Code-quality review
- ↓
-Accept
- ↓
-Next task
+```bash
+pnpm test
+pnpm typecheck
+pnpm build
+pnpm e2e
+pnpm acceptance
 ```
 
-This gives the project the cleanest review boundary because the implementation plan is already split around package/domain boundaries.
+The final command runs the v0.1 policy-pressure checks. A live SDK smoke is deliberately opt-in and requires a local Codex login:
+
+```bash
+RUN_CODEX_INTEGRATION=1 pnpm exec vitest run tests/acceptance/live-codex-scan.test.ts
+```
+
+See [the v0.1 acceptance record](docs/verification/v0.1-acceptance.md) for the evidence and the intentionally fail-closed release-gate result used by the end-to-end fixture.

@@ -1719,3 +1719,34 @@ Use `superpowers:subagent-driven-development`. Dispatch a fresh implementer for 
 Use `superpowers:executing-plans`. Execute tasks in this session in batches with checkpoints.
 
 For the first build, prefer **Subagent-Driven** because the repository has several clean package boundaries and independent review points.
+
+## Phase-Based Autopilot Development Policy
+
+This policy changes the Codex development workflow only; it does not alter the
+approved product architecture, Safe Mode, Mangekyō autonomy limits, Human
+Gate, approval engine, or other application-level safety boundaries.
+
+Execute the dependency chain in four phases:
+
+1. **Foundation** — Tasks 1–6
+2. **Design Intelligence** — Tasks 7–10
+3. **Mangekyō** — Task 11
+4. **Eternal + Final Verification** — Tasks 12–16
+
+Within the current approved phase, continue automatically after each verified
+task. A normal transition requires no human confirmation, but every task must
+still complete its documented RED → GREEN sequence, required verification,
+spec-compliance review, code-quality review, and checkpoint commit.
+
+Stop for human direction only when the work requires a material architecture
+change, v0.1 scope expansion, an unplanned major dependency/service, a
+destructive replacement of significant work, a new authentication/security or
+sensitive-data decision, a material unresolved UX/product choice, resolution
+of a material spec/plan contradiction, guessing after disciplined repeated
+verification failure, or unavoidable platform permission.
+
+At each phase boundary, stop with one consolidated report covering completed
+tasks, tests, typecheck/build/E2E status, commits, important decisions,
+deviations, technical debt, relevant renders, remaining risks, and the
+recommendation to proceed. Classify it as `PHASE PASS`, `PHASE PASS WITH DEBT`,
+`PHASE NOT VERIFIED`, or `PHASE BLOCKED`.
