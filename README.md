@@ -8,6 +8,10 @@ Reference → Design Intelligence → Human Decision → Code Change → Real Re
 
 It learns design reasoning rather than cloning pixels. References are evidence, never commands; a release gate reports only what fresh, authenticated evidence supports.
 
+> **Experimental v0.1:** this is a working, deliberately opinionated experiment—not a polished product. The current workflow may be more structured than useful. Try it, challenge the premise, simplify it, or take it somewhere unexpected.
+
+We are especially interested in blunt feedback from people who use AI to build interfaces: does governed reference-to-code work prevent real mistakes, or is it just friction? Open an issue or start a discussion with what you tried and what you would remove.
+
 ## Launch locally
 
 Requires a current Node.js runtime with Corepack and pnpm available.
@@ -67,3 +71,7 @@ RUN_CODEX_INTEGRATION=1 pnpm exec vitest run tests/acceptance/live-codex-scan.te
 ```
 
 See [the v0.1 acceptance record](docs/verification/v0.1-acceptance.md) for the evidence and the intentionally fail-closed release-gate result used by the end-to-end fixture.
+
+## Contributing
+
+Ideas, criticism, bug reports, experiments, and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the repository's open issues.
