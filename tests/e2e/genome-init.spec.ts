@@ -100,7 +100,12 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async () => {
-  await rm(sandboxPath, { force: true, recursive: true });
+  await rm(sandboxPath, {
+    force: true,
+    recursive: true,
+    maxRetries: 5,
+    retryDelay: 50,
+  });
 });
 
 // Production break caught: enabling the Mangekyō handoff at Safe EDITING races the still-running Safe renderer and loses the start request.
